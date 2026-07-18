@@ -242,7 +242,12 @@ def perf(
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect/engine."),
     explain_json: Path | None = typer.Option(
-        None, "--explain-json", help="A captured EXPLAIN (FORMAT JSON) file to analyze."
+        None,
+        "--explain-json",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="A captured EXPLAIN (FORMAT JSON) file to analyze.",
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
@@ -256,7 +261,12 @@ def perf(
 
     findings = adapter.static_findings(sql)
     if explain_json is not None:
-        findings = findings + adapter.plan_findings(json.loads(explain_json.read_text()))
+        try:
+            plan = json.loads(explain_json.read_text())
+        except json.JSONDecodeError as exc:
+            typer.echo(f"Invalid EXPLAIN JSON: {exc}", err=True)
+            raise typer.Exit(code=2)
+        findings = findings + adapter.plan_findings(plan)
 
     if json_out:
         payload = {
