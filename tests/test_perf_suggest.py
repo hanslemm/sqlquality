@@ -39,3 +39,18 @@ def test_perf_without_suggest_has_empty_suggestions(tmp_path):
     result = runner.invoke(app, ["perf", str(f), "--json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["suggestions"] == []
+
+
+def test_perf_suggest_provider_failure_is_advisory(tmp_path, monkeypatch):
+    class _Boom:
+        def suggest(self, prompt: str) -> str:
+            raise RuntimeError("rate limited")
+
+    monkeypatch.setattr(cli, "resolve_provider", lambda: _Boom())
+    f = tmp_path / "m.sql"
+    f.write_text("select * from t")  # SQ001 WARNING only -> exit 0
+    result = runner.invoke(app, ["perf", str(f), "--suggest", "--json"])
+    assert result.exit_code == 0  # provider failure must NOT change the exit code
+    payload = json.loads(result.stdout)
+    assert payload["suggestions"] == []
+    assert any(x["code"] == "SQ001" for x in payload["findings"])  # report preserved
