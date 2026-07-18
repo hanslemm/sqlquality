@@ -47,7 +47,7 @@ def compute_deltas(
             continue
         base = None if baseline is None else _composite(baseline, uid, dialect)
         is_new = base is None
-        base_value = 0.0 if is_new else base
+        base_value = 0.0 if base is None else base
         deltas.append(
             ModelDelta(
                 unique_id=uid,

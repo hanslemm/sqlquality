@@ -147,10 +147,10 @@ def check(
     report = evaluate_gate(deltas, cfg)
 
     if html is not None:
-        Path(html).write_text(render_html(report))
+        Path(html).write_text(render_html(report, skipped))
 
     if json_out:
-        typer.echo(json.dumps(gate_payload(report, changeset.neighbors), indent=2, sort_keys=True))
+        typer.echo(json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True))
     else:
         verdict = "PASS" if report.passed else "FAIL"
         table = Table(title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})")
