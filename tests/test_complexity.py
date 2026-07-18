@@ -1,0 +1,38 @@
+import pytest
+
+from sqlquality.complexity import ComplexityEngine
+from sqlquality.models import ComplexityMetrics, DagFacts
+
+# metrics matching SQL_A / SQL_B / SQL_C from Task 3
+M_A = ComplexityMetrics(0, 0, 0, 0, 0, 0, 0, 1, 1, 2)
+M_B = ComplexityMetrics(1, 1, 0, 1, 0, 0, 0, 2, 2, 3)
+M_C = ComplexityMetrics(0, 0, 3, 0, 0, 0, 0, 4, 4, 1)
+
+
+def test_score_simple():
+    s = ComplexityEngine().score(M_A)
+    assert s.composite == pytest.approx(5.4)
+
+
+def test_score_cte_join_window():
+    s = ComplexityEngine().score(M_B)
+    assert s.composite == pytest.approx(22.6)
+    assert s.components["join_count"] == pytest.approx(6.0)
+    assert s.components["max_select_depth"] == pytest.approx(10.0)
+
+
+def test_score_nested_subqueries():
+    s = ComplexityEngine().score(M_C)
+    assert s.composite == pytest.approx(35.2)
+
+
+def test_dag_facts_increase_score():
+    s = ComplexityEngine().score(M_A, DagFacts(fan_out=10, lineage_depth=3))
+    assert s.composite == pytest.approx(26.4)
+    assert s.components["dag.fan_out"] == pytest.approx(15.0)
+    assert s.dag is not None
+
+
+def test_score_capped_at_100():
+    huge = ComplexityMetrics(50, 50, 50, 50, 50, 50, 50, 50, 50, 50)
+    assert ComplexityEngine().score(huge).composite == 100.0
