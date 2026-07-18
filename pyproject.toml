@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 sqlquality = "sqlquality.cli:main"
 
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -45,4 +48,8 @@ python_version = "3.11"
 
 [[tool.mypy.overrides]]
 module = ["sqlfluff.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["anthropic.*"]
 ignore_missing_imports = true
