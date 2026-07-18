@@ -1,0 +1,68 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "adapter_type": "postgres"
+  },
+  "nodes": {
+    "seed.demo.raw_orders": {
+      "unique_id": "seed.demo.raw_orders",
+      "name": "raw_orders",
+      "resource_type": "seed",
+      "config": {"materialized": "seed"},
+      "compiled_code": null,
+      "relation_name": "\"dev\".\"main\".\"raw_orders\"",
+      "depends_on": {"macros": [], "nodes": []}
+    },
+    "model.demo.stg_orders": {
+      "unique_id": "model.demo.stg_orders",
+      "name": "stg_orders",
+      "resource_type": "model",
+      "config": {"materialized": "view"},
+      "compiled_code": "select order_id, customer_id, amount, created_at from \"dev\".\"main\".\"raw_orders\"",
+      "relation_name": "\"dev\".\"main\".\"stg_orders\"",
+      "depends_on": {"macros": [], "nodes": ["seed.demo.raw_orders"]}
+    },
+    "model.demo.orders": {
+      "unique_id": "model.demo.orders",
+      "name": "orders",
+      "resource_type": "model",
+      "config": {"materialized": "table", "indexes": [{"columns": ["customer_id"], "unique": false}]},
+      "compiled_code": "select customer_id, count(*) as order_count, sum(amount) as total_amount from \"dev\".\"main\".\"stg_orders\" group by customer_id",
+      "relation_name": "\"dev\".\"main\".\"orders\"",
+      "depends_on": {"macros": [], "nodes": ["model.demo.stg_orders"]}
+    },
+    "model.demo.customer_orders": {
+      "unique_id": "model.demo.customer_orders",
+      "name": "customer_orders",
+      "resource_type": "model",
+      "config": {"materialized": "table"},
+      "compiled_code": "select o.customer_id, o.order_count, s.amount from \"dev\".\"main\".\"orders\" o join \"dev\".\"main\".\"stg_orders\" s on s.customer_id = o.customer_id",
+      "relation_name": "\"dev\".\"main\".\"customer_orders\"",
+      "depends_on": {"macros": [], "nodes": ["model.demo.orders", "model.demo.stg_orders"]}
+    },
+    "test.demo.not_null_orders_customer_id.abc123": {
+      "unique_id": "test.demo.not_null_orders_customer_id.abc123",
+      "name": "not_null_orders_customer_id",
+      "resource_type": "test",
+      "config": {"materialized": "test"},
+      "compiled_code": null,
+      "relation_name": null,
+      "depends_on": {"macros": [], "nodes": ["model.demo.orders"]}
+    }
+  },
+  "sources": {},
+  "parent_map": {
+    "seed.demo.raw_orders": [],
+    "model.demo.stg_orders": ["seed.demo.raw_orders"],
+    "model.demo.orders": ["model.demo.stg_orders"],
+    "model.demo.customer_orders": ["model.demo.orders", "model.demo.stg_orders"],
+    "test.demo.not_null_orders_customer_id.abc123": ["model.demo.orders"]
+  },
+  "child_map": {
+    "seed.demo.raw_orders": ["model.demo.stg_orders"],
+    "model.demo.stg_orders": ["model.demo.orders", "model.demo.customer_orders"],
+    "model.demo.orders": ["model.demo.customer_orders", "test.demo.not_null_orders_customer_id.abc123"],
+    "model.demo.customer_orders": [],
+    "test.demo.not_null_orders_customer_id.abc123": []
+  }
+}
