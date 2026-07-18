@@ -19,6 +19,7 @@ from sqlquality.dbtproject import DbtProject, DbtProjectError
 from sqlquality.delta import compute_deltas
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
+from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
 from sqlquality.models import Severity
 from sqlquality.report import gate_payload, render_html, render_markdown
 from sqlquality.sqlast import SqlParseError, analyze_sql
@@ -261,6 +262,9 @@ def perf(
         help="A captured EXPLAIN file (FORMAT JSON for Postgres; plan text for Redshift).",
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    suggest: bool = typer.Option(
+        False, "--suggest", help="Enrich findings with LLM suggestions (needs SQLQUALITY_LLM set)."
+    ),
 ) -> None:
     """Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan)."""
     sql = path.read_text()
@@ -278,6 +282,18 @@ def perf(
             typer.echo(str(exc), err=True)
             raise typer.Exit(code=2)
 
+    suggestions: list[Suggestion] = []
+    if suggest:
+        provider = resolve_provider()
+        if provider is None:
+            typer.echo(
+                "LLM suggestions require SQLQUALITY_LLM=anthropic "
+                "(and `pip install 'sqlquality[llm]'` + credentials).",
+                err=True,
+            )
+        else:
+            suggestions = enrich_findings(findings, sql, provider)
+
     if json_out:
         payload = {
             "path": str(path),
@@ -292,6 +308,7 @@ def perf(
                 }
                 for f in findings
             ],
+            "suggestions": [{"code": s.code, "text": s.text} for s in suggestions],
         }
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -302,6 +319,8 @@ def perf(
         for f in findings:
             table.add_row(f.code, f.severity.value, f.message)
         console.print(table)
+        for s in suggestions:
+            console.print(f"[cyan]{s.code}[/]: {s.text}")
 
     has_error = any(f.severity is Severity.ERROR for f in findings)
     raise typer.Exit(code=1 if has_error else 0)
