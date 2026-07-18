@@ -21,7 +21,7 @@ def test_perf_with_explain_json(tmp_path):
     f.write_text("select id from orders")
     plan = tmp_path / "plan.json"
     plan.write_text(json.dumps([{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Plans": []}}]))
-    result = runner.invoke(app, ["perf", str(f), "--explain-json", str(plan), "--json"])
+    result = runner.invoke(app, ["perf", str(f), "--explain", str(plan), "--json"])
     assert result.exit_code == 0
     codes = {x["code"] for x in json.loads(result.stdout)["findings"]}
     assert "PG001" in codes
@@ -53,7 +53,7 @@ def test_perf_missing_explain_json_exit_2(tmp_path):
     f = tmp_path / "m.sql"
     f.write_text("select 1")
     result = runner.invoke(
-        app, ["perf", str(f), "--explain-json", str(tmp_path / "nope.json")]
+        app, ["perf", str(f), "--explain", str(tmp_path / "nope.json")]
     )
     assert result.exit_code == 2
 
@@ -63,5 +63,5 @@ def test_perf_malformed_explain_json_exit_2(tmp_path):
     f.write_text("select 1")
     plan = tmp_path / "plan.json"
     plan.write_text("{ not json")
-    result = runner.invoke(app, ["perf", str(f), "--explain-json", str(plan)])
+    result = runner.invoke(app, ["perf", str(f), "--explain", str(plan)])
     assert result.exit_code == 2
