@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlquality"
+description = "Measure dbt model performance and complexity, and gate changes on the delta."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dynamic = ["version"]
+dependencies = [
+    "sqlglot>=30.12,<31",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+sqlquality = "sqlquality.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.hatch.version]
+path = "src/sqlquality/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlquality"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
