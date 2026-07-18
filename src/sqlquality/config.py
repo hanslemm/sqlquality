@@ -25,7 +25,9 @@ def load_config(path: Path | None) -> Config:
     if path is None or not Path(path).exists():
         return Config()
     data = yaml.safe_load(Path(path).read_text()) or {}
-    gate_data = data.get("gate") or {}
+    gate_data = data.get("gate")
+    if not isinstance(gate_data, dict):
+        gate_data = {}
     defaults = GateConfig()
     gate = GateConfig(
         mode=gate_data.get("mode", defaults.mode),
@@ -33,5 +35,8 @@ def load_config(path: Path | None) -> Config:
             gate_data.get("max_complexity_increase", defaults.max_complexity_increase)
         ),
     )
-    waivers = tuple(data.get("waivers") or ())
+    raw_waivers = data.get("waivers") or ()
+    if isinstance(raw_waivers, str):
+        raw_waivers = [raw_waivers]
+    waivers = tuple(raw_waivers)
     return Config(gate=gate, waivers=waivers)
