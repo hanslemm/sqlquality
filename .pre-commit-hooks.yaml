@@ -4,9 +4,3 @@
   entry: sqlquality lint
   language: python
   files: \.sql$
-- id: sqlquality-perf
-  name: sqlquality perf
-  description: Flag SQL performance anti-patterns (SELECT *, cartesian joins, non-sargable LIKE).
-  entry: sqlquality perf
-  language: python
-  files: \.sql$
