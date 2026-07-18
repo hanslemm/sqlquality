@@ -61,3 +61,12 @@ def test_lint_fix_no_change_on_unparseable(tmp_path):
     result = runner.invoke(app, ["lint", str(f), "--fix"])
     assert result.exit_code == 1  # still a parse error
     assert f.read_text() == "select from where"  # unchanged, not rewritten
+
+
+def test_lint_multiple_files_exit_1_if_any_error(tmp_path):
+    good = tmp_path / "good.sql"
+    good.write_text("select 1")
+    bad = tmp_path / "bad.sql"
+    bad.write_text("select from where")  # PRS -> ERROR severity
+    result = runner.invoke(app, ["lint", str(good), str(bad)])
+    assert result.exit_code == 1
