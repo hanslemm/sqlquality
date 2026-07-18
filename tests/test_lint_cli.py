@@ -1,0 +1,44 @@
+import json
+
+from typer.testing import CliRunner
+
+from sqlquality.cli import app
+
+runner = CliRunner()
+
+
+def test_lint_json(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("SELECT *  from users where id=1")
+    result = runner.invoke(app, ["lint", str(f), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["path"] == str(f)
+    assert payload["fixed"] is False
+    assert any(item["code"] == "AM04" for item in payload["findings"])
+
+
+def test_lint_parse_error_exit_1(tmp_path):
+    f = tmp_path / "bad.sql"
+    f.write_text("select from where")
+    result = runner.invoke(app, ["lint", str(f)])
+    assert result.exit_code == 1  # PRS is ERROR severity
+
+
+def test_lint_fix_rewrites_file(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("select   a,b from t where  x=1")
+    before = f.read_text()
+    result = runner.invoke(app, ["lint", str(f), "--fix"])
+    assert result.exit_code == 0
+    after = f.read_text()
+    assert after != before
+    assert "where x = 1" in after
+
+
+def test_lint_human_output(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("SELECT *  from users where id=1")
+    result = runner.invoke(app, ["lint", str(f)])
+    assert result.exit_code == 0
+    assert "AM04" in result.stdout
