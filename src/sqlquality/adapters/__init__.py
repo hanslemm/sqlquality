@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from sqlquality.adapters.base import PerfAdapter
 from sqlquality.adapters.postgres import PostgresAdapter
+from sqlquality.adapters.redshift import RedshiftAdapter
 
 _ADAPTERS: dict[str, type[PerfAdapter]] = {
     "postgres": PostgresAdapter,
+    "redshift": RedshiftAdapter,
 }
 
 
