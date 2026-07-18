@@ -36,3 +36,10 @@ def test_delta_equal_to_threshold_is_not_regression():
     r = evaluate_gate([edge], Config(gate=GateConfig(mode="fail")))  # default threshold 10.0
     assert r.regressions == []
     assert r.passed is True
+
+
+def test_new_model_not_regression_in_fail_mode():
+    new = ModelDelta("m.new", baseline=0.0, candidate=50.0, delta=50.0, is_new=True)
+    r = evaluate_gate([new], Config(gate=GateConfig(mode="fail")))
+    assert r.regressions == []
+    assert r.passed is True

@@ -19,10 +19,13 @@ def evaluate_gate(deltas: list[ModelDelta], config: Config) -> GateReport:
     """Flag regressions (over threshold, not waived); fail only in 'fail' mode."""
     threshold = config.gate.max_complexity_increase
     waivers = set(config.waivers)
+    # A brand-new model (no baseline) has delta == its full composite; a *delta*
+    # gate does not treat net-new surface as a regression. Absolute-complexity
+    # gating of new models is a separate (future) feature.
     regressions = [
         d.unique_id
         for d in deltas
-        if d.unique_id not in waivers and d.delta > threshold
+        if not d.is_new and d.unique_id not in waivers and d.delta > threshold
     ]
     passed = config.gate.mode != "fail" or not regressions
     return GateReport(deltas=deltas, regressions=regressions, passed=passed)

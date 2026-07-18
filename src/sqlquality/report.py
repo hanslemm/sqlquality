@@ -7,7 +7,7 @@ import html as _html
 from sqlquality.gate import GateReport
 
 
-def gate_payload(report: GateReport, neighbors: list[str]) -> dict:
+def gate_payload(report: GateReport, neighbors: list[str], skipped: list[tuple[str, str]] | None = None) -> dict:
     """JSON-serializable summary of a gate report."""
     return {
         "passed": report.passed,
@@ -23,10 +23,11 @@ def gate_payload(report: GateReport, neighbors: list[str]) -> dict:
             }
             for d in report.deltas
         ],
+        "skipped": [{"unique_id": uid, "reason": reason} for uid, reason in (skipped or [])],
     }
 
 
-def render_html(report: GateReport) -> str:
+def render_html(report: GateReport, skipped: list[tuple[str, str]] | None = None) -> str:
     """A self-contained HTML report (no external assets)."""
     verdict = "PASS" if report.passed else "FAIL"
     color = "#137333" if report.passed else "#b3261e"
@@ -44,6 +45,10 @@ def render_html(report: GateReport) -> str:
             "</tr>"
         )
     table_body = "\n".join(rows)
+    skipped_rows = "\n".join(
+        f"<li>{_html.escape(uid)}: {_html.escape(reason)}</li>" for uid, reason in (skipped or [])
+    )
+    skipped_html = f"<h3>Skipped</h3>\n<ul>\n{skipped_rows}\n</ul>" if skipped else ""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>sqlquality report</title>
@@ -62,5 +67,6 @@ th:first-child, td:first-child {{ text-align: left; }}
 {table_body}
 </tbody>
 </table>
+{skipped_html}
 </body></html>
 """
