@@ -29,6 +29,25 @@ def gate_payload(
     }
 
 
+def render_markdown(report: GateReport, skipped: list[tuple[str, str]] | None = None) -> str:
+    """Render a gate report as markdown (suitable for a PR comment)."""
+    verdict = "✅ PASS" if report.passed else "❌ FAIL"
+    lines = [
+        f"# sqlquality: {verdict}",
+        "",
+        "| model | baseline | candidate | delta | |",
+        "|---|---:|---:|---:|:--:|",
+    ]
+    for d in report.deltas:
+        flag = "⚠️" if d.unique_id in report.regressions else ("🆕" if d.is_new else "")
+        lines.append(f"| {d.unique_id} | {d.baseline} | {d.candidate} | {d.delta:+} | {flag} |")
+    for uid, reason in skipped or []:
+        if len(lines) and not lines[-1].startswith("_skipped_"):
+            lines.append("")
+        lines.append(f"_skipped_ `{uid}`: {reason}")
+    return "\n".join(lines) + "\n"
+
+
 def render_html(report: GateReport, skipped: list[tuple[str, str]] | None = None) -> str:
     """A self-contained HTML report (no external assets)."""
     verdict = "PASS" if report.passed else "FAIL"
