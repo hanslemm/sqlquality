@@ -50,5 +50,11 @@ class PostgresAdapter(PerfAdapter):
     def static_findings(self, sql: str) -> list[Finding]:
         return antipattern_findings(sql, "postgres")
 
-    def plan_findings(self, plan: object) -> list[Finding]:
+    def plan_findings(self, explain_text: str) -> list[Finding]:
+        import json
+
+        try:
+            plan = json.loads(explain_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Postgres EXPLAIN must be FORMAT JSON: {exc}") from exc
         return parse_pg_plan(plan)
