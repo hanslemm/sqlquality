@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
 
 from sqlquality.models import ComplexityMetrics
 
@@ -17,7 +17,7 @@ def parse(sql: str, dialect: str) -> exp.Expression:
     """Parse one SQL statement into a SQLGlot AST, or raise SqlParseError."""
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    except ParseError as exc:
+    except (ParseError, TokenError) as exc:
         raise SqlParseError(f"Could not parse SQL ({dialect}): {exc}") from exc
     if tree is None:
         raise SqlParseError("Empty SQL produced no AST")

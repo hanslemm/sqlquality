@@ -49,3 +49,8 @@ def test_set_operation_counts_except():
 def test_parse_error_raised_on_garbage():
     with pytest.raises(SqlParseError):
         analyze_sql("select from where", "postgres")
+
+
+def test_parse_error_on_unterminated_string():
+    with pytest.raises(SqlParseError):
+        analyze_sql("select 'unterminated", "postgres")
