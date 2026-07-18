@@ -17,5 +17,5 @@ class PerfAdapter(ABC):
         """Static anti-pattern findings from the SQL text."""
 
     @abstractmethod
-    def plan_findings(self, plan: object) -> list[Finding]:
-        """Findings from a captured EXPLAIN plan (engine-specific JSON)."""
+    def plan_findings(self, explain_text: str) -> list[Finding]:
+        """Findings from a captured EXPLAIN output (raw file text; format per engine)."""

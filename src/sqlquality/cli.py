@@ -241,13 +241,13 @@ def perf(
         ..., exists=True, dir_okay=False, readable=True, help="Path to a .sql file."
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect/engine."),
-    explain_json: Path | None = typer.Option(
+    explain: Path | None = typer.Option(
         None,
-        "--explain-json",
+        "--explain",
         exists=True,
         dir_okay=False,
         readable=True,
-        help="A captured EXPLAIN (FORMAT JSON) file to analyze.",
+        help="A captured EXPLAIN file (FORMAT JSON for Postgres; plan text for Redshift).",
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
@@ -260,13 +260,12 @@ def perf(
         raise typer.Exit(code=2)
 
     findings = adapter.static_findings(sql)
-    if explain_json is not None:
+    if explain is not None:
         try:
-            plan = json.loads(explain_json.read_text())
-        except json.JSONDecodeError as exc:
-            typer.echo(f"Invalid EXPLAIN JSON: {exc}", err=True)
+            findings = findings + adapter.plan_findings(explain.read_text())
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
             raise typer.Exit(code=2)
-        findings = findings + adapter.plan_findings(plan)
 
     if json_out:
         payload = {
