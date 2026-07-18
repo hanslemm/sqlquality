@@ -61,6 +61,8 @@ def test_run_state_modified_builds_command_and_returns_stdout(tmp_path):
     assert "state:modified" in cmd
     assert "--output" in cmd and "json" in cmd
     assert "--resource-type" in cmd and "model" in cmd
+    assert "--state" in cmd
+    assert cmd[cmd.index("--state") + 1] == str(tmp_path / "base")
     assert kwargs["cwd"] == tmp_path / "proj"
 
 
