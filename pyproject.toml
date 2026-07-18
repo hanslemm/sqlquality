@@ -25,6 +25,7 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "mypy>=1.11",
+    "types-PyYAML",
 ]
 
 [tool.hatch.version]
@@ -38,3 +39,10 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+module = ["sqlfluff.*"]
+ignore_missing_imports = true

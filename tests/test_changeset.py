@@ -4,7 +4,6 @@ from unittest import mock
 import pytest
 
 from sqlquality.changeset import (
-    ChangeSet,
     ChangeSetError,
     compute_changeset,
     parse_state_modified,

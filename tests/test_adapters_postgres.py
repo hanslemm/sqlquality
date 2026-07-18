@@ -3,7 +3,17 @@ import pytest
 from sqlquality.adapters import get_adapter
 from sqlquality.adapters.postgres import PostgresAdapter, parse_pg_plan
 
-SEQ = [{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Total Cost": 1234.5, "Plan Rows": 50000, "Plans": []}}]
+SEQ = [
+    {
+        "Plan": {
+            "Node Type": "Seq Scan",
+            "Relation Name": "orders",
+            "Total Cost": 1234.5,
+            "Plan Rows": 50000,
+            "Plans": [],
+        }
+    }
+]
 SPILL = [
     {
         "Plan": {
@@ -13,7 +23,16 @@ SPILL = [
         }
     }
 ]
-INDEX = [{"Plan": {"Node Type": "Index Scan", "Relation Name": "orders", "Index Name": "orders_pk", "Plans": []}}]
+INDEX = [
+    {
+        "Plan": {
+            "Node Type": "Index Scan",
+            "Relation Name": "orders",
+            "Index Name": "orders_pk",
+            "Plans": [],
+        }
+    }
+]
 
 
 def test_seq_scan_flagged():
