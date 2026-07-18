@@ -35,6 +35,7 @@ Run the complexity-delta gate on a PR and post the result as a comment:
 ```yaml
 - run: uv run sqlquality check --project-dir . --state prod-artifacts/ --markdown report.md
 - uses: actions/github-script@v7
+  if: always()
   with:
     script: |
       const body = require('fs').readFileSync('report.md', 'utf8')
