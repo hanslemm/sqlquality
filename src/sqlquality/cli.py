@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sqlquality import __version__
+from sqlquality.adapters import get_adapter
 from sqlquality.changeset import ChangeSetError, compute_changeset, run_state_modified
 from sqlquality.complexity import ComplexityEngine
 from sqlquality.config import load_config
@@ -229,6 +230,68 @@ def lint(
                 if changed
                 else "[yellow]No auto-fixable changes.[/]"
             )
+
+    has_error = any(f.severity is Severity.ERROR for f in findings)
+    raise typer.Exit(code=1 if has_error else 0)
+
+
+@app.command()
+def perf(
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, readable=True, help="Path to a .sql file."
+    ),
+    dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect/engine."),
+    explain_json: Path | None = typer.Option(
+        None,
+        "--explain-json",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="A captured EXPLAIN (FORMAT JSON) file to analyze.",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan)."""
+    sql = path.read_text()
+    try:
+        adapter = get_adapter(dialect)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+
+    findings = adapter.static_findings(sql)
+    if explain_json is not None:
+        try:
+            plan = json.loads(explain_json.read_text())
+        except json.JSONDecodeError as exc:
+            typer.echo(f"Invalid EXPLAIN JSON: {exc}", err=True)
+            raise typer.Exit(code=2)
+        findings = findings + adapter.plan_findings(plan)
+
+    if json_out:
+        payload = {
+            "path": str(path),
+            "dialect": dialect,
+            "findings": [
+                {
+                    "code": f.code,
+                    "message": f.message,
+                    "line": f.line,
+                    "severity": f.severity.value,
+                    "fixable": f.fixable,
+                }
+                for f in findings
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        table = Table(title=f"Perf — {path.name} ({dialect}, {len(findings)} findings)")
+        table.add_column("code")
+        table.add_column("severity")
+        table.add_column("message")
+        for f in findings:
+            table.add_row(f.code, f.severity.value, f.message)
+        console.print(table)
 
     has_error = any(f.severity is Severity.ERROR for f in findings)
     raise typer.Exit(code=1 if has_error else 0)
