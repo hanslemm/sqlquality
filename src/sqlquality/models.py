@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 
 @dataclass(frozen=True)
@@ -38,3 +39,18 @@ class ComplexityScore:
     components: dict[str, float]
     metrics: ComplexityMetrics
     dag: DagFacts | None = None
+
+
+class Severity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class Finding:
+    code: str
+    message: str
+    line: int
+    severity: Severity
+    fixable: bool
