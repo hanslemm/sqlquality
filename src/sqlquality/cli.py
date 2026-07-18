@@ -20,7 +20,7 @@ from sqlquality.delta import compute_deltas
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.models import Severity
-from sqlquality.report import gate_payload, render_html
+from sqlquality.report import gate_payload, render_html, render_markdown
 from sqlquality.sqlast import SqlParseError, analyze_sql
 
 console = Console()
@@ -114,6 +114,9 @@ def check(
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     html: Path | None = typer.Option(None, "--html", help="Write a self-contained HTML report."),
+    markdown: Path | None = typer.Option(
+        None, "--markdown", help="Write a markdown report (e.g. for a PR comment)."
+    ),
     dbt: str = typer.Option("dbt", "--dbt", help="dbt executable to invoke."),
 ) -> None:
     """Gate a dbt change on the complexity delta of its changed models."""
@@ -147,6 +150,9 @@ def check(
 
     if html is not None:
         Path(html).write_text(render_html(report, skipped))
+
+    if markdown is not None:
+        Path(markdown).write_text(render_markdown(report, skipped))
 
     if json_out:
         typer.echo(
