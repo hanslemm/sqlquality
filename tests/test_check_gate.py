@@ -83,3 +83,13 @@ def test_check_dbt_failure_exit_2(tmp_path):
             app, ["check", "--project-dir", str(proj), "--state", str(state)]
         )
     assert result.exit_code == 2
+
+
+def test_check_corrupt_baseline_exit_2(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    (state / "manifest.json").write_text("{ not valid json")
+    with _mock_changed():
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(state)]
+        )
+    assert result.exit_code == 2

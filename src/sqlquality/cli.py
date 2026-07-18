@@ -135,7 +135,13 @@ def check(
     changeset = compute_changeset(candidate, ls_stdout)
 
     baseline_path = state / "manifest.json"
-    baseline = DbtProject.from_path(baseline_path) if baseline_path.exists() else None
+    try:
+        baseline = (
+            DbtProject.from_path(baseline_path) if baseline_path.exists() else None
+        )
+    except DbtProjectError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
 
     deltas, skipped = compute_deltas(baseline, candidate, changeset.changed, dialect)
     report = evaluate_gate(deltas, cfg)
