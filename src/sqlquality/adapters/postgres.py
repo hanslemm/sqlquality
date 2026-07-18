@@ -33,7 +33,7 @@ def parse_pg_plan(plan: object) -> list[Finding]:
                     False,
                 )
             )
-        for child in node.get("Plans", []):
+        for child in node.get("Plans") or []:
             walk(child)
 
     items = plan if isinstance(plan, list) else [plan]

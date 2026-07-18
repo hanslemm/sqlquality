@@ -47,3 +47,21 @@ def test_perf_human_output(tmp_path):
     result = runner.invoke(app, ["perf", str(f)])
     assert result.exit_code == 0
     assert "SQ001" in result.stdout
+
+
+def test_perf_missing_explain_json_exit_2(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("select 1")
+    result = runner.invoke(
+        app, ["perf", str(f), "--explain-json", str(tmp_path / "nope.json")]
+    )
+    assert result.exit_code == 2
+
+
+def test_perf_malformed_explain_json_exit_2(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("select 1")
+    plan = tmp_path / "plan.json"
+    plan.write_text("{ not json")
+    result = runner.invoke(app, ["perf", str(f), "--explain-json", str(plan)])
+    assert result.exit_code == 2
