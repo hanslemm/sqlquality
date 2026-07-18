@@ -17,6 +17,8 @@ from sqlquality.config import load_config
 from sqlquality.dbtproject import DbtProject, DbtProjectError
 from sqlquality.delta import compute_deltas
 from sqlquality.gate import evaluate_gate
+from sqlquality.linter import fix_sql, lint_sql
+from sqlquality.models import Severity
 from sqlquality.report import gate_payload, render_html
 from sqlquality.sqlast import SqlParseError, analyze_sql
 
@@ -167,6 +169,61 @@ def check(
             console.print(f"[yellow]skipped[/] {uid}: {reason}")
 
     raise typer.Exit(code=0 if report.passed else 1)
+
+
+@app.command()
+def lint(
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, readable=True, help="Path to a .sql file."
+    ),
+    dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
+    fix: bool = typer.Option(False, "--fix", help="Rewrite the file with auto-fixes."),
+    exclude_rules: str | None = typer.Option(
+        None, "--exclude-rules", help="Comma-separated rule codes to skip."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Lint a SQL file for best-practice violations (SQLFluff); --fix rewrites it."""
+    sql = path.read_text()
+    excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
+    findings = lint_sql(sql, dialect, excl)
+
+    if fix:
+        path.write_text(fix_sql(sql, dialect, excl))
+
+    if json_out:
+        payload = {
+            "path": str(path),
+            "fixed": fix,
+            "findings": [
+                {
+                    "code": f.code,
+                    "message": f.message,
+                    "line": f.line,
+                    "severity": f.severity.value,
+                    "fixable": f.fixable,
+                }
+                for f in findings
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        table = Table(title=f"Lint — {path.name}  ({len(findings)} findings)")
+        table.add_column("line", justify="right")
+        table.add_column("code")
+        table.add_column("severity")
+        table.add_column("fix?", justify="center")
+        table.add_column("message")
+        for f in findings:
+            table.add_row(
+                str(f.line), f.code, f.severity.value, "✓" if f.fixable else "", f.message
+            )
+        console.print(table)
+        if fix:
+            console.print("[green]Applied auto-fixes and rewrote the file.[/]")
+
+    has_error = any(f.severity is Severity.ERROR for f in findings)
+    raise typer.Exit(code=1 if has_error else 0)
 
 
 def main() -> None:
