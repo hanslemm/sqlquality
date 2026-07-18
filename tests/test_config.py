@@ -33,3 +33,17 @@ def test_partial_yaml_falls_back(tmp_path):
     assert cfg.gate.mode == "fail"
     assert cfg.gate.max_complexity_increase == 10.0  # default
     assert cfg.waivers == ()
+
+
+def test_scalar_waivers_coerced_to_single_element(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("waivers: model.demo.orders\n")
+    cfg = load_config(p)
+    assert cfg.waivers == ("model.demo.orders",)
+
+
+def test_non_mapping_gate_falls_back_to_defaults(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("gate: fail\n")
+    cfg = load_config(p)
+    assert cfg.gate == GateConfig()
