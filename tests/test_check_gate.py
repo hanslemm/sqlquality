@@ -51,9 +51,7 @@ def test_check_fail_mode_exit_1(tmp_path):
     cfg = proj / "sqlquality.yml"
     cfg.write_text("gate:\n  mode: fail\n  max_complexity_increase: 0.1\n")
     with _mock_changed():
-        result = runner.invoke(
-            app, ["check", "--project-dir", str(proj), "--state", str(state)]
-        )
+        result = runner.invoke(app, ["check", "--project-dir", str(proj), "--state", str(state)])
     # delta 0.4 > 0.1 threshold, fail mode -> exit 1
     assert result.exit_code == 1
 
@@ -79,9 +77,7 @@ def test_check_dbt_failure_exit_2(tmp_path):
         "sqlquality.cli.run_state_modified",
         side_effect=ChangeSetError("dbt not found"),
     ):
-        result = runner.invoke(
-            app, ["check", "--project-dir", str(proj), "--state", str(state)]
-        )
+        result = runner.invoke(app, ["check", "--project-dir", str(proj), "--state", str(state)])
     assert result.exit_code == 2
 
 
@@ -89,7 +85,5 @@ def test_check_corrupt_baseline_exit_2(tmp_path):
     proj, state = _project_with_baseline(tmp_path)
     (state / "manifest.json").write_text("{ not valid json")
     with _mock_changed():
-        result = runner.invoke(
-            app, ["check", "--project-dir", str(proj), "--state", str(state)]
-        )
+        result = runner.invoke(app, ["check", "--project-dir", str(proj), "--state", str(state)])
     assert result.exit_code == 2

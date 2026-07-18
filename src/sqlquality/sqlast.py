@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError, TokenError
@@ -21,7 +23,7 @@ def parse(sql: str, dialect: str) -> exp.Expression:
         raise SqlParseError(f"Could not parse SQL ({dialect}): {exc}") from exc
     if tree is None:
         raise SqlParseError("Empty SQL produced no AST")
-    return tree
+    return cast(exp.Expression, tree)
 
 
 def analyze_sql(sql: str, dialect: str) -> ComplexityMetrics:

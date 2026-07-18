@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from sqlquality.dbtproject import DbtProject
-from sqlquality.delta import ModelDelta, compute_deltas
+from sqlquality.delta import compute_deltas
 
 FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
 
@@ -45,8 +45,6 @@ def test_no_baseline_marks_new():
 
 
 def test_skips_uncompiled_candidate():
-    deltas, skipped = compute_deltas(
-        None, _candidate(), ["seed.demo.raw_orders"], "postgres"
-    )
+    deltas, skipped = compute_deltas(None, _candidate(), ["seed.demo.raw_orders"], "postgres")
     assert deltas == []
     assert skipped and skipped[0][0] == "seed.demo.raw_orders"

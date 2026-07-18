@@ -18,9 +18,7 @@ def test_fail_mode_blocks_on_regression():
 
 
 def test_waiver_clears_regression():
-    r = evaluate_gate(
-        [BIG], Config(gate=GateConfig(mode="fail"), waivers=("m.big",))
-    )
+    r = evaluate_gate([BIG], Config(gate=GateConfig(mode="fail"), waivers=("m.big",)))
     assert r.regressions == []
     assert r.passed is True
 

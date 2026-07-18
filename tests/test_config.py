@@ -15,11 +15,7 @@ def test_defaults_when_missing_file(tmp_path):
 def test_parses_yaml(tmp_path):
     p = tmp_path / "sqlquality.yml"
     p.write_text(
-        "gate:\n"
-        "  mode: fail\n"
-        "  max_complexity_increase: 5.0\n"
-        "waivers:\n"
-        "  - model.demo.orders\n"
+        "gate:\n  mode: fail\n  max_complexity_increase: 5.0\nwaivers:\n  - model.demo.orders\n"
     )
     cfg = load_config(p)
     assert cfg.gate == GateConfig(mode="fail", max_complexity_increase=5.0)
