@@ -21,9 +21,7 @@ def _to_finding(violation: dict) -> Finding:
     )
 
 
-def lint_sql(
-    sql: str, dialect: str, exclude_rules: list[str] | None = None
-) -> list[Finding]:
+def lint_sql(sql: str, dialect: str, exclude_rules: list[str] | None = None) -> list[Finding]:
     """Lint one SQL string; return findings (parse errors included as PRS)."""
     violations = sqlfluff.lint(sql, dialect=dialect, exclude_rules=exclude_rules)
     return [_to_finding(v) for v in violations]

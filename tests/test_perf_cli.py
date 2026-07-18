@@ -20,7 +20,9 @@ def test_perf_with_explain_json(tmp_path):
     f = tmp_path / "m.sql"
     f.write_text("select id from orders")
     plan = tmp_path / "plan.json"
-    plan.write_text(json.dumps([{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Plans": []}}]))
+    plan.write_text(
+        json.dumps([{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Plans": []}}])
+    )
     result = runner.invoke(app, ["perf", str(f), "--explain", str(plan), "--json"])
     assert result.exit_code == 0
     codes = {x["code"] for x in json.loads(result.stdout)["findings"]}
@@ -52,9 +54,7 @@ def test_perf_human_output(tmp_path):
 def test_perf_missing_explain_json_exit_2(tmp_path):
     f = tmp_path / "m.sql"
     f.write_text("select 1")
-    result = runner.invoke(
-        app, ["perf", str(f), "--explain", str(tmp_path / "nope.json")]
-    )
+    result = runner.invoke(app, ["perf", str(f), "--explain", str(tmp_path / "nope.json")])
     assert result.exit_code == 2
 
 

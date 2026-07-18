@@ -12,10 +12,21 @@ def test_lint_json(tmp_path):
     f.write_text("SELECT *  from users where id=1")
     result = runner.invoke(app, ["lint", str(f), "--json"])
     assert result.exit_code == 0
-    payload = json.loads(result.stdout)
+    payload = json.loads(result.stdout)["files"][0]
     assert payload["path"] == str(f)
     assert payload["fixed"] is False
     assert any(item["code"] == "AM04" for item in payload["findings"])
+
+
+def test_lint_multiple_files(tmp_path):
+    a = tmp_path / "a.sql"
+    a.write_text("SELECT *  from users")
+    b = tmp_path / "b.sql"
+    b.write_text("select 1")
+    result = runner.invoke(app, ["lint", str(a), str(b), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert {item["path"] for item in payload["files"]} == {str(a), str(b)}
 
 
 def test_lint_parse_error_exit_1(tmp_path):
@@ -50,3 +61,12 @@ def test_lint_fix_no_change_on_unparseable(tmp_path):
     result = runner.invoke(app, ["lint", str(f), "--fix"])
     assert result.exit_code == 1  # still a parse error
     assert f.read_text() == "select from where"  # unchanged, not rewritten
+
+
+def test_lint_multiple_files_exit_1_if_any_error(tmp_path):
+    good = tmp_path / "good.sql"
+    good.write_text("select 1")
+    bad = tmp_path / "bad.sql"
+    bad.write_text("select from where")  # PRS -> ERROR severity
+    result = runner.invoke(app, ["lint", str(good), str(bad)])
+    assert result.exit_code == 1

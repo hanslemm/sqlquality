@@ -20,7 +20,7 @@ from sqlquality.delta import compute_deltas
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.models import Severity
-from sqlquality.report import gate_payload, render_html
+from sqlquality.report import gate_payload, render_html, render_markdown
 from sqlquality.sqlast import SqlParseError, analyze_sql
 
 console = Console()
@@ -86,9 +86,7 @@ def complexity(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    table = Table(
-        title=f"Complexity — {path.name}  (composite {result.composite}/100)"
-    )
+    table = Table(title=f"Complexity — {path.name}  (composite {result.composite}/100)")
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_column("contribution", justify="right")
@@ -116,6 +114,9 @@ def check(
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     html: Path | None = typer.Option(None, "--html", help="Write a self-contained HTML report."),
+    markdown: Path | None = typer.Option(
+        None, "--markdown", help="Write a markdown report (e.g. for a PR comment)."
+    ),
     dbt: str = typer.Option("dbt", "--dbt", help="dbt executable to invoke."),
 ) -> None:
     """Gate a dbt change on the complexity delta of its changed models."""
@@ -139,9 +140,7 @@ def check(
 
     baseline_path = state / "manifest.json"
     try:
-        baseline = (
-            DbtProject.from_path(baseline_path) if baseline_path.exists() else None
-        )
+        baseline = DbtProject.from_path(baseline_path) if baseline_path.exists() else None
     except DbtProjectError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
@@ -152,11 +151,18 @@ def check(
     if html is not None:
         Path(html).write_text(render_html(report, skipped))
 
+    if markdown is not None:
+        Path(markdown).write_text(render_markdown(report, skipped))
+
     if json_out:
-        typer.echo(json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True))
+        typer.echo(
+            json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True)
+        )
     else:
         verdict = "PASS" if report.passed else "FAIL"
-        table = Table(title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})")
+        table = Table(
+            title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})"
+        )
         table.add_column("model")
         table.add_column("baseline", justify="right")
         table.add_column("candidate", justify="right")
@@ -174,8 +180,8 @@ def check(
 
 @app.command()
 def lint(
-    path: Path = typer.Argument(
-        ..., exists=True, dir_okay=False, readable=True, help="Path to a .sql file."
+    paths: list[Path] = typer.Argument(
+        ..., exists=True, dir_okay=False, readable=True, help="One or more .sql files."
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
     fix: bool = typer.Option(False, "--fix", help="Rewrite the file with auto-fixes."),
@@ -184,55 +190,60 @@ def lint(
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Lint a SQL file for best-practice violations (SQLFluff); --fix rewrites it."""
-    sql = path.read_text()
+    """Lint SQL files for best-practice violations (SQLFluff); --fix rewrites them."""
     excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
-    findings = lint_sql(sql, dialect, excl)
-
-    changed = False
-    if fix:
-        fixed_sql = fix_sql(sql, dialect, excl)
-        if fixed_sql != sql:
-            path.write_text(fixed_sql)
-            changed = True
+    file_reports: list[dict] = []
+    any_error = False
+    for path in paths:
+        sql = path.read_text()
+        findings = lint_sql(sql, dialect, excl)
+        changed = False
+        if fix:
+            fixed_sql = fix_sql(sql, dialect, excl)
+            if fixed_sql != sql:
+                path.write_text(fixed_sql)
+                changed = True
+        any_error = any_error or any(f.severity is Severity.ERROR for f in findings)
+        file_reports.append(
+            {
+                "path": str(path),
+                "fixed": changed,
+                "findings": [
+                    {
+                        "code": f.code,
+                        "message": f.message,
+                        "line": f.line,
+                        "severity": f.severity.value,
+                        "fixable": f.fixable,
+                    }
+                    for f in findings
+                ],
+            }
+        )
 
     if json_out:
-        payload = {
-            "path": str(path),
-            "fixed": changed,
-            "findings": [
-                {
-                    "code": f.code,
-                    "message": f.message,
-                    "line": f.line,
-                    "severity": f.severity.value,
-                    "fixable": f.fixable,
-                }
-                for f in findings
-            ],
-        }
-        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        typer.echo(json.dumps({"files": file_reports}, indent=2, sort_keys=True))
     else:
-        table = Table(title=f"Lint — {path.name}  ({len(findings)} findings)")
-        table.add_column("line", justify="right")
-        table.add_column("code")
-        table.add_column("severity")
-        table.add_column("fix?", justify="center")
-        table.add_column("message")
-        for f in findings:
-            table.add_row(
-                str(f.line), f.code, f.severity.value, "✓" if f.fixable else "", f.message
-            )
-        console.print(table)
-        if fix:
-            console.print(
-                "[green]Applied auto-fixes and rewrote the file.[/]"
-                if changed
-                else "[yellow]No auto-fixable changes.[/]"
-            )
+        for report in file_reports:
+            table = Table(title=f"Lint — {report['path']} ({len(report['findings'])} findings)")
+            table.add_column("line", justify="right")
+            table.add_column("code")
+            table.add_column("severity")
+            table.add_column("fix?", justify="center")
+            table.add_column("message")
+            for item in report["findings"]:
+                table.add_row(
+                    str(item["line"]),
+                    item["code"],
+                    item["severity"],
+                    "✓" if item["fixable"] else "",
+                    item["message"],
+                )
+            console.print(table)
+            if report["fixed"]:
+                console.print(f"[green]Rewrote {report['path']} with auto-fixes.[/]")
 
-    has_error = any(f.severity is Severity.ERROR for f in findings)
-    raise typer.Exit(code=1 if has_error else 0)
+    raise typer.Exit(code=1 if any_error else 0)
 
 
 @app.command()

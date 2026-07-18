@@ -32,8 +32,12 @@ def test_render_html_is_self_contained():
 
 
 def test_gate_payload_includes_skipped():
-    payload = gate_payload(REPORT, neighbors=[], skipped=[("seed.demo.raw_orders", "no compiled SQL")])
-    assert payload["skipped"] == [{"unique_id": "seed.demo.raw_orders", "reason": "no compiled SQL"}]
+    payload = gate_payload(
+        REPORT, neighbors=[], skipped=[("seed.demo.raw_orders", "no compiled SQL")]
+    )
+    assert payload["skipped"] == [
+        {"unique_id": "seed.demo.raw_orders", "reason": "no compiled SQL"}
+    ]
 
 
 def test_gate_payload_skipped_defaults_empty():

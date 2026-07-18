@@ -7,7 +7,9 @@ import html as _html
 from sqlquality.gate import GateReport
 
 
-def gate_payload(report: GateReport, neighbors: list[str], skipped: list[tuple[str, str]] | None = None) -> dict:
+def gate_payload(
+    report: GateReport, neighbors: list[str], skipped: list[tuple[str, str]] | None = None
+) -> dict:
     """JSON-serializable summary of a gate report."""
     return {
         "passed": report.passed,
@@ -25,6 +27,25 @@ def gate_payload(report: GateReport, neighbors: list[str], skipped: list[tuple[s
         ],
         "skipped": [{"unique_id": uid, "reason": reason} for uid, reason in (skipped or [])],
     }
+
+
+def render_markdown(report: GateReport, skipped: list[tuple[str, str]] | None = None) -> str:
+    """Render a gate report as markdown (suitable for a PR comment)."""
+    verdict = "✅ PASS" if report.passed else "❌ FAIL"
+    lines = [
+        f"# sqlquality: {verdict}",
+        "",
+        "| model | baseline | candidate | delta | |",
+        "|---|---:|---:|---:|:--:|",
+    ]
+    for d in report.deltas:
+        flag = "⚠️" if d.unique_id in report.regressions else ("🆕" if d.is_new else "")
+        lines.append(f"| {d.unique_id} | {d.baseline} | {d.candidate} | {d.delta:+} | {flag} |")
+    for uid, reason in skipped or []:
+        if len(lines) and not lines[-1].startswith("_skipped_"):
+            lines.append("")
+        lines.append(f"_skipped_ `{uid}`: {reason}")
+    return "\n".join(lines) + "\n"
 
 
 def render_html(report: GateReport, skipped: list[tuple[str, str]] | None = None) -> str:

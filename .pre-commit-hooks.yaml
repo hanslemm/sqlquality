@@ -1,0 +1,6 @@
+- id: sqlquality-lint
+  name: sqlquality lint
+  description: Lint SQL files for best-practice violations (SQLFluff).
+  entry: sqlquality lint
+  language: python
+  files: \.sql$

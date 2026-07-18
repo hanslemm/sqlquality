@@ -55,9 +55,7 @@ def compute_changeset(project: DbtProject, ls_stdout: str) -> ChangeSet:
     return ChangeSet(changed=changed, neighbors=sorted(neighbors))
 
 
-def run_state_modified(
-    project_dir: str | Path, state_dir: str | Path, dbt: str = "dbt"
-) -> str:
+def run_state_modified(project_dir: str | Path, state_dir: str | Path, dbt: str = "dbt") -> str:
     """Run `dbt ls --select state:modified ... --output json` and return stdout."""
     cmd = [
         dbt,
@@ -71,11 +69,7 @@ def run_state_modified(
         "--output",
         "json",
     ]
-    result = subprocess.run(
-        cmd, cwd=Path(project_dir), capture_output=True, text=True
-    )
+    result = subprocess.run(cmd, cwd=Path(project_dir), capture_output=True, text=True)
     if result.returncode != 0:
-        raise ChangeSetError(
-            f"`dbt ls` failed (exit {result.returncode}): {result.stderr.strip()}"
-        )
+        raise ChangeSetError(f"`dbt ls` failed (exit {result.returncode}): {result.stderr.strip()}")
     return result.stdout

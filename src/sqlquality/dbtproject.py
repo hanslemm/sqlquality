@@ -86,9 +86,7 @@ class DbtProject:
     def compiled_sql(self, uid: str) -> str:
         node = self.node(uid)
         if not node.compiled_code:
-            raise DbtProjectError(
-                f"{uid} has no compiled_code — run `dbt compile` first"
-            )
+            raise DbtProjectError(f"{uid} has no compiled_code — run `dbt compile` first")
         return node.compiled_code
 
     def dag_facts(self, uid: str) -> DagFacts:
