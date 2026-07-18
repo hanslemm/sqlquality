@@ -7,7 +7,9 @@ import html as _html
 from sqlquality.gate import GateReport
 
 
-def gate_payload(report: GateReport, neighbors: list[str], skipped: list[tuple[str, str]] | None = None) -> dict:
+def gate_payload(
+    report: GateReport, neighbors: list[str], skipped: list[tuple[str, str]] | None = None
+) -> dict:
     """JSON-serializable summary of a gate report."""
     return {
         "passed": report.passed,

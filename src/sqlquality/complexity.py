@@ -27,9 +27,7 @@ DAG_WEIGHTS: dict[str, float] = {
 class ComplexityEngine:
     """Compute a weighted composite complexity score."""
 
-    def score(
-        self, metrics: ComplexityMetrics, dag: DagFacts | None = None
-    ) -> ComplexityScore:
+    def score(self, metrics: ComplexityMetrics, dag: DagFacts | None = None) -> ComplexityScore:
         components: dict[str, float] = {}
         for name, weight in METRIC_WEIGHTS.items():
             components[name] = round(weight * getattr(metrics, name), 2)
@@ -37,6 +35,4 @@ class ComplexityEngine:
             for name, weight in DAG_WEIGHTS.items():
                 components[f"dag.{name}"] = round(weight * getattr(dag, name), 2)
         composite = round(min(MAX_SCORE, sum(components.values())), 1)
-        return ComplexityScore(
-            composite=composite, components=components, metrics=metrics, dag=dag
-        )
+        return ComplexityScore(composite=composite, components=components, metrics=metrics, dag=dag)

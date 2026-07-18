@@ -86,9 +86,7 @@ def complexity(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    table = Table(
-        title=f"Complexity — {path.name}  (composite {result.composite}/100)"
-    )
+    table = Table(title=f"Complexity — {path.name}  (composite {result.composite}/100)")
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_column("contribution", justify="right")
@@ -139,9 +137,7 @@ def check(
 
     baseline_path = state / "manifest.json"
     try:
-        baseline = (
-            DbtProject.from_path(baseline_path) if baseline_path.exists() else None
-        )
+        baseline = DbtProject.from_path(baseline_path) if baseline_path.exists() else None
     except DbtProjectError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
@@ -153,10 +149,14 @@ def check(
         Path(html).write_text(render_html(report, skipped))
 
     if json_out:
-        typer.echo(json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True))
+        typer.echo(
+            json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True)
+        )
     else:
         verdict = "PASS" if report.passed else "FAIL"
-        table = Table(title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})")
+        table = Table(
+            title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})"
+        )
         table.add_column("model")
         table.add_column("baseline", justify="right")
         table.add_column("candidate", justify="right")

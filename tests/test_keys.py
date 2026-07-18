@@ -5,9 +5,11 @@ def test_join_key_columns():
     assert join_key_columns(
         "select * from orders o join customers c on c.id = o.customer_id", "redshift"
     ) == ["customer_id", "id"]
-    assert join_key_columns(
-        "select * from a join b on a.x = b.y and a.k = b.k", "redshift"
-    ) == ["k", "x", "y"]
+    assert join_key_columns("select * from a join b on a.x = b.y and a.k = b.k", "redshift") == [
+        "k",
+        "x",
+        "y",
+    ]
     assert join_key_columns("select * from a, b", "redshift") == []
     assert join_key_columns("select * from a join b on a.x > b.y", "redshift") == []
 
@@ -16,9 +18,10 @@ def test_filter_columns():
     assert filter_columns("select * from t where created_at > '2024-01-01'", "redshift") == [
         "created_at"
     ]
-    assert filter_columns(
-        "select * from t where status = 'x' and amount >= 100", "redshift"
-    ) == ["amount", "status"]
+    assert filter_columns("select * from t where status = 'x' and amount >= 100", "redshift") == [
+        "amount",
+        "status",
+    ]
     assert filter_columns(
         "select * from t where ts between '2024-01-01' and '2024-02-01'", "redshift"
     ) == ["ts"]

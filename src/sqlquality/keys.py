@@ -27,7 +27,7 @@ def _filter_columns(tree: exp.Expression) -> list[str]:
     if where is None:
         return []
     names: set[str] = set()
-    for node in where.find_all((exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.Between)):
+    for node in where.find_all(exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.Between):
         if isinstance(node, exp.Between):
             col = node.this
             low = node.args.get("low")

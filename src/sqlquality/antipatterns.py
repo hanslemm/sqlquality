@@ -29,7 +29,7 @@ def _has_cartesian_join(tree: exp.Expression) -> bool:
 
 
 def _has_leading_wildcard_like(tree: exp.Expression) -> bool:
-    for node in tree.find_all((exp.Like, exp.ILike)):
+    for node in tree.find_all(exp.Like, exp.ILike):
         pattern = node.args.get("expression")
         if isinstance(pattern, exp.Literal) and pattern.is_string and pattern.this.startswith("%"):
             return True

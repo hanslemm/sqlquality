@@ -63,9 +63,7 @@ def test_dag_facts(project):
     assert project.dag_facts("model.demo.stg_orders") == DagFacts(
         fan_in=0, fan_out=2, lineage_depth=1
     )
-    assert project.dag_facts("model.demo.orders") == DagFacts(
-        fan_in=1, fan_out=1, lineage_depth=2
-    )
+    assert project.dag_facts("model.demo.orders") == DagFacts(fan_in=1, fan_out=1, lineage_depth=2)
     assert project.dag_facts("model.demo.customer_orders") == DagFacts(
         fan_in=2, fan_out=0, lineage_depth=3
     )
