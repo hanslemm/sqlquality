@@ -65,3 +65,19 @@ def test_perf_malformed_explain_json_exit_2(tmp_path):
     plan.write_text("{ not json")
     result = runner.invoke(app, ["perf", str(f), "--explain", str(plan)])
     assert result.exit_code == 2
+
+
+def test_perf_redshift_with_explain(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("select * from a join b on a.id = b.id where a.d > '2024-01-01'")
+    plan = tmp_path / "plan.txt"
+    plan.write_text("XN Hash Join DS_BCAST_INNER  (cost=0.00..1.00)\n")
+    result = runner.invoke(
+        app,
+        ["perf", str(f), "--dialect", "redshift", "--explain", str(plan), "--json"],
+    )
+    assert result.exit_code == 0
+    codes = {x["code"] for x in json.loads(result.stdout)["findings"]}
+    assert "RS010" in codes  # from the EXPLAIN plan text
+    assert "RS001" in codes  # DISTKEY suggestion (join key)
+    assert "RS002" in codes  # SORTKEY suggestion (filter column)

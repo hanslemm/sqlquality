@@ -8,9 +8,21 @@ from sqlquality.keys import dist_sort_findings
 from sqlquality.models import Finding, Severity
 
 _MARKERS = [
-    ("DS_BCAST_INNER", "RS010", "Broadcast of inner table (DS_BCAST_INNER) — tables not joined on their DISTKEYs."),
-    ("DS_DIST_BOTH", "RS011", "Both sides redistributed (DS_DIST_BOTH) — the heaviest redistribution; align DISTKEYs on the join key."),
-    ("DS_DIST_ALL_INNER", "RS012", "Serial execution (DS_DIST_ALL_INNER) — inner table sent to a single slice."),
+    (
+        "DS_BCAST_INNER",
+        "RS010",
+        "Broadcast of inner table (DS_BCAST_INNER) — tables not joined on their DISTKEYs.",
+    ),
+    (
+        "DS_DIST_BOTH",
+        "RS011",
+        "Both sides redistributed (DS_DIST_BOTH) — the heaviest redistribution; align DISTKEYs on the join key.",
+    ),
+    (
+        "DS_DIST_ALL_INNER",
+        "RS012",
+        "Serial execution (DS_DIST_ALL_INNER) — inner table sent to a single slice.",
+    ),
     ("Nested Loop", "RS013", "Nested Loop join — usually a missing join condition / cross join."),
 ]
 

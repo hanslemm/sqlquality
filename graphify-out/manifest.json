@@ -1,0 +1,187 @@
+{
+  "pyproject.toml": {
+    "mtime": 1784383341.2370577,
+    "ast_hash": "207de044e5df2ce1276df7aa71eba964",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/__init__.py": {
+    "mtime": 1784371164.7818918,
+    "ast_hash": "35b56d3b9d7b5463a19d80d633c90151",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/adapters/__init__.py": {
+    "mtime": 1784384994.697337,
+    "ast_hash": "e451024a7e96cbb49559220de13eb536",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/adapters/base.py": {
+    "mtime": 1784385792.5246024,
+    "ast_hash": "ffba6d9fa85e132f6320684f7d8f7902",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/adapters/postgres.py": {
+    "mtime": 1784385799.2857409,
+    "ast_hash": "0eb1ed0aeff3dd1a8428574e6c4d642f",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/antipatterns.py": {
+    "mtime": 1784384994.6977859,
+    "ast_hash": "3d1f6d3f2294d8b7636bdbe2d0344026",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/changeset.py": {
+    "mtime": 1784379358.6400437,
+    "ast_hash": "3a6608e9d16efea4e53ac6e5b56c305e",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/cli.py": {
+    "mtime": 1784385810.4249353,
+    "ast_hash": "5d0ebd3e1926da6c54c20fe8db1796c2",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/complexity.py": {
+    "mtime": 1784378521.8660328,
+    "ast_hash": "fee85d094a95b216c5a8eea7ac118837",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/config.py": {
+    "mtime": 1784381950.784876,
+    "ast_hash": "8c58377428c352c9280d3fbdc7d268ee",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/dbtproject.py": {
+    "mtime": 1784379358.6414192,
+    "ast_hash": "0871224b225ae7de06dcae89bbfc6223",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/delta.py": {
+    "mtime": 1784381950.785155,
+    "ast_hash": "54778002abedcaed08b8af77404289d2",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/gate.py": {
+    "mtime": 1784381950.7853694,
+    "ast_hash": "e570269a111500c698cbebb259c055ff",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/keys.py": {
+    "mtime": 1784385424.646902,
+    "ast_hash": "e1aa97f4d44eb90c24158da0a272f0f7",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/linter.py": {
+    "mtime": 1784383341.2378504,
+    "ast_hash": "65606fb282b06e82df08e84b67c6157b",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/models.py": {
+    "mtime": 1784383341.2382762,
+    "ast_hash": "487cd654942f957d5beb0d682706fb30",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/report.py": {
+    "mtime": 1784381950.785558,
+    "ast_hash": "54ecfe8b6caeac8ea28bdfa76a200a1c",
+    "semantic_hash": ""
+  },
+  "src/sqlquality/sqlast.py": {
+    "mtime": 1784378521.866817,
+    "ast_hash": "591d395f8e07d68eea5fc26cbe0b9488",
+    "semantic_hash": ""
+  },
+  "tests/fixtures/manifest_v12.json": {
+    "mtime": 1784379358.6416748,
+    "ast_hash": "089f0f0192358144538cffecbafce301",
+    "semantic_hash": ""
+  },
+  "tests/test_adapters_postgres.py": {
+    "mtime": 1784384994.6981838,
+    "ast_hash": "00b3d493042f0ca009146b8ede496c79",
+    "semantic_hash": ""
+  },
+  "tests/test_antipatterns.py": {
+    "mtime": 1784384994.6983492,
+    "ast_hash": "ab7b6055e5e42a90ffe78a8a227cf8c2",
+    "semantic_hash": ""
+  },
+  "tests/test_changeset.py": {
+    "mtime": 1784379358.641906,
+    "ast_hash": "df554e85eb9202fdb7258c48f99dfc9b",
+    "semantic_hash": ""
+  },
+  "tests/test_check_gate.py": {
+    "mtime": 1784381950.785802,
+    "ast_hash": "a2aa955991c94df89de8c5b32faebea4",
+    "semantic_hash": ""
+  },
+  "tests/test_cli.py": {
+    "mtime": 1784378521.8673444,
+    "ast_hash": "200ffb27c1827979977d65ee0cac6465",
+    "semantic_hash": ""
+  },
+  "tests/test_complexity.py": {
+    "mtime": 1784378521.8675675,
+    "ast_hash": "513754e3047d57de2f520fb2f86218aa",
+    "semantic_hash": ""
+  },
+  "tests/test_config.py": {
+    "mtime": 1784381950.785981,
+    "ast_hash": "473a8b3eab3594eacb1f06ce4ccabbdc",
+    "semantic_hash": ""
+  },
+  "tests/test_dbtproject.py": {
+    "mtime": 1784379358.6422873,
+    "ast_hash": "eb4f5c365a068bcba588464fbbfdd18f",
+    "semantic_hash": ""
+  },
+  "tests/test_delta.py": {
+    "mtime": 1784381950.7862754,
+    "ast_hash": "c2041839011bf5719f0bf89f0b767ffe",
+    "semantic_hash": ""
+  },
+  "tests/test_gate.py": {
+    "mtime": 1784381950.7866728,
+    "ast_hash": "036c38384679c0236c13edd6b9c186b3",
+    "semantic_hash": ""
+  },
+  "tests/test_keys.py": {
+    "mtime": 1784385409.2137513,
+    "ast_hash": "8e21942d8025cad1ae291451f84983ad",
+    "semantic_hash": ""
+  },
+  "tests/test_lint_cli.py": {
+    "mtime": 1784383341.2386363,
+    "ast_hash": "a4af1bbfeb7569f31e84277167ec3472",
+    "semantic_hash": ""
+  },
+  "tests/test_linter.py": {
+    "mtime": 1784383341.2390828,
+    "ast_hash": "48b3a44b9f6d1685b0428fdf19b95f69",
+    "semantic_hash": ""
+  },
+  "tests/test_models.py": {
+    "mtime": 1784378521.8680925,
+    "ast_hash": "986ab6ace58417fb080fd677b8c90be1",
+    "semantic_hash": ""
+  },
+  "tests/test_perf_cli.py": {
+    "mtime": 1784385766.1347287,
+    "ast_hash": "ee0c0a404d969670f3bdaaaa7db765bc",
+    "semantic_hash": ""
+  },
+  "tests/test_report.py": {
+    "mtime": 1784381950.786919,
+    "ast_hash": "2b91f0e85f27d5fa3104e36a3dbbe758",
+    "semantic_hash": ""
+  },
+  "tests/test_sqlast.py": {
+    "mtime": 1784378521.868373,
+    "ast_hash": "5c29f340c8f0fe4467c9bdfa5bf0aaca",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1784371157.87146,
+    "ast_hash": "70d0be1eae155686476fc8550cd8e07c",
+    "semantic_hash": ""
+  }
+}
