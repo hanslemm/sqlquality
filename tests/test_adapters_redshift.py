@@ -5,12 +5,14 @@ BCAST = "XN Hash Join DS_BCAST_INNER  (cost=0.00..1.00)\n  XN Seq Scan on orders
 DISTBOTH = "XN Hash Join DS_DIST_BOTH  (cost=0.00..2.00)\n"
 NESTED = "XN Nested Loop  (cost=0.00..9.00)\n  XN Seq Scan on a\n"
 CLEAN = "XN Merge Join DS_DIST_NONE  (cost=0.00..1.00)\n"
+ALLINNER = "XN Hash Join DS_DIST_ALL_INNER  (cost=0.00..3.00)\n"
 
 
 def test_parse_redshift_markers():
     assert "RS010" in {f.code for f in parse_redshift_plan(BCAST)}
     assert "RS011" in {f.code for f in parse_redshift_plan(DISTBOTH)}
     assert "RS013" in {f.code for f in parse_redshift_plan(NESTED)}
+    assert "RS012" in {f.code for f in parse_redshift_plan(ALLINNER)}
 
 
 def test_parse_redshift_clean():
