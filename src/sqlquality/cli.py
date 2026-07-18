@@ -188,13 +188,17 @@ def lint(
     excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
     findings = lint_sql(sql, dialect, excl)
 
+    changed = False
     if fix:
-        path.write_text(fix_sql(sql, dialect, excl))
+        fixed_sql = fix_sql(sql, dialect, excl)
+        if fixed_sql != sql:
+            path.write_text(fixed_sql)
+            changed = True
 
     if json_out:
         payload = {
             "path": str(path),
-            "fixed": fix,
+            "fixed": changed,
             "findings": [
                 {
                     "code": f.code,
@@ -220,7 +224,11 @@ def lint(
             )
         console.print(table)
         if fix:
-            console.print("[green]Applied auto-fixes and rewrote the file.[/]")
+            console.print(
+                "[green]Applied auto-fixes and rewrote the file.[/]"
+                if changed
+                else "[yellow]No auto-fixable changes.[/]"
+            )
 
     has_error = any(f.severity is Severity.ERROR for f in findings)
     raise typer.Exit(code=1 if has_error else 0)

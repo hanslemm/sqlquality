@@ -42,3 +42,11 @@ def test_lint_human_output(tmp_path):
     result = runner.invoke(app, ["lint", str(f)])
     assert result.exit_code == 0
     assert "AM04" in result.stdout
+
+
+def test_lint_fix_no_change_on_unparseable(tmp_path):
+    f = tmp_path / "bad.sql"
+    f.write_text("select from where")
+    result = runner.invoke(app, ["lint", str(f), "--fix"])
+    assert result.exit_code == 1  # still a parse error
+    assert f.read_text() == "select from where"  # unchanged, not rewritten
