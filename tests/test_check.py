@@ -54,3 +54,22 @@ def test_check_command_json(tmp_path):
         "model.demo.stg_orders",
     ]
     assert payload["results"][0]["unique_id"] == "model.demo.orders"
+
+
+def test_check_command_dbt_failure_exit_2(tmp_path):
+    from sqlquality.changeset import ChangeSetError
+
+    proj = tmp_path / "proj"
+    (proj / "target").mkdir(parents=True)
+    (proj / "target" / "manifest.json").write_text(FIXTURE.read_text())
+    base = tmp_path / "baseline"
+    base.mkdir()
+
+    with mock.patch(
+        "sqlquality.cli.run_state_modified",
+        side_effect=ChangeSetError("dbt not found"),
+    ):
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(base)]
+        )
+    assert result.exit_code == 2

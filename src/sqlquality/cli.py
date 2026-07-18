@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sqlquality import __version__
-from sqlquality.changeset import compute_changeset, run_state_modified
+from sqlquality.changeset import ChangeSetError, compute_changeset, run_state_modified
 from sqlquality.checkcmd import run_check
 from sqlquality.complexity import ComplexityEngine
 from sqlquality.dbtproject import DbtProject, DbtProjectError
@@ -116,7 +116,11 @@ def check(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
 
-    ls_stdout = run_state_modified(project_dir, state, dbt)
+    try:
+        ls_stdout = run_state_modified(project_dir, state, dbt)
+    except ChangeSetError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
     changeset = compute_changeset(project, ls_stdout)
     results, skipped = run_check(project, changeset.changed, dialect)
 
