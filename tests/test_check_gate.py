@@ -139,6 +139,70 @@ def test_check_invalid_config_exit_2(tmp_path):
     assert "gate.mode" in result.stderr
 
 
+def test_check_dialect_from_manifest_notice(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    with _mock_changed():
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(state), "--json"]
+        )
+    assert result.exit_code == 0, result.stdout
+    # Fixture manifest adapter_type is "postgres".
+    assert "dialect: postgres (from manifest adapter_type)" in result.stderr
+
+
+def test_check_explicit_dialect_skips_notice(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--dialect",
+                "postgres",
+                "--json",
+            ],
+        )
+    assert result.exit_code == 0, result.stdout
+    assert "from manifest adapter_type" not in result.stderr
+
+
+def test_check_absent_adapter_type_falls_back_to_postgres(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    manifest = json.loads((proj / "target" / "manifest.json").read_text())
+    manifest["metadata"].pop("adapter_type", None)
+    (proj / "target" / "manifest.json").write_text(json.dumps(manifest))
+    with _mock_changed():
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(state), "--json"]
+        )
+    assert result.exit_code == 0, result.stdout
+    assert "dialect: postgres (default" in result.stderr
+
+
+def test_check_unknown_explicit_dialect_exit_2(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--dialect",
+                "oracle9000",
+            ],
+        )
+    assert result.exit_code == 2
+    assert "oracle9000" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_check_old_schema_warns(tmp_path):
     proj, state = _project_with_baseline(tmp_path)
     manifest = json.loads((proj / "target" / "manifest.json").read_text())

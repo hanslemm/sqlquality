@@ -172,3 +172,39 @@ def test_lint_valid_jinja_broken_sql_parse_error_stays_error(tmp_path):
     prs = [i for i in json.loads(result.stdout)["files"][0]["findings"] if i["code"] == "PRS"]
     assert prs and prs[0]["severity"] == "error"
     assert "unresolved Jinja" not in prs[0]["message"]
+
+
+def test_lint_unknown_dialect_exit_2(tmp_path):
+    f = tmp_path / "m.sql"
+    f.write_text("select 1\n")
+    result = runner.invoke(app, ["lint", str(f), "--dialect", "oracle9000"])
+    assert result.exit_code == 2
+    assert "oracle9000" in result.stderr
+    assert "postgres" in result.stderr  # suggestions listed
+    assert "Traceback" not in result.stderr
+
+
+def test_lint_stdin(tmp_path):
+    result = runner.invoke(app, ["lint", "-", "--json"], input="select 1 from t\n")
+    assert result.exit_code == 0  # clean SQL -> no gating findings
+    payload = json.loads(result.stdout)["files"][0]
+    assert payload["path"] == "<stdin>"
+
+
+def test_lint_fix_stdin_rejected(tmp_path):
+    result = runner.invoke(app, ["lint", "--fix", "-"], input="select 1\n")
+    assert result.exit_code == 2
+    assert "stdin" in result.stderr
+
+
+def test_lint_non_utf8_file_exit_2(tmp_path):
+    f = tmp_path / "latin1.sql"
+    f.write_bytes(b"select caf\xe9 from t")
+    result = runner.invoke(app, ["lint", str(f)])
+    assert result.exit_code == 2
+    assert "UTF-8" in result.stderr
+
+
+def test_lint_missing_file_exit_2(tmp_path):
+    result = runner.invoke(app, ["lint", str(tmp_path / "nope.sql")])
+    assert result.exit_code == 2
