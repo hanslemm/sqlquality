@@ -73,6 +73,19 @@ def test_run_state_modified_builds_command_and_returns_stdout(tmp_path):
     assert kwargs["timeout"] == 600
 
 
+def test_run_state_modified_resolves_relative_state_to_absolute(tmp_path, monkeypatch):
+    # The subprocess runs with cwd=project_dir, so a relative --state must be
+    # resolved against the real cwd *before* being passed to dbt.
+    monkeypatch.chdir(tmp_path)
+    fake = mock.Mock(returncode=0, stdout="", stderr="")
+    with mock.patch("sqlquality.changeset.subprocess.run", return_value=fake) as run:
+        run_state_modified(tmp_path / "proj", "base", dbt="dbt")
+    cmd = run.call_args[0][0]
+    state_arg = cmd[cmd.index("--state") + 1]
+    assert Path(state_arg).is_absolute()
+    assert state_arg == str(Path("base").resolve())
+
+
 def test_run_state_modified_raises_on_failure(tmp_path):
     fake = mock.Mock(returncode=1, stdout="", stderr="boom")
     with mock.patch("sqlquality.changeset.subprocess.run", return_value=fake):
