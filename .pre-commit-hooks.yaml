@@ -4,3 +4,4 @@
   entry: sqlquality lint
   language: python
   files: \.sql$
+  exclude: (^|/)target/
