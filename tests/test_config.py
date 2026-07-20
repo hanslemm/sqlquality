@@ -88,3 +88,44 @@ def test_unknown_keys_are_tolerated(tmp_path):
     p.write_text("gate:\n  mode: fail\n  future_flag: true\ntop_level: 1\n")
     cfg = load_config(p)
     assert cfg.gate.mode == "fail"
+
+
+def test_top_level_list_doc_raises(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("- a\n- b\n")
+    with pytest.raises(ConfigError, match="must be a mapping"):
+        load_config(p)
+
+
+def test_top_level_string_doc_raises(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("just a string\n")
+    with pytest.raises(ConfigError, match="must be a mapping"):
+        load_config(p)
+
+
+def test_empty_doc_falls_back_to_defaults(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("")
+    assert load_config(p) == Config()
+
+
+def test_nan_threshold_raises(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("gate:\n  max_complexity_increase: .nan\n")
+    with pytest.raises(ConfigError, match="finite"):
+        load_config(p)
+
+
+def test_inf_threshold_raises(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("gate:\n  max_complexity_increase: .inf\n")
+    with pytest.raises(ConfigError, match="finite"):
+        load_config(p)
+
+
+def test_bool_threshold_raises(tmp_path):
+    p = tmp_path / "sqlquality.yml"
+    p.write_text("gate:\n  max_complexity_increase: true\n")
+    with pytest.raises(ConfigError):
+        load_config(p)
