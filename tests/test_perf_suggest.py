@@ -54,3 +54,21 @@ def test_perf_suggest_provider_failure_is_advisory(tmp_path, monkeypatch):
     payload = json.loads(result.stdout)
     assert payload["suggestions"] == []
     assert any(x["code"] == "SQ001" for x in payload["findings"])  # report preserved
+
+
+def test_perf_suggest_provider_construction_failure_is_advisory(tmp_path, monkeypatch):
+    # SQLQUALITY_LLM is set but the provider can't even be constructed
+    # (missing anthropic package or credentials) -> resolve_provider() raises.
+    def _explode() -> None:
+        raise RuntimeError("The 'anthropic' package is required for AnthropicProvider.")
+
+    monkeypatch.setattr(cli, "resolve_provider", _explode)
+    f = tmp_path / "m.sql"
+    f.write_text("select * from t")  # SQ001 WARNING only -> exit 0
+    result = runner.invoke(app, ["perf", str(f), "--suggest", "--json"])
+    assert result.exit_code == 0  # construction failure must NOT change the exit code
+    assert result.exception is None  # no traceback leaked
+    payload = json.loads(result.stdout)
+    assert payload["suggestions"] == []
+    assert any(x["code"] == "SQ001" for x in payload["findings"])  # report preserved
+    assert "LLM suggestions unavailable" in result.stderr  # one friendly note

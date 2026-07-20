@@ -284,18 +284,20 @@ def perf(
 
     suggestions: list[Suggestion] = []
     if suggest:
-        provider = resolve_provider()
-        if provider is None:
-            typer.echo(
-                "LLM suggestions require SQLQUALITY_LLM=anthropic (or 1/true) "
-                "(and `pip install 'sqlquality[llm]'` + credentials).",
-                err=True,
-            )
-        else:
-            try:
+        try:
+            provider = resolve_provider()
+            if provider is None:
+                typer.echo(
+                    "LLM suggestions require SQLQUALITY_LLM=anthropic (or 1/true) "
+                    "(and `pip install 'sqlquality[llm]'` + credentials).",
+                    err=True,
+                )
+            else:
                 suggestions = enrich_findings(findings, sql, provider)
-            except Exception as exc:  # advisory-only: never affect the exit code or report
-                typer.echo(f"LLM suggestions unavailable: {exc}", err=True)
+        except Exception as exc:  # advisory-only: never affect the exit code or report
+            # Covers provider construction (missing package/credentials) and any
+            # call failures — findings still print and the exit code is unchanged.
+            typer.echo(f"LLM suggestions unavailable: {exc}", err=True)
 
     if json_out:
         payload = {
