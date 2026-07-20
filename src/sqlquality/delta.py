@@ -40,14 +40,30 @@ def compute_deltas(
     """Score each changed model on candidate and baseline; return deltas + skips."""
     deltas: list[ModelDelta] = []
     skipped: list[tuple[str, str]] = []
+    baseline_model_ids = set() if baseline is None else set(baseline.model_ids())
     for uid in changed_ids:
         cand = _composite(candidate, uid, dialect)
         if cand is None:
             skipped.append((uid, "no compiled SQL or unparseable in candidate"))
             continue
-        base = None if baseline is None else _composite(baseline, uid, dialect)
-        is_new = base is None
-        base_value = 0.0 if base is None else base
+        if baseline is None:
+            is_new = True
+            base_value = 0.0
+        else:
+            base = _composite(baseline, uid, dialect)
+            if base is None:
+                # A node absent from the baseline is genuinely net-new. A node
+                # *present* in the baseline but uncompiled/unparseable must NOT be
+                # exempted as "new" — that would let a real regression through the
+                # gate. Skip it instead of emitting a misleading delta.
+                if uid in baseline_model_ids:
+                    skipped.append((uid, "baseline present but unscoreable in baseline"))
+                    continue
+                is_new = True
+                base_value = 0.0
+            else:
+                is_new = False
+                base_value = base
         deltas.append(
             ModelDelta(
                 unique_id=uid,
