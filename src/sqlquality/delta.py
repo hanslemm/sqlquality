@@ -57,7 +57,7 @@ def compute_deltas(
                 # exempted as "new" — that would let a real regression through the
                 # gate. Skip it instead of emitting a misleading delta.
                 if uid in baseline_model_ids:
-                    skipped.append((uid, "baseline present but unscoreable in baseline"))
+                    skipped.append((uid, "baseline present but unscoreable"))
                     continue
                 is_new = True
                 base_value = 0.0

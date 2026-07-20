@@ -64,4 +64,4 @@ def test_baseline_present_but_unscoreable_is_skipped_not_new():
         _baseline_with_unscoreable_orders(), _candidate(), ["model.demo.orders"], "postgres"
     )
     assert deltas == []
-    assert skipped == [("model.demo.orders", "baseline present but unscoreable in baseline")]
+    assert skipped == [("model.demo.orders", "baseline present but unscoreable")]

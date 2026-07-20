@@ -46,6 +46,22 @@ def test_markdown_warn_mode_shows_warn():
     assert "WARN" in md
     assert "gate mode: warn" in md
     assert "PASS" not in md
+    # single regression is singular, not "1 regressions"
+    assert "1 regression," in md
+    assert "1 regressions" not in md
+
+
+def test_markdown_warn_mode_pluralizes():
+    two = GateReport(
+        deltas=[
+            ModelDelta("model.demo.a", 5.0, 30.0, 25.0, False),
+            ModelDelta("model.demo.b", 5.0, 30.0, 25.0, False),
+        ],
+        regressions=["model.demo.a", "model.demo.b"],
+        passed=True,
+        mode="warn",
+    )
+    assert "2 regressions," in render_markdown(two)
 
 
 def test_markdown_injection_is_inert():
