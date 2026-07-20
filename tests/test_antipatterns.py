@@ -26,6 +26,10 @@ def test_select_star_from_cte_closer_not_flagged():
     assert "SQ001" not in _codes("with final as (select a, b from t) select * from final")
 
 
+def test_select_star_from_cte_closer_case_insensitive():
+    assert "SQ001" not in _codes("with FINAL as (select a, b from t) select * from final")
+
+
 def test_select_star_not_sole_projection_flagged():
     assert "SQ001" in _codes("with final as (select a, b from t) select *, id from final")
 
@@ -43,9 +47,30 @@ def test_comma_join_predicate_in_where_not_flagged():
     assert "SQ002" not in _codes("select x from a, b where a.id = b.id")
 
 
+def test_where_guard_is_scoped_per_join():
+    # A cross-relation predicate must only exonerate the relations it names, not
+    # every predicate-less comma join in the statement.
+    # (a) third relation genuinely cross-joined despite a.id = b.id.
+    assert "SQ002" in _codes("select x from a, b, c where a.id = b.id")
+    # (b) cartesian inside a CTE must not be exonerated by the outer WHERE.
+    assert "SQ002" in _codes("with j as (select * from a, b) select * from j, k where j.id = k.id")
+    # (c) outer cartesian must not be exonerated by a CTE's WHERE.
+    assert "SQ002" in _codes("with j as (select 1 from p, q where p.id = q.id) select x from a, b")
+    # (d) predicate nested in an EXISTS subquery must not exonerate the outer join.
+    assert "SQ002" in _codes(
+        "select x from a, b where exists (select 1 from p, q where p.id = q.id)"
+    )
+
+
 def test_constant_true_join_flagged():
     assert "SQ002" in _codes("select x from a join b on true")
     assert "SQ002" in _codes("select x from a join b on 1 = 1")
+
+
+def test_lateral_join_on_true_not_flagged():
+    assert "SQ002" not in _codes(
+        "select x from a left join lateral (select * from b where b.a_id = a.id) l on true"
+    )
 
 
 def test_join_on_not_flagged():

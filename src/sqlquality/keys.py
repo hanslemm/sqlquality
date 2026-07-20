@@ -20,8 +20,9 @@ def _join_key_counts(tree: exp.Expression) -> Counter[str]:
         for eq in on.find_all(exp.EQ):
             left, right = eq.this, eq.expression
             if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                counts[left.name] += 1
-                counts[right.name] += 1
+                # Dedupe per predicate so `a.k = b.k` counts `k` once, not twice, and
+                # cannot outweigh a column that appears across two separate joins.
+                counts.update({left.name, right.name})
     return counts
 
 

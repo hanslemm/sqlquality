@@ -92,12 +92,20 @@ def strip_jinja(sql: str) -> str:
     * Any statement-leading Jinja is dropped: everything before the first
       ``WITH``/``SELECT`` keyword that is only placeholders, whitespace, or
       comments is removed, so a model opening with ``{{ config(...) }}`` parses.
+
+    Because ``{% ... %}`` tags are removed but the text between them is kept, a
+    conditional such as ``{% if %} ... {% else %} ... {% endif %}`` leaves *both*
+    branches concatenated, which may be unparseable — hence best-effort only.
     """
     text = _JINJA_COMMENT.sub(" ", sql)
     text = _JINJA_STATEMENT.sub(" ", text)
     text = _JINJA_EXPRESSION.sub(JINJA_PLACEHOLDER, text)
 
-    keyword = _FIRST_STATEMENT_KEYWORD.search(text)
+    # Search for the first statement keyword on a comment-masked copy (SQL comments
+    # blanked to equal-length spans so offsets survive), so a leading comment that
+    # happens to contain "with"/"select" cannot be mistaken for the statement start.
+    masked = _mask_sql_comments(text)
+    keyword = _FIRST_STATEMENT_KEYWORD.search(masked)
     if keyword is not None:
         prefix = text[: keyword.start()]
         residue = prefix.replace(JINJA_PLACEHOLDER, " ")
@@ -107,3 +115,14 @@ def strip_jinja(sql: str) -> str:
             text = text[keyword.start() :]
 
     return text
+
+
+def _mask_sql_comments(text: str) -> str:
+    """Replace SQL ``--`` line and ``/* */`` block comments with equal-length spaces."""
+
+    def _blank(match: re.Match[str]) -> str:
+        return " " * (match.end() - match.start())
+
+    masked = _SQL_BLOCK_COMMENT.sub(_blank, text)
+    masked = _SQL_LINE_COMMENT.sub(_blank, masked)
+    return masked
