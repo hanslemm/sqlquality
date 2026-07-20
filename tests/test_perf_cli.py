@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -72,6 +73,28 @@ def test_perf_non_utf8_file_exit_2(tmp_path):
     result = runner.invoke(app, ["perf", str(f)])
     assert result.exit_code == 2
     assert "UTF-8" in result.stderr
+
+
+def test_perf_stdin_dash_rejected(tmp_path, monkeypatch):
+    # perf does not read stdin; even a file literally named '-' (which satisfies the
+    # exists=True check) must be rejected rather than read via the stdin branch.
+    monkeypatch.chdir(tmp_path)
+    Path("-").write_text("select 1")
+    result = runner.invoke(app, ["perf", "-"])
+    assert result.exit_code == 2
+    assert "stdin" in result.stderr
+
+
+def test_perf_jinja_unstrippable_annotates_sq000(tmp_path):
+    # Jinja markers present but stripping still won't parse -> SQ000 (ERROR, exit 1)
+    # annotated with the compiled-SQL hint.
+    f = tmp_path / "model.sql"
+    f.write_text("{{ config() }}\nselect ((( from {{ ref('t') }}")
+    result = runner.invoke(app, ["perf", str(f), "--json"])
+    assert result.exit_code == 1  # SQ000 is ERROR severity
+    findings = json.loads(result.stdout)["findings"]
+    sq000 = [x for x in findings if x["code"] == "SQ000"]
+    assert sq000 and "target/compiled/" in sq000[0]["message"]
 
 
 def test_perf_human_output(tmp_path):

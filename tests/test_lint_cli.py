@@ -208,3 +208,15 @@ def test_lint_non_utf8_file_exit_2(tmp_path):
 def test_lint_missing_file_exit_2(tmp_path):
     result = runner.invoke(app, ["lint", str(tmp_path / "nope.sql")])
     assert result.exit_code == 2
+
+
+def test_lint_fix_bad_second_path_leaves_first_unmodified(tmp_path):
+    # A bad second path must abort with exit 2 before rewriting the first file
+    # (all-or-nothing: no silent side effects on an input-error run).
+    good = tmp_path / "fixme.sql"
+    good.write_text("select   a,b from t where  x=1")
+    before = good.read_text()
+    missing = tmp_path / "nope.sql"
+    result = runner.invoke(app, ["lint", "--fix", str(good), str(missing)])
+    assert result.exit_code == 2
+    assert good.read_text() == before  # untouched
