@@ -121,10 +121,11 @@ def check(
     dbt: str = typer.Option("dbt", "--dbt", help="dbt executable to invoke."),
 ) -> None:
     """Gate a dbt change on the complexity delta of its changed models."""
-    # An explicit --config that doesn't exist is a user error; the implicit
-    # <project-dir>/sqlquality.yml default stays lenient (absent -> defaults).
-    if config is not None and not config.exists():
-        typer.echo(f"--config path does not exist: {config}", err=True)
+    # An explicit --config that isn't a readable file (missing, or a directory)
+    # is a user error; the implicit <project-dir>/sqlquality.yml default stays
+    # lenient (absent -> defaults).
+    if config is not None and not config.is_file():
+        typer.echo(f"--config path is not a file: {config}", err=True)
         raise typer.Exit(code=2)
     cfg_path = config if config is not None else project_dir / "sqlquality.yml"
     try:

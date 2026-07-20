@@ -106,7 +106,28 @@ def test_check_explicit_missing_config_exit_2(tmp_path):
             ],
         )
     assert result.exit_code == 2
-    assert "does not exist" in result.stderr
+    assert "is not a file" in result.stderr
+
+
+def test_check_config_directory_exit_2(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    a_dir = tmp_path / "conf_dir"
+    a_dir.mkdir()
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--config",
+                str(a_dir),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "is not a file" in result.stderr
 
 
 def test_check_invalid_config_exit_2(tmp_path):
