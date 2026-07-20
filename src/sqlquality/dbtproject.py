@@ -99,7 +99,28 @@ class DbtProject:
     def _lineage_depth(self, uid: str) -> int:
         if uid in self._depth_cache:
             return self._depth_cache[uid]
-        parents = self.model_parents(uid)
-        depth = 1 + max((self._lineage_depth(p) for p in parents), default=0)
-        self._depth_cache[uid] = depth
-        return depth
+        # Iterative post-order DFS: a recursive walk overflows the stack on very
+        # deep chains and never terminates on cycles. `on_stack` marks nodes whose
+        # depth is still being computed; a parent still on the stack closes a cycle
+        # and contributes depth 0, keeping the result finite.
+        stack: list[str] = [uid]
+        on_stack: set[str] = set()
+        while stack:
+            node = stack[-1]
+            if node in self._depth_cache:
+                stack.pop()
+                continue
+            on_stack.add(node)
+            parents = self.model_parents(node)
+            pending = [p for p in parents if p not in self._depth_cache and p not in on_stack]
+            if pending:
+                stack.extend(pending)
+                continue
+            depth = 1 + max(
+                (self._depth_cache[p] for p in parents if p in self._depth_cache),
+                default=0,
+            )
+            self._depth_cache[node] = depth
+            on_stack.discard(node)
+            stack.pop()
+        return self._depth_cache[uid]

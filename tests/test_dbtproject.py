@@ -72,3 +72,29 @@ def test_dag_facts(project):
 def test_unknown_node_raises(project):
     with pytest.raises(DbtProjectError):
         project.node("model.demo.nope")
+
+
+def _manifest_from_parent_map(parent_map: dict[str, list[str]]) -> dict:
+    nodes = {
+        uid: {"resource_type": "model", "name": uid, "depends_on": {"nodes": parents}}
+        for uid, parents in parent_map.items()
+    }
+    return {"nodes": nodes, "parent_map": parent_map, "child_map": {}}
+
+
+def test_lineage_depth_survives_cycle():
+    # a <-> b: a recursive walk loops forever; iteratively the depth stays finite.
+    project = DbtProject.from_manifest(
+        _manifest_from_parent_map({"model.a": ["model.b"], "model.b": ["model.a"]})
+    )
+    for uid in ("model.a", "model.b"):
+        depth = project.dag_facts(uid).lineage_depth
+        assert 1 <= depth <= 2  # finite, not a hang / RecursionError
+
+
+def test_lineage_depth_handles_deep_chain():
+    # 5000-deep chain would blow the recursion limit; iterative version handles it.
+    chain = {f"model.n{i}": [f"model.n{i + 1}"] for i in range(4999)}
+    chain["model.n4999"] = []
+    project = DbtProject.from_manifest(_manifest_from_parent_map(chain))
+    assert project.dag_facts("model.n0").lineage_depth == 5000

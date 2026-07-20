@@ -1,6 +1,6 @@
 import pytest
 
-from sqlquality.complexity import ComplexityEngine
+from sqlquality.complexity import METRIC_WEIGHTS, ComplexityEngine
 from sqlquality.models import ComplexityMetrics, DagFacts
 
 # metrics matching SQL_A / SQL_B / SQL_C from Task 3
@@ -33,6 +33,12 @@ def test_dag_facts_increase_score():
     assert s.dag is not None
 
 
-def test_score_capped_at_100():
+def test_score_is_uncapped():
+    # Previously capped at 100.0; the composite is now open-ended so the delta
+    # gate stays sensitive for already-very-complex models.
     huge = ComplexityMetrics(50, 50, 50, 50, 50, 50, 50, 50, 50, 50)
-    assert ComplexityEngine().score(huge).composite == 100.0
+    # select_count carries no weight; every other metric contributes weight * 50.
+    expected = round(sum(weight * 50 for weight in METRIC_WEIGHTS.values()), 1)
+    score = ComplexityEngine().score(huge).composite
+    assert score == pytest.approx(expected)
+    assert score > 100.0

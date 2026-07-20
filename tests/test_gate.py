@@ -41,3 +41,14 @@ def test_new_model_not_regression_in_fail_mode():
     r = evaluate_gate([new], Config(gate=GateConfig(mode="fail")))
     assert r.regressions == []
     assert r.passed is True
+
+
+def test_report_carries_mode_and_warned_flag():
+    warn = evaluate_gate([BIG], Config(gate=GateConfig(mode="warn")))
+    assert warn.mode == "warn"
+    assert warn.warned is True  # passed, but a regression slipped through
+    fail = evaluate_gate([BIG], Config(gate=GateConfig(mode="fail")))
+    assert fail.mode == "fail"
+    assert fail.warned is False
+    clean = evaluate_gate([SMALL], Config(gate=GateConfig(mode="warn")))
+    assert clean.warned is False  # warn mode, but no regressions

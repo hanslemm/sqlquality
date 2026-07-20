@@ -48,3 +48,20 @@ def test_skips_uncompiled_candidate():
     deltas, skipped = compute_deltas(None, _candidate(), ["seed.demo.raw_orders"], "postgres")
     assert deltas == []
     assert skipped and skipped[0][0] == "seed.demo.raw_orders"
+
+
+def _baseline_with_unscoreable_orders() -> DbtProject:
+    """Baseline where orders is present as a model but has no compiled_code."""
+    manifest = copy.deepcopy(json.loads(FIXTURE.read_text()))
+    manifest["nodes"]["model.demo.orders"]["compiled_code"] = None
+    return DbtProject.from_manifest(manifest)
+
+
+def test_baseline_present_but_unscoreable_is_skipped_not_new():
+    # orders is present in the baseline but uncompiled: a real regression must
+    # NOT be exempted as is_new. It lands in `skipped`, not `deltas`.
+    deltas, skipped = compute_deltas(
+        _baseline_with_unscoreable_orders(), _candidate(), ["model.demo.orders"], "postgres"
+    )
+    assert deltas == []
+    assert skipped == [("model.demo.orders", "baseline present but unscoreable")]

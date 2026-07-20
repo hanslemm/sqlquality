@@ -1,10 +1,13 @@
-"""Turn structural metrics (+ optional DAG facts) into a 0-100 complexity score."""
+"""Turn structural metrics (+ optional DAG facts) into a complexity score.
+
+The composite is open-ended (not capped): ~100 is very complex, but a
+sufficiently large model can score higher. Capping would blind the delta gate
+for models already at the cap.
+"""
 
 from __future__ import annotations
 
 from sqlquality.models import ComplexityMetrics, ComplexityScore, DagFacts
-
-MAX_SCORE = 100.0
 
 METRIC_WEIGHTS: dict[str, float] = {
     "join_count": 6.0,
@@ -34,5 +37,5 @@ class ComplexityEngine:
         if dag is not None:
             for name, weight in DAG_WEIGHTS.items():
                 components[f"dag.{name}"] = round(weight * getattr(dag, name), 2)
-        composite = round(min(MAX_SCORE, sum(components.values())), 1)
+        composite = round(sum(components.values()), 1)
         return ComplexityScore(composite=composite, components=components, metrics=metrics, dag=dag)
