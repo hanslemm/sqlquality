@@ -87,3 +87,46 @@ def test_check_corrupt_baseline_exit_2(tmp_path):
     with _mock_changed():
         result = runner.invoke(app, ["check", "--project-dir", str(proj), "--state", str(state)])
     assert result.exit_code == 2
+
+
+def test_check_explicit_missing_config_exit_2(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    missing = tmp_path / "nope.yml"
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--config",
+                str(missing),
+            ],
+        )
+    assert result.exit_code == 2
+    assert "does not exist" in result.stderr
+
+
+def test_check_invalid_config_exit_2(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    (proj / "sqlquality.yml").write_text("gate:\n  mode: fial\n")
+    with _mock_changed():
+        result = runner.invoke(app, ["check", "--project-dir", str(proj), "--state", str(state)])
+    assert result.exit_code == 2
+    assert "gate.mode" in result.stderr
+
+
+def test_check_old_schema_warns(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    manifest = json.loads((proj / "target" / "manifest.json").read_text())
+    manifest["metadata"]["dbt_schema_version"] = "https://schemas.getdbt.com/dbt/manifest/v9.json"
+    (proj / "target" / "manifest.json").write_text(json.dumps(manifest))
+    with _mock_changed():
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(state), "--json"]
+        )
+    # Warning only: no behavior change, still exits normally.
+    assert result.exit_code == 0
+    assert "v12" in result.stderr and "v9" in result.stderr
