@@ -13,6 +13,12 @@ class GateReport:
     deltas: list[ModelDelta]
     regressions: list[str]
     passed: bool
+    mode: str = "warn"
+
+    @property
+    def warned(self) -> bool:
+        """True when warn mode let regressions through (passed, but not clean)."""
+        return self.mode == "warn" and bool(self.regressions)
 
 
 def evaluate_gate(deltas: list[ModelDelta], config: Config) -> GateReport:
@@ -28,4 +34,4 @@ def evaluate_gate(deltas: list[ModelDelta], config: Config) -> GateReport:
         if not d.is_new and d.unique_id not in waivers and d.delta > threshold
     ]
     passed = config.gate.mode != "fail" or not regressions
-    return GateReport(deltas=deltas, regressions=regressions, passed=passed)
+    return GateReport(deltas=deltas, regressions=regressions, passed=passed, mode=config.gate.mode)

@@ -7,6 +7,12 @@ REPORT = GateReport(
     regressions=[],
     passed=True,
 )
+WARN = GateReport(
+    deltas=[ModelDelta("model.demo.orders", 5.0, 30.0, 25.0, False)],
+    regressions=["model.demo.orders"],
+    passed=True,
+    mode="warn",
+)
 
 
 def test_gate_payload_shape():
@@ -42,3 +48,20 @@ def test_gate_payload_includes_skipped():
 
 def test_gate_payload_skipped_defaults_empty():
     assert gate_payload(REPORT, neighbors=[])["skipped"] == []
+
+
+def test_gate_payload_has_mode_and_warned():
+    clean = gate_payload(REPORT, neighbors=[])
+    assert clean["mode"] == "warn"
+    assert clean["warned"] is False
+    warned = gate_payload(WARN, neighbors=[])
+    assert warned["mode"] == "warn"
+    assert warned["warned"] is True
+    assert warned["passed"] is True  # warn mode still passes
+
+
+def test_render_html_warn_banner():
+    html = render_html(WARN)
+    assert "WARN" in html
+    assert "gate mode: warn" in html
+    assert "sqlquality: PASS" not in html

@@ -21,7 +21,7 @@ from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
 from sqlquality.models import Severity
-from sqlquality.report import gate_payload, render_html, render_markdown
+from sqlquality.report import gate_payload, render_html, render_markdown, verdict_label
 from sqlquality.sqlast import SqlParseError, analyze_sql
 
 console = Console()
@@ -160,7 +160,7 @@ def check(
             json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True)
         )
     else:
-        verdict = "PASS" if report.passed else "FAIL"
+        verdict = verdict_label(report, emoji=True)
         table = Table(
             title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})"
         )
