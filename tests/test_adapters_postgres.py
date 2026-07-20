@@ -14,12 +14,27 @@ SEQ = [
         }
     }
 ]
+# Real Postgres EXPLAIN (FORMAT JSON) emits Sort Method / Sort Space Used /
+# Sort Space Type as separate properties (not a single "external merge Disk").
 SPILL = [
     {
         "Plan": {
             "Node Type": "Sort",
-            "Sort Method": "external merge Disk",
+            "Sort Method": "external merge",
+            "Sort Space Used": 22456,
+            "Sort Space Type": "Disk",
             "Plans": [{"Node Type": "Seq Scan", "Relation Name": "big", "Plans": []}],
+        }
+    }
+]
+MEMORY_SORT = [
+    {
+        "Plan": {
+            "Node Type": "Sort",
+            "Sort Method": "quicksort",
+            "Sort Space Used": 64,
+            "Sort Space Type": "Memory",
+            "Plans": [],
         }
     }
 ]
@@ -41,8 +56,12 @@ def test_seq_scan_flagged():
 
 def test_sort_spill_and_child_seq_scan():
     codes = {f.code for f in parse_pg_plan(SPILL)}
-    assert "PG002" in codes  # the spill
+    assert "PG002" in codes  # the spill (Sort Space Type == "Disk")
     assert "PG001" in codes  # the nested seq scan on 'big'
+
+
+def test_in_memory_sort_not_flagged():
+    assert "PG002" not in {f.code for f in parse_pg_plan(MEMORY_SORT)}
 
 
 def test_index_scan_clean():
