@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 from sqlglot import exp
 
 from sqlquality.models import Finding, Severity
 from sqlquality.sqlast import SqlParseError, parse
 
 
-def _join_key_columns(tree: exp.Expression) -> list[str]:
-    names: set[str] = set()
+def _join_key_counts(tree: exp.Expression) -> Counter[str]:
+    """Count each column's occurrences across all equi-join predicates."""
+    counts: Counter[str] = Counter()
     for join in tree.find_all(exp.Join):
         on = join.args.get("on")
         if on is None:
@@ -17,9 +20,13 @@ def _join_key_columns(tree: exp.Expression) -> list[str]:
         for eq in on.find_all(exp.EQ):
             left, right = eq.this, eq.expression
             if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                names.add(left.name)
-                names.add(right.name)
-    return sorted(names)
+                counts[left.name] += 1
+                counts[right.name] += 1
+    return counts
+
+
+def _join_key_columns(tree: exp.Expression) -> list[str]:
+    return sorted(_join_key_counts(tree))
 
 
 def _filter_columns(tree: exp.Expression) -> list[str]:
@@ -27,7 +34,7 @@ def _filter_columns(tree: exp.Expression) -> list[str]:
     if where is None:
         return []
     names: set[str] = set()
-    for node in where.find_all(exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.Between):
+    for node in where.find_all(exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.Between, exp.In):
         if isinstance(node, exp.Between):
             col = node.this
             low = node.args.get("low")
@@ -36,6 +43,15 @@ def _filter_columns(tree: exp.Expression) -> list[str]:
                 isinstance(col, exp.Column)
                 and isinstance(low, exp.Literal)
                 and isinstance(high, exp.Literal)
+            ):
+                names.add(col.name)
+        elif isinstance(node, exp.In):
+            col = node.this
+            values = node.args.get("expressions") or []
+            if (
+                isinstance(col, exp.Column)
+                and values
+                and all(isinstance(value, exp.Literal) for value in values)
             ):
                 names.add(col.name)
         else:
@@ -62,17 +78,19 @@ def dist_sort_findings(sql: str, dialect: str) -> list[Finding]:
     except SqlParseError:
         return []
     findings: list[Finding] = []
-    jk = _join_key_columns(tree)
-    if jk:
-        findings.append(
-            Finding(
-                "RS001",
-                f"Consider a DISTKEY on the join key(s): {', '.join(jk)} — colocates joined rows and avoids redistribution.",
-                0,
-                Severity.INFO,
-                False,
-            )
+    counts = _join_key_counts(tree)
+    if counts:
+        # Redshift allows only ONE DISTKEY column: pick the most frequent equi-join
+        # key (ties broken alphabetically); surface the rest as alternates.
+        best = min(counts, key=lambda name: (-counts[name], name))
+        alternates = sorted(name for name in counts if name != best)
+        message = (
+            f"Consider a single-column DISTKEY on the most frequent join key: {best} "
+            "— colocates joined rows and avoids redistribution (Redshift permits only one DISTKEY)."
         )
+        if alternates:
+            message += f" Alternate candidate(s): {', '.join(alternates)}."
+        findings.append(Finding("RS001", message, 0, Severity.INFO, False))
     fc = _filter_columns(tree)
     if fc:
         findings.append(
