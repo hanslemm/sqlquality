@@ -73,21 +73,25 @@ def _labels(path: Path) -> tuple[str, str]:
 def read_sql_file(path: Path) -> str:
     """Read SQL text from a file, or from stdin when ``path`` is ``-``.
 
-    Prints a friendly message and exits 2 on a missing file, a non-UTF-8 file, or
-    any other read error, so callers get a consistent input-error experience.
+    Prints a friendly message and exits 2 on a missing file, a non-UTF-8 source, or
+    any other read error, so callers get a consistent input-error experience. Stdin
+    is decoded from raw bytes so a non-UTF-8 pipe fails the same way a file does
+    (never a traceback / exit 1 that CI would misread as findings).
     """
-    if str(path) == "-":
-        return sys.stdin.read()
+    is_stdin = str(path) == "-"
+    source = "<stdin>" if is_stdin else str(path)
     try:
+        if is_stdin:
+            return sys.stdin.buffer.read().decode("utf-8")
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         typer.echo(f"No such file: {path}", err=True)
         raise typer.Exit(code=2)
     except UnicodeDecodeError:
-        typer.echo(f"{path} is not valid UTF-8 — supply a UTF-8 encoded SQL file.", err=True)
+        typer.echo(f"{source} is not valid UTF-8 — supply UTF-8 encoded SQL.", err=True)
         raise typer.Exit(code=2)
     except OSError as exc:
-        typer.echo(f"Could not read {path}: {exc}", err=True)
+        typer.echo(f"Could not read {source}: {exc}", err=True)
         raise typer.Exit(code=2)
 
 
@@ -188,7 +192,7 @@ def _resolve_check_dialect(candidate: DbtProject) -> str:
     ``--dialect`` was given.
     """
     adapter_type = candidate.adapter_type()
-    if adapter_type:
+    if isinstance(adapter_type, str) and adapter_type:
         try:
             resolved = validate_dialect(adapter_type)
         except ValueError:
@@ -346,10 +350,12 @@ def lint(
         raise typer.Exit(code=2)
     excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
     config_path = str(sqlfluff_config) if sqlfluff_config is not None else None
+    # Pre-flight every path before touching any file: a bad path (missing, non-UTF-8)
+    # must exit 2 with no side effects, not rewrite earlier files then abort.
+    sources = [(path, read_sql_file(path)) for path in paths]
     file_reports: list[dict] = []
     gating = False
-    for path in paths:
-        sql = read_sql_file(path)
+    for path, sql in sources:
         _, machine_path = _labels(path)
         findings = lint_sql(sql, dialect, excl, config_path)
         changed = False
@@ -422,6 +428,9 @@ def perf(
     ),
 ) -> None:
     """Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan)."""
+    if str(path) == "-":
+        typer.echo("stdin ('-') is not supported for perf; pass a file path.", err=True)
+        raise typer.Exit(code=2)
     dialect = _validate_dialect_or_exit(dialect)
     try:
         adapter = get_adapter(dialect)
@@ -434,16 +443,17 @@ def perf(
     display_name, machine_path = _labels(path)
 
     # static_findings swallows parse errors into an SQ000 finding, so a raw dbt
-    # model would otherwise yield only SQ000. Parse-check first and, when the source
-    # is Jinja, retry against stripped placeholders so we get real anti-pattern
+    # model would otherwise yield only SQ000. When the source is Jinja, parse-check
+    # first and retry against stripped placeholders so we get real anti-pattern
     # findings; if stripping still fails, fall back to SQ000 (annotated below).
+    # Plain SQL skips the pre-parse — static_findings parses it once itself.
     analyze_target = sql
     jinja_notice = False
     had_jinja = _has_jinja(sql)
-    try:
-        parse(sql, dialect)
-    except SqlParseError:
-        if had_jinja:
+    if had_jinja:
+        try:
+            parse(sql, dialect)
+        except SqlParseError:
             stripped = strip_jinja(sql)
             try:
                 parse(stripped, dialect)

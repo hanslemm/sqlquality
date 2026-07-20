@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lineage depth computation.
 - **Lint**: `--warn-only` mode; `--sqlfluff-config` option to pass a custom
   SQLFluff config; pre-commit hook now excludes `target/`.
+- **CLI**: unknown `--dialect` now fails with a friendly, suggestion-bearing
+  error (exit 2) on every command; `complexity` and `lint` accept `-` to read
+  from stdin; `complexity`/`perf` retry Jinja models with `strip_jinja`
+  placeholders (approximate results); `--help` documents the exit-code contract
+  (0 = pass, 1 = findings/gate failure, 2 = usage/config/input error).
 - **Perf / LLM**: `perf --suggest` LLM enrichment with per-finding isolation
   and prompt truncation.
 - **Scoring**: `EXISTS` now counted as a subquery; single-column `DISTKEY`
@@ -29,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer capped; warn-mode now renders `WARN` explicitly; friendly dbt error
   messages with a timeout; markdown output is escaped.
 - **Lint**: Jinja/`TMP` findings demoted to `info` severity.
+- **Check**: `--dialect` now resolves from the manifest's `adapter_type` when not
+  passed explicitly (falling back to `postgres`), so non-postgres projects may see
+  different scores/gate outcomes than in `0.1.0`; pass `--dialect` to override.
 - **Scoring**: `SQ001` gains `EXISTS`/CTE-closer exemptions; `SQ002` gains
   comma-join scoping and constant-true `ON` detection.
 
