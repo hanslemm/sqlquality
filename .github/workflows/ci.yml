@@ -7,13 +7,18 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
-      - run: uv sync
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src/sqlquality
       - run: uv run pytest
+      - run: uv build
