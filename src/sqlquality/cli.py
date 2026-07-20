@@ -294,9 +294,14 @@ def perf(
                 )
             else:
                 suggestions = enrich_findings(findings, sql, provider)
+                if len(suggestions) < len(findings):
+                    # enrich_findings skips per-finding call failures silently, so
+                    # surface a single note when some (or all) calls dropped out.
+                    missing = len(findings) - len(suggestions)
+                    typer.echo(f"LLM suggestions unavailable for {missing} finding(s).", err=True)
         except Exception as exc:  # advisory-only: never affect the exit code or report
-            # Covers provider construction (missing package/credentials) and any
-            # call failures — findings still print and the exit code is unchanged.
+            # Covers provider construction (missing package/credentials); findings
+            # still print and the exit code is unchanged.
             typer.echo(f"LLM suggestions unavailable: {exc}", err=True)
 
     if json_out:
