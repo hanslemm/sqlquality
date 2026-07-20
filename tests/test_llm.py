@@ -33,6 +33,14 @@ def test_build_prompt_does_not_truncate_short_sql():
     assert "... [truncated]" not in prompt
 
 
+def test_build_prompt_exact_boundary_not_truncated():
+    # SQL exactly at the cap must pass through untouched (strictly-greater cut).
+    sql = "Z" * MAX_PROMPT_SQL_CHARS
+    prompt = build_prompt(FINDING, sql)
+    assert "... [truncated]" not in prompt
+    assert prompt.count("Z") == MAX_PROMPT_SQL_CHARS
+
+
 def test_callable_provider_is_an_llmprovider():
     provider = CallableProvider(lambda p: "ok")
     assert isinstance(provider, LLMProvider)
