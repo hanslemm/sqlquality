@@ -22,7 +22,9 @@ def verdict_label(report: GateReport, *, emoji: bool) -> str:
     """Human verdict string. `emoji` toggles the decorated vs plain variant."""
     if report.warned:
         head = "⚠️ WARN" if emoji else "WARN"
-        return f"{head} ({len(report.regressions)} regressions, gate mode: {report.mode})"
+        n = len(report.regressions)
+        noun = "regression" if n == 1 else "regressions"
+        return f"{head} ({n} {noun}, gate mode: {report.mode})"
     if report.passed:
         return "✅ PASS" if emoji else "PASS"
     return "❌ FAIL" if emoji else "FAIL"
