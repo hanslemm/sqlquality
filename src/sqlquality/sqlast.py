@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import cast
 
 import sqlglot
@@ -9,6 +10,16 @@ from sqlglot import exp
 from sqlglot.errors import ParseError, TokenError
 
 from sqlquality.models import ComplexityMetrics
+
+#: Identifier substituted for each ``{{ ... }}`` Jinja expression by :func:`strip_jinja`.
+JINJA_PLACEHOLDER = "__sqlquality_jinja__"
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_JINJA_STATEMENT = re.compile(r"\{%.*?%\}", re.DOTALL)
+_JINJA_EXPRESSION = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+_FIRST_STATEMENT_KEYWORD = re.compile(r"\b(?:with|select)\b", re.IGNORECASE)
+_SQL_LINE_COMMENT = re.compile(r"--[^\n]*")
+_SQL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 class SqlParseError(ValueError):
@@ -46,10 +57,18 @@ def analyze_sql(sql: str, dialect: str) -> ComplexityMetrics:
     top_select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
     projected = len(top_select.expressions) if top_select is not None else 0
 
+    # EXISTS (SELECT ...) is a correlated subquery too, but sqlglot models it as an
+    # exp.Exists holding an exp.Select directly (no exp.Subquery), so `WHERE EXISTS`
+    # would otherwise score lower than the equivalent `WHERE ... IN (SELECT ...)`.
+    # Guard against double-counting EXISTS((SELECT ...)), which produces both nodes.
+    exists_subqueries = sum(
+        1 for node in tree.find_all(exp.Exists) if not isinstance(node.this, exp.Subquery)
+    )
+
     return ComplexityMetrics(
         join_count=count(exp.Join),
         cte_count=count(exp.CTE),
-        subquery_count=count(exp.Subquery),
+        subquery_count=count(exp.Subquery) + exists_subqueries,
         window_count=count(exp.Window),
         case_count=count(exp.Case),
         union_count=count(exp.SetOperation),  # Union + Except + Intersect
@@ -58,3 +77,52 @@ def analyze_sql(sql: str, dialect: str) -> ComplexityMetrics:
         max_select_depth=max_depth,
         projected_columns=projected,
     )
+
+
+def strip_jinja(sql: str) -> str:
+    """Best-effort removal of dbt/Jinja templating so a raw model roughly parses.
+
+    The result is *approximate* — it is meant to make an uncompiled dbt model
+    parseable for structural analysis, not to reproduce dbt's compiled SQL:
+
+    * ``{# ... #}`` comment blocks are removed entirely (multi-line aware).
+    * ``{% ... %}`` statement blocks are removed entirely (multi-line aware).
+    * ``{{ ... }}`` expressions are replaced with the placeholder identifier
+      :data:`JINJA_PLACEHOLDER`, so ``from {{ ref('stg') }}`` becomes a valid table.
+    * Any statement-leading Jinja is dropped: everything before the first
+      ``WITH``/``SELECT`` keyword that is only placeholders, whitespace, or
+      comments is removed, so a model opening with ``{{ config(...) }}`` parses.
+
+    Because ``{% ... %}`` tags are removed but the text between them is kept, a
+    conditional such as ``{% if %} ... {% else %} ... {% endif %}`` leaves *both*
+    branches concatenated, which may be unparseable — hence best-effort only.
+    """
+    text = _JINJA_COMMENT.sub(" ", sql)
+    text = _JINJA_STATEMENT.sub(" ", text)
+    text = _JINJA_EXPRESSION.sub(JINJA_PLACEHOLDER, text)
+
+    # Search for the first statement keyword on a comment-masked copy (SQL comments
+    # blanked to equal-length spans so offsets survive), so a leading comment that
+    # happens to contain "with"/"select" cannot be mistaken for the statement start.
+    masked = _mask_sql_comments(text)
+    keyword = _FIRST_STATEMENT_KEYWORD.search(masked)
+    if keyword is not None:
+        prefix = text[: keyword.start()]
+        residue = prefix.replace(JINJA_PLACEHOLDER, " ")
+        residue = _SQL_BLOCK_COMMENT.sub(" ", residue)
+        residue = _SQL_LINE_COMMENT.sub(" ", residue)
+        if not residue.strip():
+            text = text[keyword.start() :]
+
+    return text
+
+
+def _mask_sql_comments(text: str) -> str:
+    """Replace SQL ``--`` line and ``/* */`` block comments with equal-length spaces."""
+
+    def _blank(match: re.Match[str]) -> str:
+        return " " * (match.end() - match.start())
+
+    masked = _SQL_BLOCK_COMMENT.sub(_blank, text)
+    masked = _SQL_LINE_COMMENT.sub(_blank, masked)
+    return masked

@@ -29,6 +29,12 @@ def test_filter_columns():
     assert filter_columns("select * from t", "redshift") == []
 
 
+def test_filter_columns_in_literal_list():
+    assert filter_columns("select * from t where status in ('a', 'b')", "redshift") == ["status"]
+    # IN (subquery) is not a literal filter and must not contribute a SORTKEY column.
+    assert filter_columns("select * from t where id in (select id from u)", "redshift") == []
+
+
 def test_dist_sort_findings():
     findings = dist_sort_findings(
         "select * from orders o join customers c on c.id = o.customer_id "
@@ -39,6 +45,36 @@ def test_dist_sort_findings():
     assert codes == {"RS001", "RS002"}
     rs001 = next(f for f in findings if f.code == "RS001")
     assert "customer_id" in rs001.message
+
+
+def test_dist_sort_distkey_is_single_most_frequent_key():
+    findings = dist_sort_findings(
+        "select * from a "
+        "join b on a.user_id = b.user_id "
+        "join c on a.user_id = c.user_id "
+        "join d on a.account_id = d.account_id "
+        "where status in ('open', 'closed')",
+        "redshift",
+    )
+    rs001 = next(f for f in findings if f.code == "RS001")
+    assert "user_id" in rs001.message
+    assert "account_id" in rs001.message  # surfaced as an alternate
+    # single-column recommendation: account_id must not be the recommended key
+    assert "join key: user_id" in rs001.message
+    rs002 = next(f for f in findings if f.code == "RS002")
+    assert "status" in rs002.message  # contributed by the IN (...) list
+
+
+def test_dist_sort_distkey_dedupes_per_predicate():
+    # `a.k = b.k` names `k` on both sides but is ONE join; `m` appears across two
+    # separate joins. After per-predicate dedupe, `m` (2) must beat `k` (1).
+    findings = dist_sort_findings(
+        "select * from a join b on a.k = b.k join c on a.m = c.x join d on a.m = d.y",
+        "redshift",
+    )
+    rs001 = next(f for f in findings if f.code == "RS001")
+    assert "join key: m" in rs001.message
+    assert "k" in rs001.message  # surfaced as an alternate, not the recommendation
 
 
 def test_dist_sort_no_findings_when_nothing():
