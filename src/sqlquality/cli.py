@@ -87,7 +87,7 @@ def complexity(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    table = Table(title=f"Complexity — {path.name}  (composite {result.composite}/100)")
+    table = Table(title=f"Complexity — {path.name}  (composite {result.composite})")
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_column("contribution", justify="right")
