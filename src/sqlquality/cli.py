@@ -204,26 +204,44 @@ def lint(
         ..., exists=True, dir_okay=False, readable=True, help="One or more .sql files."
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
-    fix: bool = typer.Option(False, "--fix", help="Rewrite the file with auto-fixes."),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Rewrite the file with auto-fixes. Exit code reflects pre-fix findings "
+        "(a fully-fixed file still exits 1).",
+    ),
     exclude_rules: str | None = typer.Option(
         None, "--exclude-rules", help="Comma-separated rule codes to skip."
+    ),
+    sqlfluff_config: Path | None = typer.Option(
+        None,
+        "--sqlfluff-config",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Path to a SQLFluff config file (e.g. .sqlfluff) to apply.",
+    ),
+    warn_only: bool = typer.Option(
+        False, "--warn-only", help="Print/emit findings but always exit 0."
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Lint SQL files for best-practice violations (SQLFluff); --fix rewrites them."""
     excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
+    config_path = str(sqlfluff_config) if sqlfluff_config is not None else None
     file_reports: list[dict] = []
-    any_error = False
+    gating = False
     for path in paths:
         sql = path.read_text()
-        findings = lint_sql(sql, dialect, excl)
+        findings = lint_sql(sql, dialect, excl, config_path)
         changed = False
         if fix:
-            fixed_sql = fix_sql(sql, dialect, excl)
+            fixed_sql = fix_sql(sql, dialect, excl, config_path)
             if fixed_sql != sql:
                 path.write_text(fixed_sql)
                 changed = True
-        any_error = any_error or any(f.severity is Severity.ERROR for f in findings)
+        # INFO (unresolved-Jinja) findings are advisory and never gate the commit.
+        gating = gating or any(f.severity in (Severity.WARNING, Severity.ERROR) for f in findings)
         file_reports.append(
             {
                 "path": str(path),
@@ -263,7 +281,7 @@ def lint(
             if report["fixed"]:
                 console.print(f"[green]Rewrote {report['path']} with auto-fixes.[/]")
 
-    raise typer.Exit(code=1 if any_error else 0)
+    raise typer.Exit(code=1 if gating and not warn_only else 0)
 
 
 @app.command()
