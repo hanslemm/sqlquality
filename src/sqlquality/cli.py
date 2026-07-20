@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+import sys
+from dataclasses import asdict, replace
 from pathlib import Path
+from typing import NoReturn
 
 import typer
 from rich.console import Console
@@ -17,12 +19,13 @@ from sqlquality.complexity import ComplexityEngine
 from sqlquality.config import ConfigError, load_config
 from sqlquality.dbtproject import DbtProject, DbtProjectError
 from sqlquality.delta import compute_deltas
+from sqlquality.dialects import validate_dialect
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
 from sqlquality.models import Severity
 from sqlquality.report import gate_payload, render_html, render_markdown, verdict_label
-from sqlquality.sqlast import SqlParseError, analyze_sql
+from sqlquality.sqlast import SqlParseError, analyze_sql, parse, strip_jinja
 
 console = Console()
 
@@ -30,6 +33,22 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Measure dbt model performance and complexity.",
+    epilog=(
+        "Exit codes: 0 = pass / no findings; 1 = findings or gate failure; "
+        "2 = usage, config, or input error."
+    ),
+)
+
+#: Substrings whose presence marks a source as containing dbt/Jinja templating.
+_JINJA_MARKERS = ("{{", "{%")
+#: Notice emitted (stderr only) when analysis falls back to Jinja placeholders.
+_JINJA_NOTICE = (
+    "analyzed with Jinja placeholders — results are approximate; "
+    "prefer compiled SQL from target/compiled/"
+)
+#: Appended to a parse-error message when the source contained Jinja markers.
+_COMPILED_HINT = (
+    " — the source contains Jinja; supply compiled SQL from target/compiled/ for accurate results"
 )
 
 
@@ -37,6 +56,61 @@ def _version_callback(value: bool) -> None:
     if value:
         typer.echo(__version__)
         raise typer.Exit()
+
+
+def _has_jinja(sql: str) -> bool:
+    """True if the source contains any dbt/Jinja templating markers."""
+    return any(marker in sql for marker in _JINJA_MARKERS)
+
+
+def _labels(path: Path) -> tuple[str, str]:
+    """Return (display_name, machine_path) for a source; '<stdin>' when path is '-'."""
+    if str(path) == "-":
+        return "<stdin>", "<stdin>"
+    return path.name, str(path)
+
+
+def read_sql_file(path: Path) -> str:
+    """Read SQL text from a file, or from stdin when ``path`` is ``-``.
+
+    Prints a friendly message and exits 2 on a missing file, a non-UTF-8 source, or
+    any other read error, so callers get a consistent input-error experience. Stdin
+    is decoded from raw bytes so a non-UTF-8 pipe fails the same way a file does
+    (never a traceback / exit 1 that CI would misread as findings).
+    """
+    is_stdin = str(path) == "-"
+    source = "<stdin>" if is_stdin else str(path)
+    try:
+        if is_stdin:
+            return sys.stdin.buffer.read().decode("utf-8")
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        typer.echo(f"No such file: {path}", err=True)
+        raise typer.Exit(code=2)
+    except UnicodeDecodeError:
+        typer.echo(f"{source} is not valid UTF-8 — supply UTF-8 encoded SQL.", err=True)
+        raise typer.Exit(code=2)
+    except OSError as exc:
+        typer.echo(f"Could not read {source}: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
+def _validate_dialect_or_exit(name: str) -> str:
+    """Normalize a dialect name or print the friendly error and exit 2."""
+    try:
+        return validate_dialect(name)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+
+
+def _fail_parse(exc: SqlParseError, *, had_jinja: bool) -> NoReturn:
+    """Print a parse-error message (with a compiled-SQL hint for Jinja) and exit 2."""
+    message = str(exc)
+    if had_jinja:
+        message += _COMPILED_HINT
+    typer.echo(message, err=True)
+    raise typer.Exit(code=2)
 
 
 @app.callback()
@@ -56,10 +130,8 @@ def _root(
 def complexity(
     path: Path = typer.Argument(
         ...,
-        exists=True,
         dir_okay=False,
-        readable=True,
-        help="Path to a .sql file (compiled/plain SQL, not Jinja).",
+        help="Path to a .sql file (or '-' for stdin).",
     ),
     dialect: str = typer.Option(
         "postgres", "--dialect", "-d", help="SQL dialect (e.g. postgres, redshift)."
@@ -67,18 +139,30 @@ def complexity(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Score the structural complexity of a single SQL file."""
-    sql = path.read_text()
+    dialect = _validate_dialect_or_exit(dialect)
+    sql = read_sql_file(path)
+    display_name, machine_path = _labels(path)
+
+    jinja_notice = False
     try:
         metrics = analyze_sql(sql, dialect)
     except SqlParseError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=2)
+        if not _has_jinja(sql):
+            _fail_parse(exc, had_jinja=False)
+        try:
+            metrics = analyze_sql(strip_jinja(sql), dialect)
+        except SqlParseError as retry_exc:
+            _fail_parse(retry_exc, had_jinja=True)
+        jinja_notice = True
+
+    if jinja_notice:
+        typer.echo(_JINJA_NOTICE, err=True)
 
     result = ComplexityEngine().score(metrics)
 
     if json_out:
         payload = {
-            "path": str(path),
+            "path": machine_path,
             "dialect": dialect,
             "composite": result.composite,
             "components": result.components,
@@ -87,7 +171,7 @@ def complexity(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    table = Table(title=f"Complexity — {path.name}  (composite {result.composite})")
+    table = Table(title=f"Complexity — {display_name}  (composite {result.composite})")
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_column("contribution", justify="right")
@@ -101,6 +185,28 @@ def complexity(
     console.print(table)
 
 
+def _resolve_check_dialect(candidate: DbtProject) -> str:
+    """Resolve check's dialect from the manifest's adapter_type, else postgres.
+
+    Emits a stderr notice describing the source. Only called when no explicit
+    ``--dialect`` was given.
+    """
+    adapter_type = candidate.adapter_type()
+    if isinstance(adapter_type, str) and adapter_type:
+        try:
+            resolved = validate_dialect(adapter_type)
+        except ValueError:
+            resolved = None
+        if resolved is not None:
+            typer.echo(f"dialect: {resolved} (from manifest adapter_type)", err=True)
+            return resolved
+    typer.echo(
+        "dialect: postgres (default — manifest adapter_type absent or unrecognized)",
+        err=True,
+    )
+    return "postgres"
+
+
 @app.command()
 def check(
     project_dir: Path = typer.Option(
@@ -112,7 +218,12 @@ def check(
     config: Path | None = typer.Option(
         None, "--config", help="Path to sqlquality.yml (default: <project-dir>/sqlquality.yml)."
     ),
-    dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
+    dialect: str | None = typer.Option(
+        None,
+        "--dialect",
+        "-d",
+        help="SQL dialect (default: manifest adapter_type, else postgres).",
+    ),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     html: Path | None = typer.Option(None, "--html", help="Write a self-contained HTML report."),
     markdown: Path | None = typer.Option(
@@ -127,6 +238,10 @@ def check(
     if config is not None and not config.is_file():
         typer.echo(f"--config path is not a file: {config}", err=True)
         raise typer.Exit(code=2)
+    # An explicit --dialect is validated up front; the manifest-derived default is
+    # resolved after the candidate manifest loads.
+    if dialect is not None:
+        dialect = _validate_dialect_or_exit(dialect)
     cfg_path = config if config is not None else project_dir / "sqlquality.yml"
     try:
         cfg = load_config(cfg_path)
@@ -140,6 +255,8 @@ def check(
     except DbtProjectError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
+
+    resolved_dialect = dialect if dialect is not None else _resolve_check_dialect(candidate)
 
     schema_version = candidate.schema_version()
     if "/v12" not in schema_version:
@@ -165,7 +282,7 @@ def check(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
 
-    deltas, skipped = compute_deltas(baseline, candidate, changeset.changed, dialect)
+    deltas, skipped = compute_deltas(baseline, candidate, changeset.changed, resolved_dialect)
     report = evaluate_gate(deltas, cfg)
 
     if html is not None:
@@ -201,7 +318,7 @@ def check(
 @app.command()
 def lint(
     paths: list[Path] = typer.Argument(
-        ..., exists=True, dir_okay=False, readable=True, help="One or more .sql files."
+        ..., dir_okay=False, help="One or more .sql files (or '-' for stdin)."
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
     fix: bool = typer.Option(
@@ -227,12 +344,19 @@ def lint(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Lint SQL files for best-practice violations (SQLFluff); --fix rewrites them."""
+    dialect = _validate_dialect_or_exit(dialect)
+    if fix and any(str(p) == "-" for p in paths):
+        typer.echo("--fix cannot rewrite stdin ('-'); pass a file path instead.", err=True)
+        raise typer.Exit(code=2)
     excl = [r.strip() for r in exclude_rules.split(",")] if exclude_rules else None
     config_path = str(sqlfluff_config) if sqlfluff_config is not None else None
+    # Pre-flight every path before touching any file: a bad path (missing, non-UTF-8)
+    # must exit 2 with no side effects, not rewrite earlier files then abort.
+    sources = [(path, read_sql_file(path)) for path in paths]
     file_reports: list[dict] = []
     gating = False
-    for path in paths:
-        sql = path.read_text()
+    for path, sql in sources:
+        _, machine_path = _labels(path)
         findings = lint_sql(sql, dialect, excl, config_path)
         changed = False
         if fix:
@@ -244,7 +368,7 @@ def lint(
         gating = gating or any(f.severity in (Severity.WARNING, Severity.ERROR) for f in findings)
         file_reports.append(
             {
-                "path": str(path),
+                "path": machine_path,
                 "fixed": changed,
                 "findings": [
                     {
@@ -304,14 +428,52 @@ def perf(
     ),
 ) -> None:
     """Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan)."""
-    sql = path.read_text()
+    if str(path) == "-":
+        typer.echo("stdin ('-') is not supported for perf; pass a file path.", err=True)
+        raise typer.Exit(code=2)
+    dialect = _validate_dialect_or_exit(dialect)
     try:
         adapter = get_adapter(dialect)
     except ValueError as exc:
+        # A valid-but-unsupported dialect (only postgres/redshift have perf adapters).
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
 
-    findings = adapter.static_findings(sql)
+    sql = read_sql_file(path)
+    display_name, machine_path = _labels(path)
+
+    # static_findings swallows parse errors into an SQ000 finding, so a raw dbt
+    # model would otherwise yield only SQ000. When the source is Jinja, parse-check
+    # first and retry against stripped placeholders so we get real anti-pattern
+    # findings; if stripping still fails, fall back to SQ000 (annotated below).
+    # Plain SQL skips the pre-parse — static_findings parses it once itself.
+    analyze_target = sql
+    jinja_notice = False
+    had_jinja = _has_jinja(sql)
+    if had_jinja:
+        try:
+            parse(sql, dialect)
+        except SqlParseError:
+            stripped = strip_jinja(sql)
+            try:
+                parse(stripped, dialect)
+            except SqlParseError:
+                pass
+            else:
+                analyze_target = stripped
+                jinja_notice = True
+
+    findings = adapter.static_findings(analyze_target)
+    if had_jinja and not jinja_notice:
+        # Stripping did not yield parseable SQL: annotate the SQ000 parse error with
+        # the compiled-SQL hint so the user knows why and what to do.
+        findings = [
+            replace(f, message=f.message + _COMPILED_HINT) if f.code == "SQ000" else f
+            for f in findings
+        ]
+    if jinja_notice:
+        typer.echo(_JINJA_NOTICE, err=True)
+
     if explain is not None:
         try:
             findings = findings + adapter.plan_findings(explain.read_text())
@@ -343,7 +505,7 @@ def perf(
 
     if json_out:
         payload = {
-            "path": str(path),
+            "path": machine_path,
             "dialect": dialect,
             "findings": [
                 {
@@ -359,7 +521,7 @@ def perf(
         }
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        table = Table(title=f"Perf — {path.name} ({dialect}, {len(findings)} findings)")
+        table = Table(title=f"Perf — {display_name} ({dialect}, {len(findings)} findings)")
         table.add_column("code")
         table.add_column("severity")
         table.add_column("message")
