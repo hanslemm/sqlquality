@@ -10,11 +10,10 @@ from sqlquality.models import Finding, Severity
 # macro (dbt_utils.*, custom macros). TMP is the undefined-variable error; PRS is
 # the unparsable section that follows. On a raw dbt model these are advisory only.
 _TEMPLATING_CODES = frozenset({"TMP", "PRS"})
-_JINJA_HINT = " (unresolved Jinja — lint compiled SQL or configure a dbt templater; see docs)"
-
-
-def _has_jinja(sql: str) -> bool:
-    return "{{" in sql or "{%" in sql
+_JINJA_HINT = (
+    " (unresolved Jinja — lint the compiled SQL under target/compiled/ "
+    "or pass a dbt-templater config via --sqlfluff-config)"
+)
 
 
 def _to_finding(violation: dict, *, templating: bool) -> Finding:
@@ -48,13 +47,16 @@ def lint_sql(
 ) -> list[Finding]:
     """Lint one SQL string; return findings (parse errors included as PRS).
 
-    A file whose violations include a TMP code (or whose raw source contains Jinja)
-    is treated as unresolved-templating: its TMP/PRS findings are demoted to INFO.
+    A file whose violations include a TMP code is treated as unresolved-templating:
+    its TMP/PRS findings are demoted to INFO. TMP is the only reliable evidence that
+    templating failed — a genuine PRS on rendered SQL (Jinja only in comments, valid
+    Jinja that renders to broken SQL, templater=raw configs) carries no TMP and stays
+    ERROR.
     """
     violations = sqlfluff.lint(
         sql, dialect=dialect, exclude_rules=exclude_rules, config_path=config_path
     )
-    templating = _has_jinja(sql) or any(v.get("code") == "TMP" for v in violations)
+    templating = any(v.get("code") == "TMP" for v in violations)
     return [_to_finding(v, templating=templating) for v in violations]
 
 

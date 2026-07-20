@@ -132,20 +132,43 @@ def test_lint_sqlfluff_config_passthrough(tmp_path, monkeypatch):
     f = tmp_path / "m.sql"
     f.write_text("select 1\n")
 
-    captured = {}
+    lint_kwargs: dict = {}
+    fix_kwargs: dict = {}
 
     def fake_lint(sql, **kwargs):
-        captured.update(kwargs)
+        lint_kwargs.update(kwargs)
         return []
 
+    def fake_fix(sql, **kwargs):
+        fix_kwargs.update(kwargs)
+        return sql
+
     monkeypatch.setattr(sqlfluff, "lint", fake_lint)
-    result = runner.invoke(app, ["lint", str(f), "--sqlfluff-config", str(cfg), "--json"])
+    monkeypatch.setattr(sqlfluff, "fix", fake_fix)
+    result = runner.invoke(app, ["lint", str(f), "--fix", "--sqlfluff-config", str(cfg), "--json"])
     assert result.exit_code == 0
-    assert captured["config_path"] == str(cfg)
+    assert lint_kwargs["config_path"] == str(cfg)
+    assert fix_kwargs["config_path"] == str(cfg)
 
 
-def test_lint_real_violations_exit_1(tmp_path):
-    f = tmp_path / "m.sql"
-    f.write_text("SELECT *  from users where id=1")
-    result = runner.invoke(app, ["lint", str(f)])
+def test_lint_jinja_in_comment_parse_error_stays_error(tmp_path):
+    # Jinja only in a comment renders fine -> no TMP -> the PRS is a genuine parse
+    # error and must stay ERROR (the raw-source scan would have wrongly demoted it).
+    f = tmp_path / "bad.sql"
+    f.write_text("-- comment mentions {{ ref('x') }}\nselect ((( from t")
+    result = runner.invoke(app, ["lint", str(f), "--json"])
     assert result.exit_code == 1
+    prs = [i for i in json.loads(result.stdout)["files"][0]["findings"] if i["code"] == "PRS"]
+    assert prs and prs[0]["severity"] == "error"
+    assert "unresolved Jinja" not in prs[0]["message"]
+
+
+def test_lint_valid_jinja_broken_sql_parse_error_stays_error(tmp_path):
+    # Valid Jinja that renders to broken SQL -> no TMP -> the PRS is genuine ERROR.
+    f = tmp_path / "bad.sql"
+    f.write_text("{% set n = 1 %}\nselect {{ n }} as x from")
+    result = runner.invoke(app, ["lint", str(f), "--json"])
+    assert result.exit_code == 1
+    prs = [i for i in json.loads(result.stdout)["files"][0]["findings"] if i["code"] == "PRS"]
+    assert prs and prs[0]["severity"] == "error"
+    assert "unresolved Jinja" not in prs[0]["message"]

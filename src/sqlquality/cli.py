@@ -185,7 +185,12 @@ def lint(
         ..., exists=True, dir_okay=False, readable=True, help="One or more .sql files."
     ),
     dialect: str = typer.Option("postgres", "--dialect", "-d", help="SQL dialect."),
-    fix: bool = typer.Option(False, "--fix", help="Rewrite the file with auto-fixes."),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Rewrite the file with auto-fixes. Exit code reflects pre-fix findings "
+        "(a fully-fixed file still exits 1).",
+    ),
     exclude_rules: str | None = typer.Option(
         None, "--exclude-rules", help="Comma-separated rule codes to skip."
     ),
