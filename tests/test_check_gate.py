@@ -183,6 +183,20 @@ def test_check_absent_adapter_type_falls_back_to_postgres(tmp_path):
     assert "dialect: postgres (default" in result.stderr
 
 
+def test_check_non_string_adapter_type_falls_back(tmp_path):
+    # A malformed manifest with a non-string adapter_type must not crash check.
+    proj, state = _project_with_baseline(tmp_path)
+    manifest = json.loads((proj / "target" / "manifest.json").read_text())
+    manifest["metadata"]["adapter_type"] = 123
+    (proj / "target" / "manifest.json").write_text(json.dumps(manifest))
+    with _mock_changed():
+        result = runner.invoke(
+            app, ["check", "--project-dir", str(proj), "--state", str(state), "--json"]
+        )
+    assert result.exit_code == 0, result.stdout
+    assert "dialect: postgres (default" in result.stderr
+
+
 def test_check_unknown_explicit_dialect_exit_2(tmp_path):
     proj, state = _project_with_baseline(tmp_path)
     with _mock_changed():

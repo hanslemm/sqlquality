@@ -82,6 +82,25 @@ def test_complexity_stdin(tmp_path):
     assert payload["path"] == "<stdin>"
 
 
+def test_complexity_stdin_non_utf8_exit_2(tmp_path):
+    # A non-UTF-8 pipe must fail like a non-UTF-8 file (exit 2), never a traceback.
+    result = runner.invoke(app, ["complexity", "-"], input=b"select caf\xe9 from t")
+    assert result.exit_code == 2
+    assert "UTF-8" in result.stderr
+    assert "<stdin>" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_complexity_jinja_unstrippable_exit_2(tmp_path):
+    # Jinja markers present but the stripped SQL still won't parse -> exit 2 with a
+    # compiled-SQL hint.
+    sql_file = tmp_path / "model.sql"
+    sql_file.write_text("{{ config() }}\nselect ((( from {{ ref('t') }}")
+    result = runner.invoke(app, ["complexity", str(sql_file)])
+    assert result.exit_code == 2
+    assert "target/compiled/" in result.stderr
+
+
 def test_complexity_missing_file_exit_2(tmp_path):
     result = runner.invoke(app, ["complexity", str(tmp_path / "nope.sql")])
     assert result.exit_code == 2
