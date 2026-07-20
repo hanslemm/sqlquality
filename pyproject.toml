@@ -8,6 +8,18 @@ description = "Measure dbt model performance and complexity, and gate changes on
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+authors = [{name = "Hans Lemm"}]
+keywords = ["dbt", "sql", "lint", "complexity", "data-engineering"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
 dynamic = ["version"]
 dependencies = [
     "sqlglot>=30.12,<31",
@@ -16,6 +28,10 @@ dependencies = [
     "pyyaml>=6",
     "sqlfluff>=4,<5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hanslemm/sqlquality"
+Issues = "https://github.com/hanslemm/sqlquality/issues"
 
 [project.scripts]
 sqlquality = "sqlquality.cli:main"
@@ -36,6 +52,16 @@ path = "src/sqlquality/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlquality"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "tests",
+    "README.md",
+    "LICENSE",
+    ".pre-commit-hooks.yaml",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
