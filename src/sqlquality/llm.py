@@ -9,6 +9,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from sqlquality.models import Finding
 
+MAX_PROMPT_SQL_CHARS = 20_000
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
@@ -25,6 +27,8 @@ class Suggestion:
 
 def build_prompt(finding: Finding, sql: str) -> str:
     """Build the prompt asking for a concrete fix for one finding."""
+    if len(sql) > MAX_PROMPT_SQL_CHARS:
+        sql = sql[:MAX_PROMPT_SQL_CHARS] + "... [truncated]"
     return (
         "You are a SQL performance and maintainability expert. "
         "A static analyzer flagged this finding on a dbt model's SQL:\n"
@@ -48,8 +52,19 @@ class CallableProvider:
 
 
 def enrich_findings(findings: list[Finding], sql: str, provider: LLMProvider) -> list[Suggestion]:
-    """One suggestion per finding. Advisory — never affects severity or the gate."""
-    return [Suggestion(f.code, provider.suggest(build_prompt(f, sql))) for f in findings]
+    """One suggestion per finding. Advisory — never affects severity or the gate.
+
+    Each provider call is isolated: a failure on one finding is skipped rather
+    than aborting the rest, so a single bad call never discards every suggestion.
+    """
+    suggestions: list[Suggestion] = []
+    for f in findings:
+        try:
+            text = provider.suggest(build_prompt(f, sql))
+        except Exception:  # advisory-only: skip this finding, keep the others
+            continue
+        suggestions.append(Suggestion(f.code, text))
+    return suggestions
 
 
 class AnthropicProvider:
