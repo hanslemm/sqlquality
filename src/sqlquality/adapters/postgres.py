@@ -23,7 +23,7 @@ def parse_pg_plan(plan: object) -> list[Finding]:
                     False,
                 )
             )
-        if node.get("Sort Method") == "external merge Disk":
+        if node.get("Node Type") == "Sort" and node.get("Sort Space Type") == "Disk":
             findings.append(
                 Finding(
                     "PG002",
