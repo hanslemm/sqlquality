@@ -96,3 +96,19 @@ def test_strip_jinja_multiline_blocks():
     stripped = strip_jinja(raw)
     assert "{%" not in stripped and "{{" not in stripped
     assert stripped.lstrip().lower().startswith("select")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "-- joined with orders\nselect a from t",
+        "-- we select active rows\nselect a from t",
+        "/* build with a select */\nselect a from t",
+    ],
+)
+def test_strip_jinja_leading_comment_with_keyword_not_corrupted(raw):
+    stripped = strip_jinja(raw)
+    # The keyword inside the comment must not be mistaken for the statement start.
+    assert "orders" not in stripped
+    parsed = sqlglot.parse_one(stripped, dialect="postgres")  # must not raise
+    assert parsed is not None

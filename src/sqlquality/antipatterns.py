@@ -34,11 +34,11 @@ def _is_cte_closer(select: exp.Select, cte_names: set[str]) -> bool:
     if from_clause is None:
         return False
     table = from_clause.this
-    return isinstance(table, exp.Table) and table.name in cte_names
+    return isinstance(table, exp.Table) and table.name.lower() in cte_names
 
 
 def _has_select_star(tree: exp.Expression) -> bool:
-    cte_names = {cte.alias for cte in tree.find_all(exp.CTE)}
+    cte_names = {cte.alias.lower() for cte in tree.find_all(exp.CTE)}
     for select in tree.find_all(exp.Select):
         if not any(_is_star_projection(p) for p in select.expressions):
             continue
@@ -63,20 +63,36 @@ def _is_constant_true(on: exp.Expression) -> bool:
     return False
 
 
-def _where_has_cross_relation_eq(tree: exp.Expression) -> bool:
-    """True if WHERE has an equality between columns of two different relations."""
-    where = tree.find(exp.Where)
+def _nearest_select(node: exp.Expression) -> exp.Select | None:
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Select):
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _where_joins_relation(select: exp.Select, relation: str) -> bool:
+    """True if ``select``'s own WHERE equates ``relation`` to a *different* relation.
+
+    Scoped deliberately: only the WHERE of the join's owning SELECT is consulted, and
+    only equalities whose nearest SELECT ancestor is that same SELECT count — so a
+    predicate nested in a subquery/EXISTS cannot exonerate an outer comma join, and an
+    outer predicate cannot exonerate a comma join buried in a CTE.
+    """
+    where = select.args.get("where")
     if where is None:
         return False
     for eq in where.find_all(exp.EQ):
+        if _nearest_select(eq) is not select:
+            continue
         left, right = eq.this, eq.expression
-        if (
-            isinstance(left, exp.Column)
-            and isinstance(right, exp.Column)
-            and left.table
-            and right.table
-            and left.table != right.table
-        ):
+        if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+            continue
+        left_tbl, right_tbl = left.table, right.table
+        if left_tbl == relation and right_tbl and right_tbl != relation:
+            return True
+        if right_tbl == relation and left_tbl and left_tbl != relation:
             return True
     return False
 
@@ -84,6 +100,10 @@ def _where_has_cross_relation_eq(tree: exp.Expression) -> bool:
 def _has_cartesian_join(tree: exp.Expression) -> bool:
     for join in tree.find_all(exp.Join):
         if (join.args.get("method") or "").upper() == "NATURAL":
+            continue
+        # LATERAL joins correlate through the lateral body, not an ON clause; the
+        # `... ON TRUE` idiom is expected and must not be flagged.
+        if isinstance(join.this, exp.Lateral):
             continue
         if join.args.get("using"):
             continue
@@ -96,8 +116,10 @@ def _has_cartesian_join(tree: exp.Expression) -> bool:
         # Explicit CROSS JOIN is always flagged (behavior kept as-is).
         if (join.args.get("kind") or "").upper() == "CROSS":
             return True
-        # Old-style comma join: not cartesian if its predicate lives in WHERE.
-        if _where_has_cross_relation_eq(tree):
+        # Old-style comma join: not cartesian if this SELECT's own WHERE joins it.
+        owner = join.parent
+        relation = join.this.alias_or_name if isinstance(join.this, exp.Expression) else ""
+        if isinstance(owner, exp.Select) and relation and _where_joins_relation(owner, relation):
             continue
         return True
     return False
