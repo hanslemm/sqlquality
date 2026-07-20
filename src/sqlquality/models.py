@@ -33,7 +33,7 @@ class DagFacts:
 
 @dataclass(frozen=True)
 class ComplexityScore:
-    """A weighted 0-100 complexity score with per-component contributions."""
+    """A weighted, open-ended complexity score with per-component contributions."""
 
     composite: float
     components: dict[str, float]

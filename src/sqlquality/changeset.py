@@ -57,19 +57,37 @@ def compute_changeset(project: DbtProject, ls_stdout: str) -> ChangeSet:
 
 def run_state_modified(project_dir: str | Path, state_dir: str | Path, dbt: str = "dbt") -> str:
     """Run `dbt ls --select state:modified ... --output json` and return stdout."""
+    # --no-write-json: `dbt ls` would otherwise rewrite the candidate's
+    # target/manifest.json without compiled_code, self-neutralizing the gate on
+    # the next run. --state is resolved absolute because the subprocess runs
+    # with cwd=project_dir, but the CLI resolves --state against the real cwd.
     cmd = [
         dbt,
         "ls",
+        "--no-write-json",
         "--select",
         "state:modified",
         "--state",
-        str(state_dir),
+        str(Path(state_dir).resolve()),
         "--resource-type",
         "model",
         "--output",
         "json",
     ]
-    result = subprocess.run(cmd, cwd=Path(project_dir), capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            cmd, cwd=Path(project_dir), capture_output=True, text=True, timeout=600
+        )
+    except FileNotFoundError as exc:
+        raise ChangeSetError(
+            f"dbt executable '{dbt}' not found on PATH — install dbt or pass --dbt"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ChangeSetError(f"`dbt ls` timed out after {exc.timeout:.0f}s") from exc
     if result.returncode != 0:
-        raise ChangeSetError(f"`dbt ls` failed (exit {result.returncode}): {result.stderr.strip()}")
+        # dbt logs errors to stdout, not stderr; fall back to the stdout tail.
+        detail = result.stderr.strip()
+        if not detail:
+            detail = "\n".join(result.stdout.strip().splitlines()[-20:])
+        raise ChangeSetError(f"`dbt ls` failed (exit {result.returncode}): {detail}")
     return result.stdout

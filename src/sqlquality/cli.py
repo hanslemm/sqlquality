@@ -14,14 +14,14 @@ from sqlquality import __version__
 from sqlquality.adapters import get_adapter
 from sqlquality.changeset import ChangeSetError, compute_changeset, run_state_modified
 from sqlquality.complexity import ComplexityEngine
-from sqlquality.config import load_config
+from sqlquality.config import ConfigError, load_config
 from sqlquality.dbtproject import DbtProject, DbtProjectError
 from sqlquality.delta import compute_deltas
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
 from sqlquality.models import Severity
-from sqlquality.report import gate_payload, render_html, render_markdown
+from sqlquality.report import gate_payload, render_html, render_markdown, verdict_label
 from sqlquality.sqlast import SqlParseError, analyze_sql
 
 console = Console()
@@ -87,7 +87,7 @@ def complexity(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    table = Table(title=f"Complexity — {path.name}  (composite {result.composite}/100)")
+    table = Table(title=f"Complexity — {path.name}  (composite {result.composite})")
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_column("contribution", justify="right")
@@ -121,8 +121,18 @@ def check(
     dbt: str = typer.Option("dbt", "--dbt", help="dbt executable to invoke."),
 ) -> None:
     """Gate a dbt change on the complexity delta of its changed models."""
+    # An explicit --config that isn't a readable file (missing, or a directory)
+    # is a user error; the implicit <project-dir>/sqlquality.yml default stays
+    # lenient (absent -> defaults).
+    if config is not None and not config.is_file():
+        typer.echo(f"--config path is not a file: {config}", err=True)
+        raise typer.Exit(code=2)
     cfg_path = config if config is not None else project_dir / "sqlquality.yml"
-    cfg = load_config(cfg_path)
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
 
     manifest_path = project_dir / "target" / "manifest.json"
     try:
@@ -130,6 +140,15 @@ def check(
     except DbtProjectError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
+
+    schema_version = candidate.schema_version()
+    if "/v12" not in schema_version:
+        found = schema_version or "(absent)"
+        typer.echo(
+            f"warning: candidate manifest dbt_schema_version is {found}, "
+            "expected a v12 schema — results may be unreliable",
+            err=True,
+        )
 
     try:
         ls_stdout = run_state_modified(project_dir, state, dbt)
@@ -160,7 +179,7 @@ def check(
             json.dumps(gate_payload(report, changeset.neighbors, skipped), indent=2, sort_keys=True)
         )
     else:
-        verdict = "PASS" if report.passed else "FAIL"
+        verdict = verdict_label(report, emoji=True)
         table = Table(
             title=f"sqlquality: {verdict}  (changed {len(deltas)}, neighbors {len(changeset.neighbors)})"
         )

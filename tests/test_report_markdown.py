@@ -11,6 +11,13 @@ FAIL = GateReport(
     deltas=[ModelDelta("model.demo.orders", 5.0, 30.0, 25.0, False)],
     regressions=["model.demo.orders"],
     passed=False,
+    mode="fail",
+)
+WARN = GateReport(
+    deltas=[ModelDelta("model.demo.orders", 5.0, 30.0, 25.0, False)],
+    regressions=["model.demo.orders"],
+    passed=True,
+    mode="warn",
 )
 
 
@@ -32,3 +39,40 @@ def test_markdown_lists_skipped():
     md = render_markdown(PASS, skipped=[("seed.demo.raw", "no compiled SQL")])
     assert "seed.demo.raw" in md
     assert "no compiled SQL" in md
+
+
+def test_markdown_warn_mode_shows_warn():
+    md = render_markdown(WARN)
+    assert "WARN" in md
+    assert "gate mode: warn" in md
+    assert "PASS" not in md
+    # single regression is singular, not "1 regressions"
+    assert "1 regression," in md
+    assert "1 regressions" not in md
+
+
+def test_markdown_warn_mode_pluralizes():
+    two = GateReport(
+        deltas=[
+            ModelDelta("model.demo.a", 5.0, 30.0, 25.0, False),
+            ModelDelta("model.demo.b", 5.0, 30.0, 25.0, False),
+        ],
+        regressions=["model.demo.a", "model.demo.b"],
+        passed=True,
+        mode="warn",
+    )
+    assert "2 regressions," in render_markdown(two)
+
+
+def test_markdown_injection_is_inert():
+    injected = GateReport(
+        deltas=[ModelDelta(" | 0 | ✅ PASS injected", 1.0, 2.0, 1.0, False)],
+        regressions=[],
+        passed=True,
+    )
+    md = render_markdown(injected, skipped=[("x", "<img src=x onerror=alert(1)>")])
+    # pipe injection can't fabricate table columns, and raw HTML is neutralized.
+    assert "\\|" in md
+    assert " | 0 | ✅ PASS injected |" not in md
+    assert "<img" not in md
+    assert "&lt;img" in md
