@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from sqlquality.models import (
     Aggregation,
@@ -90,15 +90,26 @@ def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
     if the driver echoes the connection string back verbatim, which real libpq errors do
     not do — they report the offending value on its own. Without the extracted password,
     DSN-based connections would have no effective protection at all.
+
+    The password is added in **both** its percent-encoded and decoded forms.
+    ``urlparse().password`` returns it still encoded, but libpq decodes a URI DSN before
+    authenticating, so the value a real auth-failure message carries is the decoded one:
+    for ``postgresql://u:p%40ss@h/db`` the driver reports ``p@ss`` while urlparse yields
+    ``p%40ss``, and a token of only the encoded form never matches. Any password containing
+    ``@``, ``:``, ``/``, ``%`` or a space hits this. The encoded form is kept too, since a
+    URI-parse error can echo the raw string back instead.
     """
     secrets = tuple(
         value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
     )
     if params.dsn:
         secrets += (params.dsn,)
-        dsn_password = urlparse(params.dsn).password
-        if dsn_password:
-            secrets += (dsn_password,)
+        encoded = urlparse(params.dsn).password
+        if encoded:
+            secrets += (encoded,)
+            decoded = unquote(encoded)
+            if decoded != encoded:
+                secrets += (decoded,)
     return secrets
 
 
