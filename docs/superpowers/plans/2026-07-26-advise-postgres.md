@@ -4442,6 +4442,57 @@ def test_malformed_since_exit_2():
     assert result.exit_code == 2
 
 
+def test_out_of_range_timeout_exit_2_before_connecting(monkeypatch):
+    """Reject rather than silently clamp. 0 means "no limit" to Postgres — the opposite."""
+    def explode(*args, **kwargs):
+        raise AssertionError("must not connect with an invalid --timeout")
+
+    monkeypatch.setattr(
+        "sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode
+    )
+    for bad in ("0", "-5", "99999"):
+        result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db",
+                                     "--timeout", bad])
+        assert result.exit_code == 2, f"--timeout {bad} should be rejected"
+        assert "between 1 and 3600" in result.output
+
+
+def test_low_coverage_warns_on_stderr(monkeypatch):
+    """"No proposals" must be distinguishable from "I understood almost none of this"."""
+    _stub_adapter(monkeypatch, {
+        "pg_stat_statements": [
+            ("select id from mystery_table where a = $1", 100, 5000.0, 10),
+            ("select id from other_mystery where b = $1", 100, 5000.0, 10),
+            ("select id from orders where status = $1", 1, 10.0, 1),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": WIDE_COLUMNS,
+        "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
+        "pg_stats": [("orders", "status", 5000.0)],
+        "pg_index": [],
+    })
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "low coverage" in result.output
+    assert "min-cost-share" in result.output
+
+
+def test_good_coverage_does_not_warn(monkeypatch):
+    _stub_adapter(monkeypatch, {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": WIDE_COLUMNS,
+        "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
+        "pg_stats": [("orders", "status", 5000.0)],
+        "pg_index": [],
+    })
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "low coverage" not in result.output
+
+
 def _stub_adapter(monkeypatch, rows):
     """Replace connect() with an injected fake querier."""
     from sqlquality.workload.postgres import PostgresWorkloadAdapter
@@ -4548,6 +4599,54 @@ Add to `src/sqlquality/cli.py`:
 
 ```python
 _SINCE_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
+#: Accepted --timeout range, in seconds. The adapter clamps to the same bounds as a safety
+#: net, but silently altering a number the user typed is worse than telling them it is out
+#: of range — 0 in particular means "no limit" to Postgres, the opposite of a timeout.
+_TIMEOUT_MIN_S = 1
+_TIMEOUT_MAX_S = 3600
+#: Warn when this share of the *analyzable* statements could not be analyzed. Coverage is
+#: not cosmetic: cost_share divides by the whole window's cost including skipped statements,
+#: so poor coverage dilutes every share and makes --min-cost-share progressively stricter.
+#: Without this warning, "no proposals" is indistinguishable from "I understood almost none
+#: of your workload".
+_LOW_COVERAGE_FRACTION = 0.2
+
+
+def _validate_timeout(value: int) -> int:
+    """Return a timeout in seconds, or exit 2 with a message naming the accepted range."""
+    if not _TIMEOUT_MIN_S <= value <= _TIMEOUT_MAX_S:
+        typer.echo(
+            f"--timeout must be between {_TIMEOUT_MIN_S} and {_TIMEOUT_MAX_S} seconds "
+            f"(got {value}). Postgres treats 0 as no limit, which would defeat the flag.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return value
+
+
+def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | None:
+    """A warning when too little of the workload could be analyzed, else None.
+
+    Noise (introspection, DDL, session control) is excluded from the denominator: those are
+    deliberately filtered, not failures to understand. Only statements we tried and failed
+    to use count against coverage.
+    """
+    analyzed = max(0, len(workload.stats) - aggregation.skipped_unqualifiable)
+    unexplained = workload.skipped_unparseable + aggregation.skipped_unqualifiable
+    considered = analyzed + unexplained
+    if not considered:
+        return None
+    share = unexplained / considered
+    if share <= _LOW_COVERAGE_FRACTION:
+        return None
+    return (
+        f"low coverage: {share:.0%} of candidate statements could not be analyzed "
+        f"({workload.skipped_unparseable} unparseable, "
+        f"{aggregation.skipped_unqualifiable} unresolvable against the schema). "
+        "Cost shares are computed against the whole window, so they are diluted and "
+        "--min-cost-share is effectively stricter — few or no proposals may reflect "
+        "coverage rather than a healthy workload."
+    )
 
 
 def _parse_since(value: str | None) -> timedelta | None:
@@ -4598,6 +4697,7 @@ def advise(
 ) -> None:
     """Propose database optimizations from query history and catalog metadata."""
     since_delta = _parse_since(since)
+    timeout = _validate_timeout(timeout)
 
     # --dry-run must work with no credentials at all: it is how you audit what we would run.
     if dry_run:
@@ -4663,6 +4763,9 @@ def advise(
     for capability, reason in adapter.degraded:
         typer.echo(f"reduced coverage — {capability}: {reason}", err=True)
     typer.echo(f"window: {workload.window_description}", err=True)
+    coverage = _coverage_warning(workload, aggregation)
+    if coverage is not None:
+        typer.echo(coverage, err=True)
 
     table = Table(
         title=(
