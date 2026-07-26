@@ -3281,7 +3281,10 @@ def propose_indexes(
                     "leading_ndv": leading_ndv,
                 },
                 confidence=confidence,
-                ddl=f"CREATE INDEX ON {table} ({', '.join(columns)});",
+                ddl=(
+                    f"CREATE INDEX ON {_quote_ident(table)} "
+                    f"({', '.join(_quote_ident(c) for c in columns)});"
+                ),
             )
         )
     return proposals
@@ -3316,7 +3319,7 @@ def propose_unused_indexes(
                         "size_bytes": index.size_bytes,
                     },
                     confidence=Confidence.MEDIUM,
-                    ddl=f"DROP INDEX {index.name};",
+                    ddl=f"DROP INDEX {_quote_ident(index.name)};",
                 )
             )
     return proposals
@@ -3360,7 +3363,7 @@ def propose_redundant_indexes(
                         "size_bytes": narrow.size_bytes,
                     },
                     confidence=Confidence.HIGH,
-                    ddl=f"DROP INDEX {narrow.name};",
+                    ddl=f"DROP INDEX {_quote_ident(narrow.name)};",
                 )
             )
     return proposals
@@ -3556,7 +3559,7 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
     proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
 
-    drops = [p for p in proposals if p.ddl == "DROP INDEX idx_narrow;"]
+    drops = [p for p in proposals if p.ddl == 'DROP INDEX "idx_narrow";']
     assert len(drops) == 1
     assert drops[0].code == "ADV003"
 
@@ -3675,8 +3678,9 @@ def propose_partial_indexes(
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=(
-                    f"CREATE INDEX ON {table} ({leading.column}) "
-                    f"WHERE {guard.column} {predicate};"
+                    f"CREATE INDEX ON {_quote_ident(table)} "
+                    f"({_quote_ident(leading.column)}) "
+                    f"WHERE {_quote_ident(guard.column)} {predicate};"
                 ),
             )
         )
@@ -3744,6 +3748,23 @@ def propose_sargability(
     return proposals
 
 
+def _quote_ident(name: str) -> str:
+    """Quote an identifier the way Postgres does, doubling any embedded double quote.
+
+    Two distinct reasons, both real:
+
+    * Unquoted identifiers produce invalid DDL for anything needing quoting — a mixed-case
+      name, or one colliding with a reserved word.
+    * Identifiers reach these strings straight from the catalog, so a name containing a
+      newline and a semicolon can smuggle a whole extra statement into a script a human is
+      skimming. Measured before this existed: a table named ``orders\\nDROP TABLE users; --``
+      rendered a line ``DROP TABLE users; -- (status);`` that *passed* the
+      "every line is a comment or ends in a semicolon" check. Quoting collapses the
+      identifier back into one token, so it cannot span lines or terminate a statement.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _comment_lines(text: str) -> list[str]:
     """Every line of ``text`` prefixed as a SQL comment.
 
@@ -3753,7 +3774,7 @@ def _comment_lines(text: str) -> list[str]:
     identifiers, so this is reachable from an unusual table or column name rather than only
     synthetically.
     """
-    return [f"-- {line}" for line in (text.splitlines() or [""])]
+    return [f"-- {line}" for line in text.splitlines()]
 
 
 def _mentions_table(name: str, sql: str) -> bool:
@@ -3942,6 +3963,43 @@ def test_render_ddl_never_emits_a_bare_uncommented_line():
             f"bare non-comment, non-statement line in generated script: {line!r}"
         )
     assert "-- line2 -- injected" in script
+
+
+def test_generated_ddl_quotes_identifiers():
+    """Unquoted identifiers break on anything needing quotes — mixed case, reserved words."""
+    proposals = propose_indexes(
+        [usage("Status", ColumnRole.EQUALITY, table="Order")],
+        {"Order": TableFacts(name="Order", row_estimate=10**6, size_bytes=10**8,
+                             columns=("Status",), ndv={"Status": 5000.0})},
+        {}, min_cost_share=0.01,
+    )
+    assert proposals[0].ddl == 'CREATE INDEX ON "Order" ("Status");'
+
+
+def test_a_newline_in_an_identifier_cannot_smuggle_a_statement():
+    """The invariant test alone is not enough, because a smuggled statement ends in ';'.
+
+    Measured before identifiers were quoted: a table named `orders\\nDROP TABLE users; --`
+    produced a line `DROP TABLE users; -- (status);` that *passed* the comment-or-semicolon
+    check. Quoting collapses the identifier into one token so it cannot span lines.
+    """
+    hostile = "orders\nDROP TABLE users; --"
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY, table=hostile)],
+        {hostile: TableFacts(name=hostile, row_estimate=10**6, size_bytes=10**8,
+                             columns=("status",), ndv={"status": 5000.0})},
+        {}, min_cost_share=0.01,
+    )
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "DROP TABLE users;" not in script
+    for line in script.splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith("--") or line.rstrip().endswith(";"), f"bare line: {line!r}"
+
+
+def test_quote_ident_doubles_an_embedded_quote():
+    assert _quote_ident('we"ird') == '"we""ird"'
 
 
 def test_render_ddl_tolerates_a_missing_or_non_numeric_cost_share():
