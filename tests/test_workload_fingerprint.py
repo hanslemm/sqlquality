@@ -48,6 +48,19 @@ def test_is_noise_filters_our_own_introspection_and_ddl():
     assert not is_noise("select id from orders where status = $1")
 
 
+def test_is_noise_also_discards_predicate_bearing_declare_and_copy():
+    """A documented loss, pinned so it cannot become an undocumented one.
+
+    `_LEADING_NOISE` is a statement-prefix filter, so a cursor declaration or a COPY that
+    wraps a real SELECT — with real predicates — is discarded whole. Django's
+    `QuerySet.iterator()` emits the first form. Unwrapping to the inner SELECT is a
+    follow-up; until then this is a README limitation and the skip counter says only
+    "filtered", never "introspection/DDL".
+    """
+    assert is_noise("DECLARE cur CURSOR FOR SELECT id FROM orders WHERE status = $1")
+    assert is_noise("COPY (SELECT id FROM orders WHERE status = $1) TO STDOUT")
+
+
 def test_is_noise_filters_session_control_but_not_update_set():
     assert is_noise("SET search_path TO public")
     assert is_noise("set statement_timeout = '30s'")
