@@ -3744,6 +3744,18 @@ def propose_sargability(
     return proposals
 
 
+def _comment_lines(text: str) -> list[str]:
+    """Every line of ``text`` prefixed as a SQL comment.
+
+    A single ``f"-- {text}"`` comments only the *first* line, so a newline anywhere in the
+    text leaves the remainder as a bare line in a file a human may pipe into psql. Titles
+    are built from live schema identifiers, and Postgres permits newlines in quoted
+    identifiers, so this is reachable from an unusual table or column name rather than only
+    synthetically.
+    """
+    return [f"-- {line}" for line in (text.splitlines() or [""])]
+
+
 def _mentions_table(name: str, sql: str) -> bool:
     """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
 
@@ -3910,6 +3922,40 @@ def test_render_ddl_emits_a_reviewable_commented_script():
     assert "review" in script.lower()
 
 
+def test_render_ddl_never_emits_a_bare_uncommented_line():
+    """The one property this file exists to guarantee: safe to skim, nothing unintended.
+
+    A single `f"-- {title}"` comments only the first line, so a newline in a title leaves
+    the remainder bare in a file someone may pipe into psql. Titles are built from live
+    schema identifiers and Postgres permits newlines in quoted identifiers.
+    """
+    proposals = [
+        Proposal(code="ADV001", title="line1\nline2 -- injected", rationale="r",
+                 evidence={"cost_share": 0.3}, confidence=Confidence.HIGH,
+                 ddl="CREATE INDEX ON t (c);"),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    for line in script.splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith("--") or line.rstrip().endswith(";"), (
+            f"bare non-comment, non-statement line in generated script: {line!r}"
+        )
+    assert "-- line2 -- injected" in script
+
+
+def test_render_ddl_tolerates_a_missing_or_non_numeric_cost_share():
+    """evidence is dict[str, object], so neither presence nor type is guaranteed."""
+    for evidence in ({}, {"cost_share": "not a number"}, {"cost_share": True}):
+        proposals = [
+            Proposal(code="ADV001", title="t", rationale="r", evidence=evidence,
+                     confidence=Confidence.HIGH, ddl="CREATE INDEX ON t (c);"),
+        ]
+        script = PostgresWorkloadAdapter().render_ddl(proposals)
+        assert "-- ADV001 [high]" in script
+        assert "%" not in script.split("-- ADV001")[1].split("\n")[0]
+
+
 def test_render_ddl_with_no_ddl_proposals_still_explains_itself():
     script = PostgresWorkloadAdapter().render_ddl([])
     assert script.strip().startswith("--")
@@ -3944,6 +3990,8 @@ Replace `PostgresWorkloadAdapter.render_ddl`:
             "--",
             "-- On a live table prefer CREATE INDEX CONCURRENTLY / DROP INDEX CONCURRENTLY:",
             "-- the plain forms below take a lock that blocks writes for the duration.",
+            "-- Note that CONCURRENTLY cannot run inside a transaction block, so apply those",
+            "-- statements individually rather than piping this whole file into one.",
             "",
         ]
         body: list[str] = []
@@ -3951,9 +3999,15 @@ Replace `PostgresWorkloadAdapter.render_ddl`:
             if not proposal.ddl:
                 continue
             share = proposal.evidence.get("cost_share")
-            share_text = f", {float(share):.1%} of workload cost" if share is not None else ""
+            # bool is an int subclass, so exclude it explicitly — a stray True would
+            # otherwise render as "100.0% of workload cost".
+            share_text = (
+                f", {share:.1%} of workload cost"
+                if isinstance(share, (int, float)) and not isinstance(share, bool)
+                else ""
+            )
             body.append(f"-- {proposal.code} [{proposal.confidence.value}{share_text}]")
-            body.append(f"-- {proposal.title}")
+            body.extend(_comment_lines(proposal.title))
             body.append(proposal.ddl)
             body.append("")
         if not body:
