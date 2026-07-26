@@ -663,7 +663,9 @@ from sqlquality.workload.extract import UnqualifiableQuery, extract_usage
 SCHEMA = {
     "orders": {"id": "INT", "customer_id": "INT", "status": "TEXT", "created_at": "TIMESTAMP",
                "note": "TEXT", "shipped_at": "TIMESTAMP"},
-    "customers": {"id": "INT", "email": "TEXT"},
+    # `status` is needed by the cross-scope alias tests, which filter on customers.status;
+    # without it qualify() raises and the attribution under test never runs.
+    "customers": {"id": "INT", "email": "TEXT", "status": "TEXT"},
 }
 
 
