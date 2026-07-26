@@ -551,6 +551,51 @@ def test_render_ddl_emits_a_reviewable_commented_script():
     assert "review" in script.lower()
 
 
+def test_render_ddl_never_emits_a_bare_uncommented_line():
+    """The one property this file exists to guarantee: safe to skim, nothing unintended.
+
+    A single `f"-- {title}"` comments only the first line, so a newline in a title leaves
+    the remainder bare in a file someone may pipe into psql. Titles are built from live
+    schema identifiers and Postgres permits newlines in quoted identifiers.
+    """
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="line1\nline2 -- injected",
+            rationale="r",
+            evidence={"cost_share": 0.3},
+            confidence=Confidence.HIGH,
+            ddl="CREATE INDEX ON t (c);",
+        ),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    for line in script.splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith("--") or line.rstrip().endswith(";"), (
+            f"bare non-comment, non-statement line in generated script: {line!r}"
+        )
+    assert "-- line2 -- injected" in script
+
+
+def test_render_ddl_tolerates_a_missing_or_non_numeric_cost_share():
+    """evidence is dict[str, object], so neither presence nor type is guaranteed."""
+    for evidence in ({}, {"cost_share": "not a number"}, {"cost_share": True}):
+        proposals = [
+            Proposal(
+                code="ADV001",
+                title="t",
+                rationale="r",
+                evidence=evidence,
+                confidence=Confidence.HIGH,
+                ddl="CREATE INDEX ON t (c);",
+            ),
+        ]
+        script = PostgresWorkloadAdapter().render_ddl(proposals)
+        assert "-- ADV001 [high]" in script
+        assert "%" not in script.split("-- ADV001")[1].split("\n")[0]
+
+
 def test_render_ddl_with_no_ddl_proposals_still_explains_itself():
     script = PostgresWorkloadAdapter().render_ddl([])
     assert script.strip().startswith("--")
