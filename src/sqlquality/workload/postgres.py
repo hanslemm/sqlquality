@@ -291,7 +291,7 @@ def propose_indexes(
         proposals.append(
             Proposal(
                 code="ADV001",
-                title=f"Add index on {table}({', '.join(columns)})",
+                title=f"Add index on {_sanitize_name(table)}({', '.join(_sanitize_name(c) for c in columns)})",
                 rationale=rationale,
                 evidence={
                     "table": table,
@@ -304,7 +304,7 @@ def propose_indexes(
                     "leading_ndv": leading_ndv,
                 },
                 confidence=confidence,
-                ddl=f"CREATE INDEX ON {table} ({', '.join(columns)});",
+                ddl=f"CREATE INDEX ON {_quote_ident(table)} ({', '.join(_quote_ident(c) for c in columns)});",
             )
         )
     return proposals
@@ -326,7 +326,7 @@ def propose_unused_indexes(
             proposals.append(
                 Proposal(
                     code="ADV002",
-                    title=f"Drop unused index {index.name} on {table}",
+                    title=f"Drop unused index {_sanitize_name(index.name)} on {_sanitize_name(table)}",
                     rationale=(
                         "No recorded scans since the last statistics reset. Verify the "
                         "reset time covers a full business cycle before dropping."
@@ -339,7 +339,7 @@ def propose_unused_indexes(
                         "size_bytes": index.size_bytes,
                     },
                     confidence=Confidence.MEDIUM,
-                    ddl=f"DROP INDEX {index.name};",
+                    ddl=f"DROP INDEX {_quote_ident(index.name)};",
                 )
             )
     return proposals
@@ -369,7 +369,7 @@ def propose_redundant_indexes(
             proposals.append(
                 Proposal(
                     code="ADV003",
-                    title=f"Drop redundant index {narrow.name} on {table}",
+                    title=f"Drop redundant index {_sanitize_name(narrow.name)} on {_sanitize_name(table)}",
                     rationale=(
                         f"Its columns are a leading prefix of {wider.name}, which can "
                         "serve the same lookups."
@@ -383,7 +383,7 @@ def propose_redundant_indexes(
                         "size_bytes": narrow.size_bytes,
                     },
                     confidence=Confidence.HIGH,
-                    ddl=f"DROP INDEX {narrow.name};",
+                    ddl=f"DROP INDEX {_quote_ident(narrow.name)};",
                 )
             )
     return proposals
@@ -458,7 +458,7 @@ def propose_partial_indexes(
             Proposal(
                 code="ADV004",
                 title=(
-                    f"Partial index on {table}({leading.column}) WHERE {guard.column} {predicate}"
+                    f"Partial index on {_sanitize_name(table)}({_sanitize_name(leading.column)}) WHERE {_sanitize_name(guard.column)} {predicate}"
                 ),
                 rationale=(
                     "The hot predicates always pair this lookup with the same null check, "
@@ -478,7 +478,9 @@ def propose_partial_indexes(
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=(
-                    f"CREATE INDEX ON {table} ({leading.column}) WHERE {guard.column} {predicate};"
+                    f"CREATE INDEX ON {_quote_ident(table)} "
+                    f"({_quote_ident(leading.column)}) "
+                    f"WHERE {_quote_ident(guard.column)} {predicate};"
                 ),
             )
         )
@@ -499,7 +501,7 @@ def propose_sargability(
         proposals.append(
             Proposal(
                 code="ADV005",
-                title=f"Non-sargable predicate on {item.table}.{item.column}",
+                title=f"Non-sargable predicate on {_sanitize_name(item.table)}.{_sanitize_name(item.column)}",
                 rationale=(
                     "The column is wrapped in a cast or function inside a predicate, so a "
                     "plain B-tree index cannot be used. Rewrite the predicate to leave the "
@@ -582,7 +584,7 @@ def propose_select_star(
         proposals.append(
             Proposal(
                 code="ADV006",
-                title=f"Hot SELECT * over wide table(s): {', '.join(touched)}",
+                title=f"Hot SELECT * over wide table(s): {', '.join(_sanitize_name(t) for t in touched)}",
                 rationale=(
                     "Projecting every column of a wide table moves data no consumer asked "
                     "for. List the columns the query actually needs."
@@ -599,6 +601,35 @@ def propose_select_star(
             )
         )
     return proposals
+
+
+def _sanitize_name(name: str) -> str:
+    """Sanitize a name for display in human-readable titles, removing line breaks.
+
+    This prevents hostile names like ``orders\\nDROP TABLE users; --`` from appearing in
+    the generated script, even in comments.
+    """
+    return name.split("\n")[0].split("\r")[0]
+
+
+def _quote_ident(name: str) -> str:
+    """Quote an identifier the way Postgres does, doubling any embedded double quote.
+
+    Two distinct reasons, both real:
+
+    * Unquoted identifiers produce invalid DDL for anything needing quoting — a mixed-case
+      name, or one colliding with a reserved word.
+    * Identifiers reach these strings straight from the catalog, so a name containing a
+      newline and a semicolon can smuggle a whole extra statement into a script a human is
+      skimming. Measured before this existed: a table named ``orders\\nDROP TABLE users; --``
+      rendered a line ``DROP TABLE users; -- (status);`` that *passed* the
+      "every line is a comment or ends in a semicolon" check. Quoting collapses the
+      identifier back into one token, so it cannot span lines or terminate a statement.
+    """
+    # Truncate at the first line break to prevent multi-line identifiers, which could
+    # still be confusing even when quoted. This removes any attempted injection after a newline.
+    name = name.split("\n")[0].split("\r")[0]
+    return '"' + name.replace('"', '""') + '"'
 
 
 def _comment_lines(text: str) -> list[str]:
