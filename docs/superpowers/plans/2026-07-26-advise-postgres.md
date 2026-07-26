@@ -223,6 +223,15 @@ class ColumnUsage:
     role: ColumnRole
     calls: int
     cost_ms: float
+    #: Fraction of the *whole* analyzed window's cost carried by queries using this column
+    #: in this role. Deliberately **not** a partition — the shares do not sum to 1:
+    #:
+    #: * A query filtering on two columns credits its full cost to *both* entries, because
+    #:   both predicates really are involved in that cost. (This is why proposals take the
+    #:   max cost_share over their columns rather than the sum — summing double-counts.)
+    #: * The denominator includes queries that were skipped as unparseable or
+    #:   unqualifiable, so poor schema coverage dilutes every surviving share rather than
+    #:   silently inflating it. Read it alongside the report's skipped counts.
     cost_share: float
     fingerprints: int
 
@@ -1138,6 +1147,61 @@ def test_equal_cost_entries_are_ordered_canonically_not_by_arrival():
     ]
 
 
+def test_skipped_stats_still_count_toward_the_denominator():
+    """cost_share is a fraction of the whole window, not of the analyzable part.
+
+    The 90ms query cannot be qualified, so it contributes no usage — but its cost stays in
+    the denominator, leaving the surviving 10ms query at 0.1 rather than 1.0. This keeps
+    the number honest about how much of the database's work we actually explained.
+    """
+    agg = aggregate(
+        _workload(
+            ("select mystery from unknown_table", 1, 90.0),
+            ("select id from orders where status = $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    assert agg.skipped_unqualifiable == 1
+    assert agg.total_cost_ms == 100.0
+    assert _find(agg, "status", ColumnRole.EQUALITY).cost_share == 0.1
+
+
+def test_a_multi_predicate_query_credits_its_full_cost_to_each_column():
+    """Shares deliberately do not sum to 1: both predicates are involved in the same cost.
+
+    Proposals therefore take the max cost_share over their columns, never the sum.
+    """
+    agg = aggregate(
+        _workload(("select id from orders where status = $1 and created_at > $2", 1, 100.0)),
+        SCHEMA,
+        "postgres",
+    )
+    assert _find(agg, "status", ColumnRole.EQUALITY).cost_share == 1.0
+    assert _find(agg, "created_at", ColumnRole.RANGE).cost_share == 1.0
+
+
+def test_role_breaks_ties_when_table_and_column_match():
+    """The fourth sort key. Same column, same cost, two roles — order must be canonical."""
+    forward = aggregate(
+        _workload(
+            ("select id from orders where status = $1", 1, 10.0),
+            ("select id from orders group by status", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    reverse = aggregate(
+        _workload(
+            ("select id from orders group by status", 1, 10.0),
+            ("select id from orders where status = $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    assert [u.role for u in forward.usage] == [u.role for u in reverse.usage]
+
+
 def test_empty_workload_yields_empty_aggregation_and_no_division_error():
     agg = aggregate(Workload(stats=(), window_description="w"), SCHEMA, "postgres")
     assert agg.usage == ()
@@ -1189,6 +1253,12 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
             fingerprints[key] += 1
             tables.add(key[0])
 
+    # The denominator is the whole window's cost, including stats we could not analyze.
+    # That keeps the number honest — "this column is involved in 12% of everything the
+    # database did" — rather than flattering it to "12% of the sliver we understood". The
+    # trade-off is that poor schema coverage dilutes every share, so a --min-cost-share
+    # threshold silently gets stricter as coverage drops; the report's skipped counts are
+    # what make that visible. See ColumnUsage.cost_share for the full semantics.
     total = workload.total_cost_ms
     usage = tuple(
         sorted(
