@@ -182,6 +182,67 @@ def test_arity_cap_keeps_the_range_column_last_when_it_bites():
     assert len(columns) == 3
 
 
+def test_a_column_used_in_two_roles_is_not_proposed_twice():
+    """`where id = $1` plus `order by id desc` puts `id` in both role lists.
+
+    Concatenating them yielded `(id, id)`: invalid DDL, and unmatchable by _covered —
+    `_is_prefix(("id","id"), ("id",))` is False, so even the primary key could not suppress
+    it. Two ordinary queries were enough to reproduce it at HIGH confidence.
+    """
+    proposals = propose_indexes(
+        [
+            usage("id", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("id", ColumnRole.SORT, cost_ms=80.0),
+        ],
+        facts(ndv={"id": 5000.0}),
+        {},
+        min_cost_share=0.01,
+    )
+    columns = proposals[0].evidence["columns"]
+    assert columns == ("id",)
+    assert len(set(columns)) == len(columns), f"repeated column in {columns}"
+    assert proposals[0].ddl == 'CREATE INDEX ON "public"."orders" ("id");'
+
+
+def test_the_existing_primary_key_suppresses_the_deduplicated_candidate():
+    """The consequence of the dedupe, and the reason the bug mattered.
+
+    Once `(id, id)` collapses to `(id,)`, `orders_pkey(id)` covers it and there is no
+    proposal at all — which is the correct answer for this workload.
+    """
+    existing = {"orders": (PgIndex("orders_pkey", ("id",), True, True, 900, 4096),)}
+    proposals = propose_indexes(
+        [
+            usage("id", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("id", ColumnRole.SORT, cost_ms=80.0),
+        ],
+        facts(ndv={"id": 5000.0}),
+        existing,
+        min_cost_share=0.01,
+    )
+    assert proposals == []
+
+
+def test_dedupe_prefers_the_equality_occurrence_of_a_two_role_column():
+    """Order matters: the surviving entry must be the equality one.
+
+    `roles` is reported as evidence, and an index built for an equality probe on a column
+    that is also sorted on is described honestly only if the equality role is the one kept.
+    """
+    proposals = propose_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=99.0),
+            usage("created_at", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("created_at", ColumnRole.RANGE, cost_ms=95.0),
+        ],
+        facts(ndv={"status": 5000.0}),
+        {},
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("status", "created_at")
+    assert proposals[0].evidence["roles"] == ("equality", "equality")
+
+
 def test_unknown_row_count_is_low_confidence_and_says_why():
     """The small-table gate cannot run without a row count.
 

@@ -261,9 +261,23 @@ def propose_indexes(
             reverse=True,
         )
         if ranges:
-            chosen = equality[: max_arity - 1] + ranges[:1]
+            candidate = equality[: max_arity - 1] + ranges[:1]
         else:
-            chosen = equality[:max_arity]
+            candidate = equality[:max_arity]
+        # `equality` and `ranges` are filtered from the same list by *role*, so a column
+        # used in two roles — `where id = $1` alongside `order by id desc`, entirely
+        # ordinary — lands in both and the concatenation above repeats it. That produced
+        # `CREATE INDEX ON orders (id, id)` at HIGH confidence, which `_covered` could not
+        # even suppress: `_is_prefix(("id","id"), ("id",))` is False, so the table's own
+        # primary key did not match. Equality wins because equality-first is the B-tree
+        # ordering the whole rule is built on.
+        chosen: list[ColumnUsage] = []
+        picked: set[str] = set()
+        for item in candidate:
+            if item.column in picked:
+                continue
+            picked.add(item.column)
+            chosen.append(item)
         if not chosen:
             continue
 
