@@ -4176,10 +4176,46 @@ def test_markdown_shows_confidence_and_cost_share():
 
 
 def test_markdown_discloses_the_window_and_the_skips():
+    """Asserts the phrases, not bare digits.
+
+    A `"2" in md` style check passes on the window description alone ("2026-07-01" contains
+    both a 2 and a 7), so it would not notice the counts being transposed or dropped.
+    """
     md = render_advise_markdown(PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres",
                                 redacted=True, degraded=[])
     assert "since stats reset at 2026-07-01" in md
-    assert "2" in md and "7" in md and "3" in md
+    assert "2 unparseable" in md
+    assert "7 introspection/DDL" in md
+    assert "3 unresolvable" in md
+
+
+def test_markdown_escapes_an_evidence_key_as_well_as_its_value():
+    """Keys reach the output too. Static today, but the asymmetry is worth closing."""
+    hostile = [
+        Proposal(code="ADV001", title="t", rationale="r",
+                 evidence={"we|ird\nkey": "v", "cost_share": 0.1},
+                 confidence=Confidence.LOW, ddl=None),
+    ]
+    md = render_advise_markdown(hostile, WORKLOAD, AGGREGATION, engine="postgres",
+                                redacted=True, degraded=[])
+    assert "we\\|ird" in md
+    assert "we|ird" not in md
+
+
+def test_gate_markdown_also_survives_a_newline_in_a_skip_reason():
+    """`_md_escape` is shared with the gate report, so pin the behavior on that side too.
+
+    Today every gate skip reason is a hardcoded literal, so nothing exercises the newline
+    path there — which means a future reason built from an exception message could regress
+    it with no test failing.
+    """
+    from sqlquality.gate import GateReport
+    from sqlquality.report import render_markdown
+
+    report = GateReport(passed=True, mode="warn", warned=False, regressions=[], deltas=[])
+    md = render_markdown(report, skipped=[("model.demo.x", "line one\nline two")])
+    for line in md.splitlines():
+        assert not line.startswith("line two"), "a newline broke out of the skipped bullet"
 
 
 def test_markdown_escapes_pipes_from_query_text():
@@ -4311,7 +4347,11 @@ def render_advise_markdown(
         lines.append("")
         lines.append(_md_escape(p.rationale))
         lines.append("")
-        evidence = ", ".join(f"{k}={_md_escape(v)}" for k, v in sorted(p.evidence.items()))
+        # Keys are escaped too. They are a closed static vocabulary today, but the
+        # asymmetry is the kind that stops being true quietly.
+        evidence = ", ".join(
+            f"{_md_escape(k)}={_md_escape(v)}" for k, v in sorted(p.evidence.items())
+        )
         lines.append(f"Evidence: {evidence}")
         lines.append("")
         if p.ddl:
