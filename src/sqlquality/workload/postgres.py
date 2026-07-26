@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from sqlquality.models import (
     Aggregation,
@@ -75,6 +76,32 @@ def _clamp_timeout_ms(timeout_s: int) -> int:
     return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S)) * 1000
 
 
+#: A secret shorter than this cannot be redacted by substring replacement without
+#: destroying the message — a one-character password would blank every occurrence of that
+#: letter. When one actually appears, the driver's text is withheld rather than mangled.
+_MIN_SCRUBBABLE_SECRET = 4
+_WITHHELD = "(driver message withheld: it contained a value too short to redact safely)"
+
+
+def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
+    """Every value we know to be secret for this connection.
+
+    A DSN is added *and* its password extracted separately. The whole-DSN token only helps
+    if the driver echoes the connection string back verbatim, which real libpq errors do
+    not do — they report the offending value on its own. Without the extracted password,
+    DSN-based connections would have no effective protection at all.
+    """
+    secrets = tuple(
+        value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
+    )
+    if params.dsn:
+        secrets += (params.dsn,)
+        dsn_password = urlparse(params.dsn).password
+        if dsn_password:
+            secrets += (dsn_password,)
+    return secrets
+
+
 def _scrub(text: str, secrets: Iterable[str]) -> str:
     """Replace any known secret occurring in ``text`` with a redaction marker.
 
@@ -83,10 +110,12 @@ def _scrub(text: str, secrets: Iterable[str]) -> str:
     without a live server, and we hold the secret anyway, so its absence can be guaranteed
     instead of trusted.
     """
+    present = [secret for secret in secrets if secret and secret in text]
+    if any(len(secret) < _MIN_SCRUBBABLE_SECRET for secret in present):
+        return _WITHHELD
     scrubbed = text
-    for secret in secrets:
-        if secret:
-            scrubbed = scrubbed.replace(secret, "***")
+    for secret in present:
+        scrubbed = scrubbed.replace(secret, "***")
     return scrubbed
 
 
@@ -227,12 +256,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
         conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
         # Everything we know to be secret, so a driver exception can be proven clean rather
-        # than trusted. The DSN itself is included because it may embed a password inline.
-        secrets = tuple(
-            value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
-        )
-        if params.dsn:
-            secrets += (params.dsn,)
+        # than trusted.
+        secrets = _secrets_for(params)
 
         failure: str | None = None
         try:
