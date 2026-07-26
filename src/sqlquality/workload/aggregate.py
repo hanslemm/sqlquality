@@ -32,6 +32,12 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
             fingerprints[key] += 1
             tables.add(key[0])
 
+    # The denominator is the whole window's cost, including stats we could not analyze.
+    # That keeps the number honest — "this column is involved in 12% of everything the
+    # database did" — rather than flattering it to "12% of the sliver we understood". The
+    # trade-off is that poor schema coverage dilutes every share, so a --min-cost-share
+    # threshold silently gets stricter as coverage drops; the report's skipped counts are
+    # what make that visible. See ColumnUsage.cost_share for the full semantics.
     total = workload.total_cost_ms
     usage = tuple(
         sorted(
