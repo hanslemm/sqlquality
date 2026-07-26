@@ -901,7 +901,9 @@ def _role(column: exp.Column) -> ColumnRole | None:
         return ColumnRole.NON_SARGABLE
 
     comparison: ColumnRole | None = None
-    node: exp.Expression | None = column.parent
+    # `exp.Expr`, not `exp.Expression`: sqlglot declares `.parent` on the `Expr` base
+    # class, and the narrower annotation fails mypy.
+    node: exp.Expr | None = column.parent
     while node is not None:
         if isinstance(node, exp.Is) and predicate_scope:
             null_side = isinstance(node.expression, exp.Null)
