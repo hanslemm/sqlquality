@@ -1979,7 +1979,13 @@ def read_profile(
     try:
         return read_output(profiles_dir, profile, target, env)
     except ProfileError as exc:
-        raise ConnectionResolutionError(str(exc)) from exc
+        # `from None` at this boundary too, not just inside profiles.py. ProfileError's own
+        # message is already scrubbed, but its __context__ still holds the raw YAMLError —
+        # whose text quotes the offending source line. Chaining here would make that
+        # reachable to anything that walks __cause__/__context__ (error reporters do),
+        # even though a printed traceback would honor the inner suppression. The
+        # suppression has to hold at every boundary crossing to be worth anything.
+        raise ConnectionResolutionError(str(exc)) from None
 
 
 def resolve_connection(
