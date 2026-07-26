@@ -15,6 +15,14 @@ Spec: `docs/superpowers/specs/2026-07-26-advise-workload-analysis-design.md`. Th
 - Python `>=3.11`. Every new module starts with `from __future__ import annotations`.
 - `sqlglot>=30.12,<31`. Verified available: `sqlglot.optimizer.qualify.qualify(expression, dialect=, schema=, expand_stars=)`, raising `sqlglot.errors.OptimizeError` on unresolvable columns.
 - Ruff line length 100. Mypy runs with `python_version = "3.11"`; new third-party imports without stubs need a `[[tool.mypy.overrides]]` entry with `ignore_missing_imports = true`.
+- **CI gate (`.github/workflows/ci.yml`) runs all four of these over the whole repo, so every task must pass all four before committing — including on its test files, not just `src/`:**
+  ```
+  uv run ruff check .
+  uv run ruff format --check .
+  uv run mypy src/sqlquality
+  uv run pytest
+  ```
+  The code blocks in this plan are written for readability and are **not** guaranteed to be `ruff format` clean. Run `uv run ruff format .` after transcribing them and commit the formatted result — reformatting the plan's code is expected, not a deviation from it.
 - Exit-code contract, unchanged from the README: **0** = success (proposals are advisory and never gate), **2** = usage/config/input/connection error. `advise` never exits 1.
 - `advise` never issues DDL or DML, and never executes user-supplied SQL. Only the statements returned by `introspection_sql()` are ever run.
 - Literals are redacted at ingest by default. `--keep-literals` opts back in. Any literal-derived signal must be captured as a boolean flag *before* redaction, never by retaining the literal.
