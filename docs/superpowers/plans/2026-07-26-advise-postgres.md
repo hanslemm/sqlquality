@@ -4962,8 +4962,18 @@ from sqlquality.cli import app
 
 runner = CliRunner()
 
-#: Distinctive strings that must never appear downstream. If any of these leaks, the
-#: redaction path is broken.
+#: Distinctive strings that must never appear downstream.
+#:
+#: Be honest about which of these currently discriminate. Measured by disabling
+#: `redact_tree` and sweeping all four surfaces: only `hans@betterdoc.de` leaks, because it
+#: is the only one reaching ADV005's evidence — the single proposal type that copies query
+#: text into output. The other three enter via HOT_QUERY, whose proposals carry column
+#: names, roles and counts but never `stat.sql`, so they cannot leak today whatever
+#: redaction does.
+#:
+#: They stay in the list deliberately, as regression insurance against a future proposal
+#: type that widens what evidence carries. But they are future-proofing, not live
+#: trip-wires, and a reader should not mistake four passing checks for four proofs.
 SECRETS = ("patient-4711", "hans@betterdoc.de", "DE89370400440532013000", "1990-04-17")
 
 HOT_QUERY = (
@@ -5035,15 +5045,27 @@ def test_no_literal_reaches_json_markdown_ddl_or_stdout(stubbed, tmp_path):
                                  "--markdown", str(md), "--ddl", str(ddl), "--json"])
     assert result.exit_code == 0
 
+    # `ddl` currently has no live leak channel either: ADV005 (the only evidence block
+    # carrying query text) always sets ddl=None, and generated DDL is built from quoted
+    # identifiers, never predicate literals. Measured: with redaction disabled, stdout,
+    # markdown and json all leak while ddl stays clean. It is asserted anyway, because a
+    # literal-valued partial index would change that — but three surfaces, not four, are
+    # doing real work today.
     surfaces = {
         "stdout": result.stdout,
         "markdown": md.read_text(),
         "ddl": ddl.read_text(),
         "json": json.dumps(json.loads(result.stdout)),
     }
-    for name, content in surfaces.items():
-        for secret in SECRETS:
-            assert secret not in content, f"{secret!r} leaked into {name}"
+    # Collect every leak before asserting. A bare assert inside the loop short-circuits on
+    # the first hit, so a break affecting three surfaces would report only one.
+    leaks = [
+        f"{secret!r} leaked into {name}"
+        for name, content in surfaces.items()
+        for secret in SECRETS
+        if secret in content
+    ]
+    assert not leaks, "; ".join(leaks)
 
 
 def test_analysis_still_works_on_redacted_sql(stubbed):
