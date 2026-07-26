@@ -5,15 +5,20 @@ from __future__ import annotations
 import html as _html
 
 from sqlquality.gate import GateReport
+from sqlquality.models import Aggregation, Proposal, Workload
 
 
 def _md_escape(value: object) -> str:
     """Neutralize a value for a markdown table cell / inline text.
 
-    Escapes `|` (table cell breakout) and backticks, and HTML-escapes `<>&`
-    so a hostile unique_id or skip reason cannot inject markup or fake columns.
+    Escapes `|` (table cell breakout) and backticks, HTML-escapes `<>&` so a
+    hostile unique_id or skip reason cannot inject markup or fake columns, and
+    collapses embedded newlines so a multi-line identifier (a real threat: see
+    the DDL-rendering `_comment_lines` precedent in workload/postgres.py)
+    cannot split a table row into a bogus second row or truncate a heading.
     """
     text = str(value)
+    text = text.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return text.replace("|", "\\|").replace("`", "\\`")
 
@@ -122,3 +127,139 @@ th:first-child, td:first-child {{ text-align: left; }}
 {skipped_html}
 </body></html>
 """
+
+
+def advise_payload(
+    proposals: list[Proposal],
+    workload: Workload,
+    aggregation: Aggregation,
+    *,
+    engine: str,
+    redacted: bool,
+    degraded: list[tuple[str, str]],
+) -> dict:
+    """JSON-serializable summary of an advise run."""
+    return {
+        "engine": engine,
+        "redacted": redacted,
+        "window": workload.window_description,
+        "analyzed": {
+            "query_groups": len(workload.stats),
+            "total_cost_ms": workload.total_cost_ms,
+            "tables": sorted(aggregation.tables),
+        },
+        "skipped": {
+            "unparseable": workload.skipped_unparseable,
+            "noise": workload.skipped_noise,
+            "unqualifiable": aggregation.skipped_unqualifiable,
+        },
+        "degraded": [{"capability": cap, "reason": reason} for cap, reason in degraded],
+        "proposals": [
+            {
+                "code": p.code,
+                "title": p.title,
+                "rationale": p.rationale,
+                "confidence": p.confidence.value,
+                # Evidence values include tuples and frozensets; normalize for JSON.
+                "evidence": {k: _jsonable(v) for k, v in p.evidence.items()},
+                "ddl": p.ddl,
+            }
+            for p in proposals
+        ],
+    }
+
+
+def _jsonable(value: object) -> object:
+    """Coerce evidence values (tuples, sets) into JSON-friendly types."""
+    if isinstance(value, (tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    return value
+
+
+def render_advise_markdown(
+    proposals: list[Proposal],
+    workload: Workload,
+    aggregation: Aggregation,
+    *,
+    engine: str,
+    redacted: bool,
+    degraded: list[tuple[str, str]],
+) -> str:
+    """Render advise proposals as markdown (suitable for a ticket or PR comment)."""
+    lines = [
+        f"# sqlquality advise — {_md_escape(engine)}",
+        "",
+        f"**Window:** {_md_escape(workload.window_description)}",
+        f"**Query groups analyzed:** {len(workload.stats)}  ",
+        f"**Literals:** {'redacted' if redacted else 'retained (--keep-literals)'}",
+        "",
+        (
+            f"Skipped: {workload.skipped_unparseable} unparseable, "
+            f"{workload.skipped_noise} introspection/DDL, "
+            f"{aggregation.skipped_unqualifiable} unresolvable against the schema."
+        ),
+        "",
+    ]
+    if degraded:
+        lines.append("## Reduced coverage")
+        lines.append("")
+        for capability, reason in degraded:
+            lines.append(f"- `{_md_escape(capability)}`: {_md_escape(reason)}")
+        lines.append("")
+
+    if not proposals:
+        lines.append("No proposals — nothing in the analyzed workload met the thresholds.")
+        return "\n".join(lines) + "\n"
+
+    lines += [
+        "| code | confidence | cost share | proposal |",
+        "|---|---|---:|---|",
+    ]
+    for p in proposals:
+        share = p.evidence.get("cost_share")
+        share_text = f"{float(share):.1%}" if isinstance(share, (int, float)) else "—"
+        lines.append(
+            f"| {_md_escape(p.code)} | {p.confidence.value} | {share_text} "
+            f"| {_md_escape(p.title)} |"
+        )
+    lines.append("")
+    lines.append("## Detail")
+    lines.append("")
+    for p in proposals:
+        lines.append(f"### {_md_escape(p.code)} — {_md_escape(p.title)}")
+        lines.append("")
+        lines.append(_md_escape(p.rationale))
+        lines.append("")
+        evidence = ", ".join(f"{k}={_md_escape(v)}" for k, v in sorted(p.evidence.items()))
+        lines.append(f"Evidence: {evidence}")
+        lines.append("")
+        if p.ddl:
+            fence = _code_fence(p.ddl)
+            lines.append(f"{fence}sql")
+            lines.append(p.ddl)
+            lines.append(fence)
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _code_fence(text: str) -> str:
+    """A backtick fence guaranteed longer than any backtick run inside `text`.
+
+    `ddl` is generated from live schema identifiers (see `_quote_ident` in
+    workload/postgres.py, which does not forbid backticks). A fixed ```` ```` ````
+    fence would let an identifier containing a triple-backtick close the fence early
+    and inject arbitrary markdown — a fake heading, a fake second code block — after
+    it. Sizing the fence past the longest run in the content is the standard
+    CommonMark technique for nesting a fence around backtick-bearing content.
+    """
+    longest = 0
+    current = 0
+    for char in text:
+        if char == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return "`" * max(3, longest + 1)
