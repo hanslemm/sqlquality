@@ -3014,6 +3014,60 @@ def test_a_wider_existing_index_still_covers_a_narrower_candidate():
     assert proposals == []
 
 
+def test_a_narrower_existing_index_does_not_cover_a_wider_candidate():
+    """The reverse of the coverage rule, and the direction that inverting the slice breaks.
+
+    An index on (status) does not serve a candidate (status, created_at). Only the
+    wider-covers-narrower test existed, so `candidate[:len(existing)] == existing` would
+    have shipped silently.
+    """
+    existing = {"orders": (PgIndex("idx_status", ("status",), False, False, 5, 1),)}
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+         usage("created_at", ColumnRole.RANGE, cost_ms=80.0)],
+        facts(), existing, min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].evidence["columns"] == ("status", "created_at")
+
+
+def test_arity_cap_keeps_the_range_column_last_when_it_bites():
+    """The interaction of the two most important ordering rules, previously untested.
+
+    Four equality columns plus a range column with max_arity 3 must drop the weakest
+    equality column, not the range column, and the range column must still come last —
+    once a range predicate is used, later columns cannot be probed by equality.
+    """
+    proposals = propose_indexes(
+        [usage("a", ColumnRole.EQUALITY, cost_ms=99.0),
+         usage("b", ColumnRole.EQUALITY, cost_ms=98.0),
+         usage("c", ColumnRole.EQUALITY, cost_ms=97.0),
+         usage("d", ColumnRole.EQUALITY, cost_ms=96.0),
+         usage("e", ColumnRole.RANGE, cost_ms=50.0)],
+        facts(columns=("a", "b", "c", "d", "e")), {}, min_cost_share=0.01,
+    )
+    columns = proposals[0].evidence["columns"]
+    assert columns == ("a", "b", "e")
+    assert len(columns) == 3
+
+
+def test_unknown_row_count_is_low_confidence_and_says_why():
+    """The small-table gate cannot run without a row count.
+
+    Suppressing entirely would deny advice to anyone whose row-count grant is missing; the
+    cost evidence is real. But reporting MEDIUM would present an unverified proposal as
+    ordinarily-trustworthy, so it is LOW and the rationale states the gap.
+    """
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(rows=None, ndv={"status": 9999.0}), {}, min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].confidence is Confidence.LOW
+    assert proposals[0].evidence["row_estimate"] is None
+    assert "unknown" in proposals[0].rationale.lower()
+
+
 def test_cost_share_is_the_max_never_the_sum():
     proposals = propose_indexes(
         [usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=90.0),
@@ -3105,10 +3159,20 @@ def _by_table(usage: Sequence[ColumnUsage]) -> dict[str, list[ColumnUsage]]:
     return grouped
 
 
+def _is_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    """True if ``shorter`` is a leading prefix of ``longer`` (equal lists included).
+
+    The slice direction is the whole point and is easy to invert: an index on (a, b) covers
+    a candidate (a), but an index on (a) does *not* cover a candidate (a, b). Both
+    directions are tested.
+    """
+    return longer[: len(shorter)] == shorter
+
+
 def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | None:
     """Name of an existing index whose leading columns already cover ``candidate``."""
     for index in existing:
-        if index.columns[: len(candidate)] == candidate:
+        if _is_prefix(candidate, index.columns):
             return index.name
     return None
 
@@ -3162,22 +3226,38 @@ def propose_indexes(
 
         ndv = table_facts.ndv if table_facts else {}
         leading_ndv = ndv.get(columns[0])
-        if rows is None or leading_ndv is None:
+        if rows is None:
+            # The small-table gate above could not run, so we cannot rule out that this
+            # index would be pure write overhead on a tiny table. The cost evidence is
+            # real, so the proposal is kept — a user whose row-count grant is missing
+            # should still get advice — but at LOW, and the rationale says why. Reporting
+            # MEDIUM here would be the exact confident-but-wrong failure this rule set
+            # exists to avoid: the size is not assumed large, it is unknown.
+            confidence = Confidence.LOW
+        elif leading_ndv is None:
             confidence = Confidence.MEDIUM
         elif leading_ndv >= SELECTIVE_NDV:
             confidence = Confidence.HIGH
         else:
             confidence = Confidence.LOW
 
+        rationale = (
+            "These columns carry the table's hottest predicates and no existing index "
+            "leads with them. Equality columns come first so the range column can be "
+            "scanned last."
+        )
+        if rows is None:
+            rationale += (
+                " The row count for this table is unknown, so it could not be checked "
+                "against the small-table floor — on a small table an index is pure write "
+                "overhead. Confirm the table's size before applying."
+            )
+
         proposals.append(
             Proposal(
                 code="ADV001",
                 title=f"Add index on {table}({', '.join(columns)})",
-                rationale=(
-                    "These columns carry the table's hottest predicates and no existing "
-                    "index leads with them. Equality columns come first so the range "
-                    "column can be scanned last."
-                ),
+                rationale=rationale,
                 evidence={
                     "table": table,
                     "columns": columns,
@@ -3245,7 +3325,7 @@ def propose_redundant_indexes(
                     for other in indexes
                     if other.name != narrow.name
                     and len(other.columns) > len(narrow.columns)
-                    and other.columns[: len(narrow.columns)] == narrow.columns
+                    and _is_prefix(narrow.columns, other.columns)
                 ),
                 None,
             )
@@ -3388,6 +3468,28 @@ def test_select_star_ignored_on_a_narrow_table():
     narrow = {"orders": TableFacts(name="orders", row_estimate=10**6, size_bytes=1,
                                    columns=("a", "b"))}
     assert propose_select_star(_workload(stat), narrow, min_cost_share=0.01) == []
+
+
+def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
+    """ADV002 and ADV003 can both fire on one index, emitting the same DROP twice.
+
+    ADV003 must survive: prefix redundancy is provable from the column lists, while
+    ADV002 rests on a scan counter covering only the window since the last stats reset.
+    """
+    existing = {"orders": (
+        PgIndex("idx_narrow", ("status",), False, False, 0, 4096),
+        PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 8192),
+    )}
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    aggregation = Aggregation(
+        usage=(), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
+    )
+    adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
+    proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
+
+    drops = [p for p in proposals if p.ddl == "DROP INDEX idx_narrow;"]
+    assert len(drops) == 1
+    assert drops[0].code == "ADV003"
 
 
 def test_propose_composes_all_rules_and_ranks_high_confidence_first():
@@ -3595,6 +3697,29 @@ Replace `PostgresWorkloadAdapter.propose`:
     #: Highest confidence first, then largest cost share — the reading order a human wants.
     _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
 
+    @classmethod
+    def _dedupe_by_ddl(cls, proposals: list[Proposal]) -> list[Proposal]:
+        """Collapse proposals that would run identical DDL, keeping the strongest evidence.
+
+        An index with no recorded scans that is *also* a prefix of a wider index gets
+        flagged by both ADV002 and ADV003, producing two entries with the same
+        `DROP INDEX`. They do not contradict each other, but a reader should not have to
+        notice they are the same object twice. ADV003 wins ties because prefix redundancy
+        is structural — provable from the column lists alone — whereas ADV002 rests on a
+        scan counter that only covers the window since the last statistics reset.
+        """
+        best: dict[str, Proposal] = {}
+        for proposal in proposals:
+            if not proposal.ddl:
+                continue
+            incumbent = best.get(proposal.ddl)
+            if incumbent is None or (
+                cls._CONFIDENCE_ORDER[proposal.confidence]
+                < cls._CONFIDENCE_ORDER[incumbent.confidence]
+            ):
+                best[proposal.ddl] = proposal
+        return [p for p in proposals if not p.ddl or best[p.ddl] is p]
+
     def propose(
         self,
         aggregation: Aggregation,
@@ -3615,7 +3740,7 @@ Replace `PostgresWorkloadAdapter.propose`:
             *propose_redundant_indexes(existing),
         ]
         return sorted(
-            proposals,
+            self._dedupe_by_ddl(proposals),
             key=lambda p: (
                 self._CONFIDENCE_ORDER[p.confidence],
                 -float(p.evidence.get("cost_share", 0.0)),  # type: ignore[arg-type]
