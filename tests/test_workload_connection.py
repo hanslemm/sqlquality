@@ -163,6 +163,51 @@ def test_profile_errors_never_leak_a_secret_value(tmp_path):
     assert "hunter2" not in str(exc.value)
 
 
+def test_malformed_yaml_error_never_echoes_a_secret(tmp_path):
+    """PyYAML's message quotes the offending source line verbatim.
+
+    A stray tab on a `password:` line is an ordinary hand-editing mistake, and
+    interpolating `str(exc)` would put the secret into the error — and into CI logs.
+    """
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      password: hunter2\tSUPERSECRET\n"
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    message = str(exc.value)
+    assert "SUPERSECRET" not in message
+    assert "hunter2" not in message
+    # Still actionable: the position survives even though the content does not.
+    assert "line 6" in message
+
+
+def test_malformed_yaml_error_suppresses_the_leaky_cause(tmp_path):
+    """`from None` is the other half of the fix.
+
+    A chained cause would let the traceback print PyYAML's snippet even though our own
+    message is clean, so the suppression is load-bearing rather than stylistic.
+    """
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  outputs:\n    dev:\n      password: hunter2\tSUPERSECRET\n"
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    assert exc.value.__cause__ is None
+    assert exc.value.__suppress_context__ is True
+
+
+def test_profile_with_no_default_target_says_so(tmp_path):
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  outputs:\n    dev:\n      type: postgres\n      dbname: a\n"
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    message = str(exc.value)
+    assert "--target" in message
+    assert "'None'" not in message
+
+
 def test_dsn_means_profiles_yml_is_never_read(tmp_path):
     """Precedence must short-circuit, not merely be preferred.
 

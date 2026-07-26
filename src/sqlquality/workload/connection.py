@@ -44,7 +44,11 @@ def read_profile(
     try:
         return read_output(profiles_dir, profile, target, env)
     except ProfileError as exc:
-        raise ConnectionResolutionError(str(exc)) from exc
+        # `from None`, not `from exc`: str(exc) is already folded into this message, so
+        # chaining adds nothing — and profiles.py's own suppression (for the YAML-error
+        # case) would otherwise be defeated one boundary up, by re-attaching the
+        # ProfileError as this exception's __cause__.
+        raise ConnectionResolutionError(str(exc)) from None
 
 
 def resolve_connection(
