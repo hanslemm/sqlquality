@@ -1720,19 +1720,28 @@ def test_malformed_yaml_error_never_echoes_a_secret(tmp_path):
     assert "line 6" in message
 
 
-def test_malformed_yaml_error_suppresses_the_leaky_cause(tmp_path):
-    """`from None` is the other half of the fix.
+def test_malformed_yaml_error_is_fully_detached_from_the_leaky_original(tmp_path):
+    """Walks the whole chain, the way an error reporter does.
 
-    A chained cause would let the traceback print PyYAML's snippet even though our own
-    message is clean, so the suppression is load-bearing rather than stylistic.
+    `raise ... from None` is *not* sufficient: raising inside an `except` block sets
+    __context__ regardless of the `from` clause, so the raw YAMLError — whose text quotes
+    the offending source line — stays reachable even though a printed traceback hides it.
+    Both raise sites therefore build their message inside the handler and raise after it
+    exits. This test fails if either one is moved back inside.
     """
     (tmp_path / "profiles.yml").write_text(
         "jaffle:\n  outputs:\n    dev:\n      password: hunter2\tSUPERSECRET\n"
     )
     with pytest.raises(ConnectionResolutionError) as exc:
         read_profile(tmp_path, "jaffle", None, {})
-    assert exc.value.__cause__ is None
-    assert exc.value.__suppress_context__ is True
+
+    node: BaseException | None = exc.value
+    depth = 0
+    while node is not None and depth < 8:
+        assert "SUPERSECRET" not in str(node), f"secret reachable at chain depth {depth}"
+        assert "hunter2" not in str(node), f"secret reachable at chain depth {depth}"
+        node = node.__cause__ or node.__context__
+        depth += 1
 
 
 def test_profile_with_no_default_target_says_so(tmp_path):
@@ -1874,18 +1883,25 @@ def _yaml_location(exc: yaml.YAMLError) -> str:
 def read_profiles_file(profiles_dir: Path) -> dict:
     """Load profiles.yml from a directory, or raise ProfileError."""
     path = Path(profiles_dir) / "profiles.yml"
+    # The YAML failure is recorded here and raised *after* the handler exits. This is not
+    # style. Raising inside an `except` block populates the new exception's __context__
+    # with the original, whatever the `from` clause says — `from None` only sets
+    # __suppress_context__, which hides it from a printed traceback but leaves it
+    # reachable to anything that walks the chain. Since PyYAML's message quotes the
+    # offending source line, a syntax error on a `password:` line would otherwise leave
+    # the secret retrievable. Leaving the handler first is what actually removes it.
+    yaml_problem: str | None = None
     try:
         raw = yaml.safe_load(path.read_text())
     except FileNotFoundError:
         raise ProfileError(f"No profiles.yml in {profiles_dir}") from None
     except OSError as exc:
-        # OSError carries the path and errno, never file content.
+        # OSError carries the path and errno, never file content — safe to chain.
         raise ProfileError(f"Could not read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
-        # `from None` is load-bearing, not style: a chained cause would let the traceback
-        # print PyYAML's message — and its quoted source line — even though our own
-        # message is clean.
-        raise ProfileError(f"Malformed YAML in {path}{_yaml_location(exc)}") from None
+        yaml_problem = _yaml_location(exc)
+    if yaml_problem is not None:
+        raise ProfileError(f"Malformed YAML in {path}{yaml_problem}")
     if not isinstance(raw, dict):
         raise ProfileError(f"top-level of {path} must be a mapping")
     return raw
@@ -1976,16 +1992,15 @@ def read_profile(
     profiles_dir: Path, profile: str, target: str | None, env: Mapping[str, str]
 ) -> tuple[str, dict[str, str]]:
     """Read (engine, fields) from profiles.yml, re-raising as ConnectionResolutionError."""
+    message: str
     try:
         return read_output(profiles_dir, profile, target, env)
     except ProfileError as exc:
-        # `from None` at this boundary too, not just inside profiles.py. ProfileError's own
-        # message is already scrubbed, but its __context__ still holds the raw YAMLError —
-        # whose text quotes the offending source line. Chaining here would make that
-        # reachable to anything that walks __cause__/__context__ (error reporters do),
-        # even though a printed traceback would honor the inner suppression. The
-        # suppression has to hold at every boundary crossing to be worth anything.
-        raise ConnectionResolutionError(str(exc)) from None
+        message = str(exc)
+    # Raised outside the handler for the same reason as in read_profiles_file: a raise
+    # inside `except` would make the ProfileError this exception's __context__, and the
+    # chain has to be severed at every boundary crossing to be worth severing at all.
+    raise ConnectionResolutionError(message)
 
 
 def resolve_connection(
