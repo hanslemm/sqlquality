@@ -3976,12 +3976,15 @@ def test_generated_ddl_quotes_identifiers():
     assert proposals[0].ddl == 'CREATE INDEX ON "Order" ("Status");'
 
 
-def test_a_newline_in_an_identifier_cannot_smuggle_a_statement():
-    """The invariant test alone is not enough, because a smuggled statement ends in ';'.
+def test_a_newline_in_an_identifier_is_not_rendered_as_a_statement():
+    """Two things had to be true here, and quoting alone only gave the first.
 
-    Measured before identifiers were quoted: a table named `orders\\nDROP TABLE users; --`
-    produced a line `DROP TABLE users; -- (status);` that *passed* the comment-or-semicolon
-    check. Quoting collapses the identifier into one token so it cannot span lines.
+    Before quoting, a table named `orders\\nDROP TABLE users; --` produced a line
+    `DROP TABLE users; -- (status);` that *passed* the comment-or-semicolon check — a real
+    smuggled statement. Quoting fixes the semantics (psql reads it as one identifier) but
+    not the file: a line break inside a quoted identifier still splits the physical line,
+    leaving something that reads like a statement. Truncating the name would instead emit
+    DDL against an object that does not exist. So the statement is commented out whole.
     """
     hostile = "orders\nDROP TABLE users; --"
     proposals = propose_indexes(
@@ -3991,11 +3994,16 @@ def test_a_newline_in_an_identifier_cannot_smuggle_a_statement():
         {}, min_cost_share=0.01,
     )
     script = PostgresWorkloadAdapter().render_ddl(proposals)
-    assert "DROP TABLE users;" not in script
+    assert "NOT RENDERED" in script
     for line in script.splitlines():
         if not line.strip():
             continue
         assert line.startswith("--") or line.rstrip().endswith(";"), f"bare line: {line!r}"
+    # No executable statement mentions the smuggled text — it survives only as a comment.
+    executable = [ln for ln in script.splitlines() if not ln.startswith("--")]
+    assert not any("DROP TABLE users" in ln for ln in executable)
+    # The real name is still recoverable, so an operator can see what was anomalous.
+    assert "DROP TABLE users; --" in script
 
 
 def test_quote_ident_doubles_an_embedded_quote():
@@ -4055,6 +4063,21 @@ Replace `PostgresWorkloadAdapter.render_ddl`:
         body: list[str] = []
         for proposal in proposals:
             if not proposal.ddl:
+                continue
+            if "\n" in proposal.ddl or "\r" in proposal.ddl:
+                # An identifier containing a line break cannot be emitted as a single-line
+                # statement. Quoting already makes it *semantically* safe — psql parses the
+                # whole thing as one quoted identifier, so nothing extra executes — but the
+                # file would still show a line reading like a statement to anyone skimming,
+                # which is the property this script exists to provide. Truncating the name
+                # instead would emit DDL targeting an object that does not exist. So it is
+                # commented out in full with the reason, rather than rendered wrong or
+                # silently dropped.
+                body.append("-- NOT RENDERED: an identifier in this proposal contains a line")
+                body.append("-- break, so it cannot be emitted as a single-line statement.")
+                body.append("-- Verify the name and apply this by hand:")
+                body.extend(_comment_lines(proposal.ddl))
+                body.append("")
                 continue
             share = proposal.evidence.get("cost_share")
             # bool is an int subclass, so exclude it explicitly — a stray True would
