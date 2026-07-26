@@ -312,7 +312,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--profile` | — | dbt profile name, read from `profiles.yml`. |
 | `--target` | — | dbt target within the profile. |
 | `--profiles-dir` | `~/.dbt` | Directory holding `profiles.yml`. |
-| `--schema` | `public` | Schema(s) to introspect. Repeatable (`--schema public --schema app`). |
+| `--schema` | `public` | Schema to introspect. **One at a time** — passing two exits 2, see Limitations. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
 | `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. |
@@ -766,6 +766,13 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
 - **ADV003 cannot see partial-index predicates.** It compares column lists only, so it
   could recommend dropping a partial index in favor of a wider full index that does not
   actually cover the same rows.
+- **One schema per run.** Every catalog fact is keyed on the bare relation name — table
+  sizes, NDV statistics, index lists and the `qualify()` schema all merge across schemas —
+  so `orders` in two schemas would alias into one another and the last catalog row read
+  would silently win the row estimate. Rather than report that quietly, `advise` rejects
+  more than one `--schema` with exit 2. Run it once per schema. Generated DDL is qualified
+  with the schema you passed, so it does not depend on the applying session's
+  `search_path`.
 - **Redshift, Snowflake and dbt enrichment are designed but not implemented.** `advise`
   supports Postgres only today; passing another `--engine` fails with a clear error
   rather than silently degrading.
