@@ -232,7 +232,11 @@ def render_advise_markdown(
         lines.append("")
         lines.append(_md_escape(p.rationale))
         lines.append("")
-        evidence = ", ".join(f"{k}={_md_escape(v)}" for k, v in sorted(p.evidence.items()))
+        # Keys are escaped too. They are a closed static vocabulary today, but the
+        # asymmetry is the kind that stops being true quietly.
+        evidence = ", ".join(
+            f"{_md_escape(k)}={_md_escape(v)}" for k, v in sorted(p.evidence.items())
+        )
         lines.append(f"Evidence: {evidence}")
         lines.append("")
         if p.ddl:
