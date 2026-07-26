@@ -61,17 +61,35 @@ def _interpolate(key: str, value: object, env: Mapping[str, str]) -> str:
     return resolved
 
 
+def _yaml_location(exc: yaml.YAMLError) -> str:
+    """Position and reason for a YAML error, *without* PyYAML's quoted source snippet.
+
+    ``str(exc)`` embeds the offending line verbatim, so a syntax error on a ``password:``
+    line would put the secret into the message. Only the mark and the parser's reason are
+    value-free enough to repeat.
+    """
+    mark = getattr(exc, "problem_mark", None)
+    problem = getattr(exc, "problem", None)
+    where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+    why = f": {problem}" if problem else ""
+    return f"{where}{why}"
+
+
 def read_profiles_file(profiles_dir: Path) -> dict:
     """Load profiles.yml from a directory, or raise ProfileError."""
     path = Path(profiles_dir) / "profiles.yml"
     try:
         raw = yaml.safe_load(path.read_text())
     except FileNotFoundError:
-        raise ProfileError(f"No profiles.yml in {profiles_dir}")
+        raise ProfileError(f"No profiles.yml in {profiles_dir}") from None
     except OSError as exc:
+        # OSError carries the path and errno, never file content.
         raise ProfileError(f"Could not read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
-        raise ProfileError(f"Malformed YAML in {path}: {exc}") from exc
+        # `from None` is load-bearing, not style: a chained cause would let the traceback
+        # print PyYAML's message — and its quoted source line — even though our own
+        # message is clean.
+        raise ProfileError(f"Malformed YAML in {path}{_yaml_location(exc)}") from None
     if not isinstance(raw, dict):
         raise ProfileError(f"top-level of {path} must be a mapping")
     return raw
@@ -91,6 +109,13 @@ def read_output(
     outputs = block.get("outputs")
     if not isinstance(outputs, dict) or chosen not in outputs:
         available = ", ".join(outputs) if isinstance(outputs, dict) else "none"
+        if chosen is None:
+            # A profile with no `target:` key and no --target: say that, rather than
+            # rendering the literal "No target 'None'".
+            raise ProfileError(
+                f"Profile '{profile}' sets no default target — pass --target "
+                f"(available: {available})"
+            )
         raise ProfileError(f"No target '{chosen}' in profile '{profile}' (found: {available})")
     output = outputs[chosen]
     if not isinstance(output, dict):
