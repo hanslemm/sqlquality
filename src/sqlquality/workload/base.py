@@ -28,6 +28,16 @@ from sqlquality.models import (
 #: Injectable so every fetch path is testable without a live database.
 Querier = Callable[[str, tuple[object, ...]], list[tuple[object, ...]]]
 
+#: Accepted `--timeout` range, in seconds. Defined here, once, because two layers need it:
+#: the CLI rejects an out-of-range value up front (silently altering a number the user
+#: typed is worse than telling them), and the adapter clamps to the same bounds as a safety
+#: net for any other caller. As two independent constant pairs they could drift, and then
+#: the CLI would reject what the adapter accepts, or the adapter would clamp past the range
+#: the CLI's own error message promises. 0 in particular means "no limit" to Postgres — the
+#: opposite of a timeout — and an absurd upper value is more likely a typo than an intent.
+MIN_TIMEOUT_S = 1
+MAX_TIMEOUT_S = 3600
+
 
 @dataclass(frozen=True)
 class IntrospectionStatement:

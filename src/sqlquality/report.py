@@ -5,7 +5,7 @@ from __future__ import annotations
 import html as _html
 
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Proposal, Workload
+from sqlquality.models import Aggregation, Proposal, Workload, cost_share_of
 
 
 def _md_escape(value: object) -> str:
@@ -221,8 +221,8 @@ def render_advise_markdown(
         "|---|---|---:|---|",
     ]
     for p in proposals:
-        share = p.evidence.get("cost_share")
-        share_text = f"{float(share):.1%}" if isinstance(share, (int, float)) else "—"
+        share = cost_share_of(p.evidence)
+        share_text = f"{share:.1%}" if share is not None else "—"
         lines.append(
             f"| {_md_escape(p.code)} | {p.confidence.value} | {share_text} "
             f"| {_md_escape(p.title)} |"
@@ -237,8 +237,12 @@ def render_advise_markdown(
         lines.append("")
         # Keys are escaped too. They are a closed static vocabulary today, but the
         # asymmetry is the kind that stops being true quietly.
+        #
+        # Values go through `_jsonable` first so the markdown reader and the JSON reader
+        # see the same shape. Without it `str(("status",))` renders the Python repr
+        # `('status',)` where JSON shows `["status"]` — the same run described two ways.
         evidence = ", ".join(
-            f"{_md_escape(k)}={_md_escape(v)}" for k, v in sorted(p.evidence.items())
+            f"{_md_escape(k)}={_md_escape(_jsonable(v))}" for k, v in sorted(p.evidence.items())
         )
         lines.append(f"Evidence: {evidence}")
         lines.append("")

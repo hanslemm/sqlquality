@@ -26,7 +26,7 @@ from sqlquality.dialects import validate_dialect
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
-from sqlquality.models import Aggregation, Severity, Workload
+from sqlquality.models import Aggregation, Severity, Workload, cost_share_of
 from sqlquality.report import (
     advise_payload,
     gate_payload,
@@ -38,6 +38,7 @@ from sqlquality.report import (
 from sqlquality.sqlast import SqlParseError, analyze_sql, parse, strip_jinja
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.aggregate import aggregate, star_tables
+from sqlquality.workload.base import MAX_TIMEOUT_S, MIN_TIMEOUT_S
 from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
 from sqlquality.workload.fingerprint import ingest
 
@@ -550,11 +551,6 @@ def perf(
 
 
 _SINCE_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
-#: Accepted --timeout range, in seconds. The adapter clamps to the same bounds as a safety
-#: net, but silently altering a number the user typed is worse than telling them it is out
-#: of range — 0 in particular means "no limit" to Postgres, the opposite of a timeout.
-_TIMEOUT_MIN_S = 1
-_TIMEOUT_MAX_S = 3600
 #: Warn when this share of the *analyzable* statements could not be analyzed. Coverage is
 #: not cosmetic: cost_share divides by the whole window's cost including skipped statements,
 #: so poor coverage dilutes every share and makes --min-cost-share progressively stricter.
@@ -569,10 +565,15 @@ def _plural(count: int, noun: str) -> str:
 
 
 def _validate_timeout(value: int) -> int:
-    """Return a timeout in seconds, or exit 2 with a message naming the accepted range."""
-    if not _TIMEOUT_MIN_S <= value <= _TIMEOUT_MAX_S:
+    """Return a timeout in seconds, or exit 2 with a message naming the accepted range.
+
+    The bounds are imported, not restated: the adapter clamps to the same pair as a safety
+    net, and two independent literals drift into an error message that promises a range the
+    adapter does not honor.
+    """
+    if not MIN_TIMEOUT_S <= value <= MAX_TIMEOUT_S:
         typer.echo(
-            f"--timeout must be between {_TIMEOUT_MIN_S} and {_TIMEOUT_MAX_S} seconds "
+            f"--timeout must be between {MIN_TIMEOUT_S} and {MAX_TIMEOUT_S} seconds "
             f"(got {value}). Postgres treats 0 as no limit, which would defeat the flag.",
             err=True,
         )
@@ -845,8 +846,8 @@ def advise(
     table.add_column("cost share", justify="right")
     table.add_column("proposal")
     for proposal in proposals:
-        share = proposal.evidence.get("cost_share")
-        share_text = f"{float(share):.1%}" if isinstance(share, (int, float)) else "—"
+        share = cost_share_of(proposal.evidence)
+        share_text = f"{share:.1%}" if share is not None else "—"
         table.add_row(proposal.code, proposal.confidence.value, share_text, proposal.title)
     console.print(table)
     # Proposals are advisory: advise never gates.

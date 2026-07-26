@@ -263,3 +263,49 @@ def test_profiles_path_used_when_no_dsn(tmp_path):
     assert params.source == "profiles.yml"
     assert params.engine == "postgres"
     assert params.dsn is None
+
+
+def test_profiles_yml_is_decoded_as_utf8_regardless_of_locale(tmp_path, monkeypatch):
+    """`read_text()` with no encoding uses the *platform's* preferred encoding.
+
+    On a cp1252 machine a UTF-8 profiles.yml is mojibake, and a non-ASCII password
+    corrupts into a baffling authentication failure with nothing pointing at the cause.
+    """
+    recorded: dict = {}
+    real_read_text = Path.read_text
+
+    def spy(self, *args, **kwargs):
+        recorded["encoding"] = kwargs.get("encoding")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", spy)
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      password: pässwörd\n",
+        encoding="utf-8",
+    )
+    read_profile(tmp_path, "jaffle", None, {})
+    assert recorded["encoding"] == "utf-8"
+
+
+def test_a_non_utf8_profiles_file_names_the_file_and_detaches_the_bytes(tmp_path):
+    """UnicodeDecodeError already exits 2 (it is a ValueError), so this is message quality.
+
+    But it is also a leak: the exception object holds the *entire undecodable file* in
+    `.object`, secret included, so the chain has to be severed here like the YAML one.
+    """
+    (tmp_path / "profiles.yml").write_bytes(
+        "jaffle:\n  outputs:\n    dev:\n      password: SUPERSECRÈT\n".encode("latin-1")
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    message = str(exc.value)
+    assert "profiles.yml" in message
+    assert "UTF-8" in message
+
+    node: BaseException | None = exc.value
+    depth = 0
+    while node is not None and depth < 8:
+        assert "SUPERSECR" not in str(node), f"file content reachable at chain depth {depth}"
+        node = node.__cause__ or node.__context__
+        depth += 1
