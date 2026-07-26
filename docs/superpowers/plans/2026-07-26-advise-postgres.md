@@ -2100,20 +2100,34 @@ FORBIDDEN_VERBS = (
 def _write_verbs_in(sql: str) -> set[str]:
     """Write verbs appearing as whole words in ``sql``.
 
-    Whitespace is collapsed before matching, and the result padded, so a verb preceded by a
-    newline or sitting at the very start of the statement is still caught. A naive
-    ``f" {verb} " in f" {sql.lower()} "`` check misses `"... LIMIT %s;\\ndrop table foo"`
-    entirely — which is precisely the stacked-statement mistake this guard exists to catch.
+    Word-boundary matching, not whitespace tokenizing. Two earlier attempts at this guard
+    each left a hole: ``f" {verb} " in f" {sql.lower()} "`` misses a verb after a newline
+    or at the statement start, and collapsing whitespace first still misses one glued to
+    punctuation (``";drop table foo"``, ``"(delete from t)"``). ``\\b`` covers every
+    position while still leaving ``created_at``, ``deleted`` and ``pg_stat_user_indexes``
+    alone, since a following word character means no boundary.
     """
-    normalized = f" {' '.join(sql.lower().split())} "
-    return {verb for verb in FORBIDDEN_VERBS if f" {verb} " in normalized}
+    lowered = sql.lower()
+    return {verb for verb in FORBIDDEN_VERBS if re.search(rf"\b{verb}\b", lowered)}
 
 
-def test_the_write_verb_detector_catches_newline_and_leading_positions():
-    """Guard the guard: this test is the reason the detector normalizes whitespace."""
+def test_the_write_verb_detector_catches_every_adjacency():
+    """Guard the guard. Each case below defeated an earlier version of this detector."""
+    # Whitespace-separated — caught by every version.
+    assert _write_verbs_in("select 1 from t; drop table foo") == {"drop"}
+    # Newline, tab, and leading position — defeated the space-padded version.
     assert _write_verbs_in("select 1 from t limit 1;\ndrop table foo") == {"drop"}
-    assert _write_verbs_in("delete from t") == {"delete"}
     assert _write_verbs_in("select 1\n\tgrant select on x to y") == {"grant"}
+    assert _write_verbs_in("delete from t") == {"delete"}
+    # Punctuation-adjacent — defeated the whitespace-collapsing version too.
+    assert _write_verbs_in("select 1;drop table foo") == {"drop"}
+    assert _write_verbs_in("select(delete from t)") == {"delete"}
+
+
+def test_the_write_verb_detector_does_not_fire_on_ordinary_identifiers():
+    """A guard that flags `created_at` gets weakened to shut it up, so it must not."""
+    assert _write_verbs_in("select created_at, updated_at from t") == set()
+    assert _write_verbs_in("select deleted, insertion_id from pg_stat_user_indexes") == set()
     assert _write_verbs_in("select 1 from t where a = 2") == set()
 
 
