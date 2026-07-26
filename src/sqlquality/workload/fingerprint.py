@@ -21,20 +21,36 @@ FLAG_LEADING_WILDCARD_LIKE = "leading_wildcard_like"
 #: The query group projects a star. Captured pre-qualify (qualify runs expand_stars=False).
 FLAG_SELECT_STAR = "select_star"
 
-#: Statements that are our own introspection, dbt's metadata, or DDL — advising on these
-#: would be advising on our own noise.
-_NOISE = re.compile(
-    r"\b(pg_stat_statements|pg_stat_user_indexes|pg_stats|pg_class|pg_index|pg_namespace"
-    r"|information_schema|svv_table_info|svl_statementtext|sys_query_history"
-    r"|account_usage|create\s+index|drop\s+index|create\s+table|alter\s+table"
-    r"|vacuum|analyze|begin|commit|rollback|set\s+)\b",
+#: Statement-leading keywords marking session control, DDL, or maintenance — never user
+#: workload. Anchored at the start deliberately: an unanchored `set\s+` also matches
+#: `UPDATE ... SET`, and an unanchored `commit` matches a literal like `action = 'commit'`.
+_LEADING_NOISE = re.compile(
+    r"^\s*(?:set|reset|begin|start|commit|rollback|savepoint|discard|vacuum|analyze"
+    r"|create|drop|alter|truncate|grant|revoke|comment|reindex|cluster|explain|copy"
+    r"|prepare|deallocate|declare|fetch|close|listen|unlisten|notify|show|call|do)\b",
+    re.IGNORECASE,
+)
+#: Relations only our own introspection (or dbt's metadata) reads. Matched anywhere, since
+#: a statement can reference them in any position.
+_INTROSPECTION = re.compile(
+    r"\b(?:pg_stat_statements|pg_stat_database|pg_stat_user_indexes|pg_stats|pg_class"
+    r"|pg_index|pg_namespace|pg_attribute|pg_database|pg_locks|information_schema"
+    r"|svv_table_info|svv_redshift_columns|svv_alter_table_recommendations"
+    r"|svl_statementtext|svl_query_summary|stl_query|sys_query_history"
+    r"|account_usage)\b",
     re.IGNORECASE,
 )
 
 
 def is_noise(sql: str) -> bool:
-    """True if a statement is introspection, session management, or DDL."""
-    return _NOISE.search(sql) is not None
+    """True for session control, DDL, maintenance, and introspection statements.
+
+    `SELECT`, `INSERT`, `UPDATE` and `DELETE` are all user workload and are always kept.
+    A write's `WHERE` clause benefits from an index exactly as a read's does, and write
+    volume is precisely what makes an index expensive to maintain — so dropping DML would
+    both hide index candidates and bias the cost picture toward reads.
+    """
+    return bool(_LEADING_NOISE.match(sql) or _INTROSPECTION.search(sql))
 
 
 def literal_flags(tree: exp.Expression) -> frozenset[str]:
