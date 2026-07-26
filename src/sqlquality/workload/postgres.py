@@ -398,6 +398,23 @@ _NULL_ROLE_PREDICATE = {
 }
 
 
+def _first_co_occurring(
+    equality: Sequence[ColumnUsage], null_checks: Sequence[ColumnUsage]
+) -> tuple[ColumnUsage, ColumnUsage, frozenset[str]] | None:
+    """Highest-cost (equality, null-check) pair that some single query uses together.
+
+    Both inputs arrive sorted by cost descending, so the first overlapping pair found is
+    the most expensive supported one. Returns the shared fingerprints alongside, since that
+    overlap *is* the evidence for the proposal.
+    """
+    for left in equality:
+        for right in null_checks:
+            shared = left.fingerprint_ids & right.fingerprint_ids
+            if shared:
+                return left, right, shared
+    return None
+
+
 def propose_partial_indexes(
     usage: Sequence[ColumnUsage],
     facts: Mapping[str, TableFacts],
@@ -423,14 +440,15 @@ def propose_partial_indexes(
         )
         if not equality or not null_checks:
             continue
-        # The hottest equality column and the hottest null-check column are chosen
-        # independently per table — ColumnUsage carries no per-query link back to which
-        # predicates co-occurred in the same statement, so this pairing is never verified
-        # to come from one query. It could combine two predicates that no single query
-        # actually filters together. That is exactly why confidence stops at MEDIUM rather
-        # than HIGH even when both columns are individually hot: the evidence supports "both
-        # predicates are hot on this table," not "this specific combination is hot."
-        leading, guard = equality[0], null_checks[0]
+        # Pair only columns that some single query actually filters on *together*. Taking
+        # the hottest of each list independently can pair a filter from query A with a null
+        # check from query B that never co-occur — and a partial index whose guard no
+        # filtering query uses helps nothing while still costing writes. The overlap is the
+        # evidence for this proposal, so without one there is no proposal.
+        pair = _first_co_occurring(equality, null_checks)
+        if pair is None:
+            continue
+        leading, guard, shared = pair
         cost_share = max(leading.cost_share, guard.cost_share)
         if cost_share < min_cost_share:
             continue
@@ -454,6 +472,9 @@ def propose_partial_indexes(
                     "cost_share": cost_share,
                     "calls": max(leading.calls, guard.calls),
                     "row_estimate": table_facts.row_estimate if table_facts else None,
+                    #: How many query groups filter on both columns together. This is what
+                    #: makes the proposal supported rather than a guess.
+                    "co_occurring_fingerprints": len(shared),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=(

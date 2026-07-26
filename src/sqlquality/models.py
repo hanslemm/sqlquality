@@ -132,6 +132,10 @@ class ColumnUsage:
     #:   silently inflating it. Read it alongside the report's skipped counts.
     cost_share: float
     fingerprints: int
+    #: Fingerprints of the query groups that contributed this usage. Needed to ask whether
+    #: two usages *co-occur* — a partial-index proposal is only supported if some single
+    #: query actually filters on the indexed column and the guard column together.
+    fingerprint_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
