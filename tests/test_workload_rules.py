@@ -499,7 +499,7 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
     proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
 
-    drops = [p for p in proposals if p.ddl == 'DROP INDEX "idx_narrow";']
+    drops = [p for p in proposals if p.ddl == 'DROP INDEX "public"."idx_narrow";']
     assert len(drops) == 1
     assert drops[0].code == "ADV003"
 
@@ -634,7 +634,7 @@ def test_generated_ddl_quotes_identifiers():
         {},
         min_cost_share=0.01,
     )
-    assert proposals[0].ddl == 'CREATE INDEX ON "Order" ("Status");'
+    assert proposals[0].ddl == 'CREATE INDEX ON "public"."Order" ("Status");'
 
 
 def test_a_newline_in_an_identifier_is_not_rendered_as_a_statement():
@@ -677,3 +677,64 @@ def test_a_newline_in_an_identifier_is_not_rendered_as_a_statement():
 
 def test_quote_ident_doubles_an_embedded_quote():
     assert _quote_ident('we"ird') == '"we""ird"'
+
+
+def test_created_index_ddl_is_schema_qualified():
+    """An unqualified name resolves against the *operator's* search_path, not ours.
+
+    With `--schema analytics`, `CREATE INDEX ON "orders"` run by someone whose search_path
+    is `public` targets the wrong table entirely.
+    """
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(ndv={"status": 5000.0}),
+        {},
+        min_cost_share=0.01,
+        schema="analytics",
+    )
+    assert proposals[0].ddl == 'CREATE INDEX ON "analytics"."orders" ("status");'
+
+
+def test_partial_index_ddl_is_schema_qualified():
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        facts(),
+        min_cost_share=0.01,
+        schema="analytics",
+    )
+    assert proposals[0].ddl.startswith('CREATE INDEX ON "analytics"."orders" ("status")')
+
+
+def test_dropped_index_ddl_is_schema_qualified():
+    """A bare `DROP INDEX idx_cold` drops whichever idx_cold the search_path finds first."""
+    unused = {"orders": (PgIndex("idx_cold", ("note",), False, False, 0, 4096),)}
+    proposals = propose_unused_indexes(unused, hot_tables=frozenset({"orders"}), schema="analytics")
+    assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_cold";'
+
+    redundant = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        )
+    }
+    proposals = propose_redundant_indexes(redundant, schema="analytics")
+    assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_narrow";'
+
+
+def test_propose_passes_the_adapters_schema_into_the_ddl():
+    """The rules are module-level, so the adapter is the only thing that knows the schema."""
+    aggregation = Aggregation(
+        usage=(usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({"orders"}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    adapter.schemas = ("analytics",)
+    proposals = adapter.propose(
+        aggregation, facts(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
+    )
+    assert any('"analytics"."orders"' in (p.ddl or "") for p in proposals)

@@ -629,6 +629,29 @@ def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | Non
     )
 
 
+def _validate_schemas(values: list[str]) -> tuple[str, ...]:
+    """Accept exactly one distinct schema, or exit 2 explaining why.
+
+    Every catalog fact `advise` collects is keyed on the bare relation name: table sizes,
+    NDV maps, index lists and the qualify() schema all merge across schemas, so two
+    schemas each holding an `orders` alias into one another silently — the last catalog
+    row wins the row estimate, and `qualify()` resolves columns against a union of the
+    two column sets. Rejecting is the honest minimum until the keys are schema-qualified.
+    """
+    distinct = tuple(dict.fromkeys(values))
+    if len(distinct) > 1:
+        typer.echo(
+            f"--schema accepts one schema at a time (got {', '.join(distinct)}). "
+            "Multi-schema introspection is not supported yet: table facts, index lists "
+            "and NDV statistics are keyed on the bare table name, not schema-qualified, "
+            "so same-named tables in two schemas would silently alias. Run advise once "
+            "per schema.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return distinct
+
+
 def _parse_since(value: str | None) -> timedelta | None:
     """Parse a '7d' / '24h' / '2w' duration, or exit 2."""
     if value is None:
@@ -655,7 +678,7 @@ def advise(
         None, "--profiles-dir", help="Directory holding profiles.yml (default: ~/.dbt)."
     ),
     schema: list[str] = typer.Option(
-        ["public"], "--schema", help="Schema(s) to introspect. Repeatable."
+        ["public"], "--schema", help="Schema to introspect. One at a time (see --help notes)."
     ),
     since: str | None = typer.Option(
         None, "--since", help="Window, e.g. 7d. Not supported by pg_stat_statements."
@@ -680,6 +703,7 @@ def advise(
     """Propose database optimizations from query history and catalog metadata."""
     since_delta = _parse_since(since)
     timeout = _validate_timeout(timeout)
+    schemas = _validate_schemas(schema)
 
     # --dry-run must work with no credentials at all: it is how you audit what we would run.
     if dry_run:
@@ -732,7 +756,6 @@ def advise(
 
     typer.echo(f"engine: {params.engine} (credentials from {params.source})", err=True)
 
-    schemas = tuple(schema)
     adapter.schemas = schemas
     try:
         adapter.connect(params, timeout)

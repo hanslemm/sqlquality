@@ -212,6 +212,22 @@ def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | N
     return None
 
 
+#: Schema every rule qualifies its DDL with unless told otherwise. It matches the CLI's
+#: `--schema` default, so the default is truthful rather than merely convenient; the CLI
+#: always passes the resolved schema explicitly (see PostgresWorkloadAdapter.propose).
+DEFAULT_SCHEMA = "public"
+
+
+def _qualified(schema: str, name: str) -> str:
+    """`"schema"."name"` — both parts quoted.
+
+    Generated DDL is read and run by an operator whose `search_path` we do not control.
+    An unqualified `DROP INDEX "idx_cold"` drops whichever `idx_cold` their search_path
+    resolves first, which is not necessarily the one we introspected.
+    """
+    return f"{_quote_ident(schema)}.{_quote_ident(name)}"
+
+
 def propose_indexes(
     usage: Sequence[ColumnUsage],
     facts: Mapping[str, TableFacts],
@@ -220,6 +236,7 @@ def propose_indexes(
     min_cost_share: float,
     min_rows: int = MIN_ROWS_FOR_INDEX,
     max_arity: int = MAX_INDEX_ARITY,
+    schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV001 — composite index candidates: equality columns first, one range column last.
 
@@ -304,14 +321,20 @@ def propose_indexes(
                     "leading_ndv": leading_ndv,
                 },
                 confidence=confidence,
-                ddl=f"CREATE INDEX ON {_quote_ident(table)} ({', '.join(_quote_ident(c) for c in columns)});",
+                ddl=(
+                    f"CREATE INDEX ON {_qualified(schema, table)} "
+                    f"({', '.join(_quote_ident(c) for c in columns)});"
+                ),
             )
         )
     return proposals
 
 
 def propose_unused_indexes(
-    existing: Mapping[str, Sequence[PgIndex]], *, hot_tables: frozenset[str]
+    existing: Mapping[str, Sequence[PgIndex]],
+    *,
+    hot_tables: frozenset[str],
+    schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV002 — indexes with zero recorded scans, excluding constraint-backing indexes.
 
@@ -339,7 +362,7 @@ def propose_unused_indexes(
                         "size_bytes": index.size_bytes,
                     },
                     confidence=Confidence.MEDIUM,
-                    ddl=f"DROP INDEX {_quote_ident(index.name)};",
+                    ddl=f"DROP INDEX {_qualified(schema, index.name)};",
                 )
             )
     return proposals
@@ -347,6 +370,8 @@ def propose_unused_indexes(
 
 def propose_redundant_indexes(
     existing: Mapping[str, Sequence[PgIndex]],
+    *,
+    schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV003 — an index whose column list is a strict prefix of another's is redundant."""
     proposals: list[Proposal] = []
@@ -383,7 +408,7 @@ def propose_redundant_indexes(
                         "size_bytes": narrow.size_bytes,
                     },
                     confidence=Confidence.HIGH,
-                    ddl=f"DROP INDEX {_quote_ident(narrow.name)};",
+                    ddl=f"DROP INDEX {_qualified(schema, narrow.name)};",
                 )
             )
     return proposals
@@ -420,6 +445,7 @@ def propose_partial_indexes(
     facts: Mapping[str, TableFacts],
     *,
     min_cost_share: float,
+    schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV004 — index the hot equality column, restricted by a hot null-check predicate.
 
@@ -478,7 +504,7 @@ def propose_partial_indexes(
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=(
-                    f"CREATE INDEX ON {_quote_ident(table)} "
+                    f"CREATE INDEX ON {_qualified(schema, table)} "
                     f"({_quote_ident(leading.column)}) "
                     f"WHERE {_quote_ident(guard.column)} {predicate};"
                 ),
@@ -894,13 +920,25 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         min_cost_share: float,
     ) -> list[Proposal]:
         existing = self.fetch_indexes(self.schemas, aggregation.tables)
+        # The rules are module-level and emit DDL, so they need the schema they are talking
+        # about. Only one schema is ever introspected (the CLI rejects more than one), so
+        # this is unambiguous rather than a guess about which one a proposal belongs to.
+        schema = self.schemas[0] if self.schemas else DEFAULT_SCHEMA
         proposals = [
-            *propose_indexes(aggregation.usage, facts, existing, min_cost_share=min_cost_share),
-            *propose_partial_indexes(aggregation.usage, facts, min_cost_share=min_cost_share),
+            *propose_indexes(
+                aggregation.usage,
+                facts,
+                existing,
+                min_cost_share=min_cost_share,
+                schema=schema,
+            ),
+            *propose_partial_indexes(
+                aggregation.usage, facts, min_cost_share=min_cost_share, schema=schema
+            ),
             *propose_sargability(aggregation.usage, workload, min_cost_share=min_cost_share),
             *propose_select_star(workload, facts, min_cost_share=min_cost_share),
-            *propose_unused_indexes(existing, hot_tables=aggregation.tables),
-            *propose_redundant_indexes(existing),
+            *propose_unused_indexes(existing, hot_tables=aggregation.tables, schema=schema),
+            *propose_redundant_indexes(existing, schema=schema),
         ]
         return sorted(
             self._dedupe_by_ddl(proposals),

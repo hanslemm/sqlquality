@@ -56,6 +56,34 @@ def test_out_of_range_timeout_exit_2_before_connecting(monkeypatch):
         assert "between 1 and 3600" in result.output
 
 
+def test_multiple_schemas_are_rejected_before_connecting(monkeypatch):
+    """Table facts are keyed on relname alone, so two schemas holding `orders` alias.
+
+    Rejecting is the honest minimum: the last row of whichever schema the catalog returned
+    last would otherwise decide the row estimate, silently.
+    """
+
+    def explode(*args, **kwargs):
+        raise AssertionError("must not connect with more than one --schema")
+
+    monkeypatch.setattr("sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode)
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "public", "--schema", "app"],
+    )
+    assert result.exit_code == 2
+    assert "schema-qualified" in result.output
+    assert "app" in result.output and "public" in result.output
+
+
+def test_a_single_schema_is_still_accepted(monkeypatch):
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--schema", "analytics", "--json"]
+    )
+    assert result.exit_code == 0
+
+
 def test_low_coverage_warns_on_stderr(monkeypatch):
     """ "No proposals" must be distinguishable from "I understood almost none of this"."""
     _stub_adapter(
