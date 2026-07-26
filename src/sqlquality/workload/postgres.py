@@ -601,6 +601,15 @@ def propose_select_star(
     return proposals
 
 
+def _comment_lines(text: str) -> list[str]:
+    """Comment each line of text for safe inclusion in a SQL script.
+
+    Each line is prefixed with '-- ', ensuring that even a multi-line title from
+    a schema identifier cannot break out of comment mode and become executable.
+    """
+    return [f"-- {line}" for line in text.splitlines()]
+
+
 class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
@@ -898,6 +907,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             "--",
             "-- On a live table prefer CREATE INDEX CONCURRENTLY / DROP INDEX CONCURRENTLY:",
             "-- the plain forms below take a lock that blocks writes for the duration.",
+            "-- Note that CONCURRENTLY cannot run inside a transaction block, so apply those",
+            "-- statements individually rather than piping this whole file into one.",
             "",
         ]
         body: list[str] = []
@@ -905,11 +916,15 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             if not proposal.ddl:
                 continue
             share = proposal.evidence.get("cost_share")
-            share_text = ""
-            if isinstance(share, (int, float)):
-                share_text = f", {float(share):.1%} of workload cost"
+            # bool is an int subclass, so exclude it explicitly — a stray True would
+            # otherwise render as "100.0% of workload cost".
+            share_text = (
+                f", {share:.1%} of workload cost"
+                if isinstance(share, (int, float)) and not isinstance(share, bool)
+                else ""
+            )
             body.append(f"-- {proposal.code} [{proposal.confidence.value}{share_text}]")
-            body.append(f"-- {proposal.title}")
+            body.extend(_comment_lines(proposal.title))
             body.append(proposal.ddl)
             body.append("")
         if not body:
