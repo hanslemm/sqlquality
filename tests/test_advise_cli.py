@@ -152,6 +152,55 @@ WIDE_COLUMNS = [
 ]
 
 
+#: A table wide enough for ADV006, reachable only by a bare star query.
+STAR_ONLY_ROWS = {
+    "pg_stat_statements": [("select * from wide_t", 100, 5000.0, 10)],
+    "pg_stat_database": [("2026-07-01",)],
+    "information_schema.columns": [("wide_t", f"c{i}", "text") for i in range(20)],
+    "pg_total_relation_size": [("wide_t", 5_000_000, 10**8)],
+    "pg_stats": [],
+    "pg_index": [],
+}
+
+
+def test_a_bare_select_star_table_is_still_introspected(monkeypatch):
+    """ADV006 was inert for exactly the case it exists to catch.
+
+    `select * from wide_t` has no predicates, so it contributes no column usage, so the
+    table never reached `aggregation.tables`, so `fetch_table_facts` never fetched its
+    column count, so the wide-table test could not pass. Adding `where c1 = $1` made the
+    proposal appear — which is the wrong way round.
+    """
+    _stub_adapter(monkeypatch, STAR_ONLY_ROWS)
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert any(p["code"] == "ADV006" for p in payload["proposals"]), payload["proposals"]
+
+
+def test_an_unwritable_markdown_path_exits_2_not_1(monkeypatch, tmp_path):
+    """1 is reserved for "findings or gate failure" — a typo must not read as a failed gate.
+
+    It also happened after the whole analysis, so the work was discarded with a traceback.
+    """
+    _stub_adapter(monkeypatch, STAR_ONLY_ROWS)
+    missing = tmp_path / "no" / "such" / "dir" / "report.md"
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--markdown", str(missing)]
+    )
+    assert result.exit_code == 2
+    assert str(missing) in result.output
+    assert "Traceback" not in result.output
+
+
+def test_a_ddl_path_that_is_a_directory_exits_2_not_1(monkeypatch, tmp_path):
+    _stub_adapter(monkeypatch, STAR_ONLY_ROWS)
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--ddl", str(tmp_path)])
+    assert result.exit_code == 2
+    assert str(tmp_path) in result.output
+    assert "Traceback" not in result.output
+
+
 def test_successful_run_exits_0_and_emits_json(monkeypatch):
     _stub_adapter(
         monkeypatch,

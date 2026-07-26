@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -20,6 +20,7 @@ from sqlquality.models import (
     Workload,
     WorkloadFetch,
 )
+from sqlquality.workload.aggregate import mentions_table
 from sqlquality.workload.base import IntrospectionStatement, Querier, WorkloadAdapter
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
 
@@ -63,6 +64,14 @@ _PG_FIELD_MAP = {
     "username": "user",
     "password": "password",
 }
+#: profiles.yml keys forwarded to libpq unchanged, because the name already *is* the libpq
+#: keyword. The TLS group is here for a security reason, not a completeness one: a profile
+#: saying `sslmode: verify-full` that silently connects under libpq's default `prefer`
+#: performs no certificate verification at all, and the user is never told. For a tool
+#: pitched as safe to point at production that is the wrong way to fail.
+_PG_PASSTHROUGH_FIELDS = frozenset(
+    {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
+)
 #: profiles.yml keys whose values must never appear in any message we emit.
 _SECRET_FIELDS = frozenset({"password", "pass"})
 #: Bounds for --timeout, in seconds. A statement timeout of 0 means "no limit" in Postgres,
@@ -73,7 +82,20 @@ _MAX_TIMEOUT_S = 3600
 
 def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
     """Translate profiles.yml keys to libpq keywords, dropping anything unrecognized."""
-    return {_PG_FIELD_MAP[k]: v for k, v in fields.items() if k in _PG_FIELD_MAP}
+    translated = {_PG_FIELD_MAP[k]: v for k, v in fields.items() if k in _PG_FIELD_MAP}
+    translated.update({k: v for k, v in fields.items() if k in _PG_PASSTHROUGH_FIELDS})
+    return translated
+
+
+def _dropped_pg_fields(fields: dict[str, str]) -> tuple[str, ...]:
+    """profiles.yml keys this adapter cannot forward, by name.
+
+    Names only, never values: one of them could be a secret (`sslpassword`), and this text
+    goes to stderr and from there into CI logs.
+    """
+    return tuple(
+        sorted(k for k in fields if k not in _PG_FIELD_MAP and k not in _PG_PASSTHROUGH_FIELDS)
+    )
 
 
 def _clamp_timeout_ms(timeout_s: int) -> int:
@@ -630,17 +652,6 @@ def propose_sargability(
     return proposals
 
 
-def _mentions_table(name: str, sql: str) -> bool:
-    """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
-
-    A plain `name in sql` test would false-positive three ways: a table `order` inside a
-    query on `orders`, a table `cart` inside `shopping_cart`, and a table `orders` that only
-    appears as part of a column alias like `orders_total`. `\\b` already treats `_` as a word
-    character in Python's `re`, so it rejects all three without a custom boundary class.
-    """
-    return re.search(rf"\b{re.escape(name)}\b", sql) is not None
-
-
 def propose_select_star(
     workload: Workload,
     facts: Mapping[str, TableFacts],
@@ -657,7 +668,7 @@ def propose_select_star(
     for stat in workload.stats:
         if FLAG_SELECT_STAR not in stat.flags:
             continue
-        touched = sorted(name for name in wide if _mentions_table(name, stat.sql))
+        touched = sorted(name for name in wide if mentions_table(name, stat.sql))
         if not touched:
             continue
         share = (stat.total_time_ms / total) if total else 0.0
@@ -797,13 +808,26 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 "Install it with: pip install 'sqlquality[postgres]'"
             ) from exc
 
-        conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
+        # Silence is the failure mode being fixed here: a dropped `sslmode` downgrades the
+        # connection with no signal at all. Key names only — see _dropped_pg_fields.
+        dropped = _dropped_pg_fields(params.fields)
+        if dropped:
+            print(
+                f"warning: ignoring connection setting(s) not supported by the Postgres "
+                f"adapter: {', '.join(dropped)}. Pass --dsn if you need them.",
+                file=sys.stderr,
+            )
+
         # Everything we know to be secret, so a driver exception can be proven clean rather
         # than trusted.
         secrets = _secrets_for(params)
 
         failure: str | None = None
         try:
+            # Inside the scrubbing envelope: psycopg raises from make_conninfo on an
+            # unusable keyword, and that message can quote the offending value — which for
+            # the `password` keyword is the password.
+            conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
             connection = psycopg.connect(conninfo, autocommit=True)
             with connection.cursor() as cursor:
                 # Belt and braces: the session cannot write even if a statement tried to.
