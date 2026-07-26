@@ -123,8 +123,7 @@ def ingest(fetch: WorkloadFetch, dialect: str, *, keep_literals: bool = False) -
                 )
                 for key in calls
             ),
-            key=lambda s: s.total_time_ms,
-            reverse=True,
+            key=lambda s: (-s.total_time_ms, s.fingerprint),
         )
     )
     return Workload(
