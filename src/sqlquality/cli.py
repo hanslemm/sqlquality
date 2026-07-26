@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from dataclasses import asdict, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import NoReturn
 
@@ -23,16 +26,27 @@ from sqlquality.dialects import validate_dialect
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
-from sqlquality.models import Severity
-from sqlquality.report import gate_payload, render_html, render_markdown, verdict_label
+from sqlquality.models import Aggregation, Severity, Workload
+from sqlquality.report import (
+    advise_payload,
+    gate_payload,
+    render_advise_markdown,
+    render_html,
+    render_markdown,
+    verdict_label,
+)
 from sqlquality.sqlast import SqlParseError, analyze_sql, parse, strip_jinja
+from sqlquality.workload import get_workload_adapter
+from sqlquality.workload.aggregate import aggregate
+from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
+from sqlquality.workload.fingerprint import ingest
 
 console = Console()
 
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
-    help="Measure dbt model performance and complexity.",
+    help="Measure dbt model performance and complexity, and advise on database optimizations.",
     epilog=(
         "Exit codes: 0 = pass / no findings; 1 = findings or gate failure; "
         "2 = usage, config, or input error."
@@ -533,6 +547,208 @@ def perf(
 
     has_error = any(f.severity is Severity.ERROR for f in findings)
     raise typer.Exit(code=1 if has_error else 0)
+
+
+_SINCE_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
+#: Accepted --timeout range, in seconds. The adapter clamps to the same bounds as a safety
+#: net, but silently altering a number the user typed is worse than telling them it is out
+#: of range — 0 in particular means "no limit" to Postgres, the opposite of a timeout.
+_TIMEOUT_MIN_S = 1
+_TIMEOUT_MAX_S = 3600
+#: Warn when this share of the *analyzable* statements could not be analyzed. Coverage is
+#: not cosmetic: cost_share divides by the whole window's cost including skipped statements,
+#: so poor coverage dilutes every share and makes --min-cost-share progressively stricter.
+#: Without this warning, "no proposals" is indistinguishable from "I understood almost none
+#: of your workload".
+_LOW_COVERAGE_FRACTION = 0.2
+
+
+def _validate_timeout(value: int) -> int:
+    """Return a timeout in seconds, or exit 2 with a message naming the accepted range."""
+    if not _TIMEOUT_MIN_S <= value <= _TIMEOUT_MAX_S:
+        typer.echo(
+            f"--timeout must be between {_TIMEOUT_MIN_S} and {_TIMEOUT_MAX_S} seconds "
+            f"(got {value}). Postgres treats 0 as no limit, which would defeat the flag.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return value
+
+
+def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | None:
+    """A warning when too little of the workload could be analyzed, else None.
+
+    Noise (introspection, DDL, session control) is excluded from the denominator: those are
+    deliberately filtered, not failures to understand. Only statements we tried and failed
+    to use count against coverage.
+    """
+    analyzed = max(0, len(workload.stats) - aggregation.skipped_unqualifiable)
+    unexplained = workload.skipped_unparseable + aggregation.skipped_unqualifiable
+    considered = analyzed + unexplained
+    if not considered:
+        return None
+    share = unexplained / considered
+    if share <= _LOW_COVERAGE_FRACTION:
+        return None
+    return (
+        f"low coverage: {share:.0%} of candidate statements could not be analyzed "
+        f"({workload.skipped_unparseable} unparseable, "
+        f"{aggregation.skipped_unqualifiable} unresolvable against the schema). "
+        "Cost shares are computed against the whole window, so they are diluted and "
+        "--min-cost-share is effectively stricter — few or no proposals may reflect "
+        "coverage rather than a healthy workload."
+    )
+
+
+def _parse_since(value: str | None) -> timedelta | None:
+    """Parse a '7d' / '24h' / '2w' duration, or exit 2."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+)([hdw])", value.strip().lower())
+    if match is None:
+        typer.echo(
+            f"Could not parse --since {value!r}. Use a count and a unit, e.g. 24h, 7d, 2w.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return timedelta(**{_SINCE_UNITS[match.group(2)]: int(match.group(1))})
+
+
+@app.command()
+def advise(
+    engine: str | None = typer.Option(
+        None, "--engine", help="postgres | redshift | snowflake. Inferred from the DSN if unset."
+    ),
+    dsn: str | None = typer.Option(None, "--dsn", help="Database URL. Overrides SQLQUALITY_DSN."),
+    profile: str | None = typer.Option(None, "--profile", help="dbt profile name (optional)."),
+    target: str | None = typer.Option(None, "--target", help="dbt target within the profile."),
+    profiles_dir: Path | None = typer.Option(
+        None, "--profiles-dir", help="Directory holding profiles.yml (default: ~/.dbt)."
+    ),
+    schema: list[str] = typer.Option(
+        ["public"], "--schema", help="Schema(s) to introspect. Repeatable."
+    ),
+    since: str | None = typer.Option(
+        None, "--since", help="Window, e.g. 7d. Not supported by pg_stat_statements."
+    ),
+    limit: int = typer.Option(500, "--limit", help="Max query-history rows to read."),
+    min_cost_share: float = typer.Option(
+        0.01, "--min-cost-share", help="Suppress proposals below this share of workload cost."
+    ),
+    keep_literals: bool = typer.Option(
+        False, "--keep-literals", help="Do NOT redact literal values from query text."
+    ),
+    timeout: int = typer.Option(30, "--timeout", help="Statement timeout in seconds."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the statements that would run, then exit without connecting.",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    markdown: Path | None = typer.Option(None, "--markdown", help="Write a markdown report."),
+    ddl: Path | None = typer.Option(None, "--ddl", help="Write proposed DDL for review."),
+) -> None:
+    """Propose database optimizations from query history and catalog metadata."""
+    since_delta = _parse_since(since)
+    timeout = _validate_timeout(timeout)
+
+    # --dry-run must work with no credentials at all: it is how you audit what we would run.
+    if dry_run:
+        try:
+            adapter = get_workload_adapter(engine or "postgres")
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2)
+        for statement in adapter.introspection_sql():
+            typer.echo(f"-- {statement.capability}: {statement.privilege_hint}")
+            typer.echo(statement.sql)
+            typer.echo("")
+        raise typer.Exit(code=0)
+
+    try:
+        params = resolve_connection(
+            dsn=dsn,
+            engine=engine,
+            profile=profile,
+            target=target,
+            profiles_dir=profiles_dir,
+            env=os.environ,
+        )
+        adapter = get_workload_adapter(params.engine)
+    except (ConnectionResolutionError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+
+    typer.echo(f"engine: {params.engine} (credentials from {params.source})", err=True)
+
+    schemas = tuple(schema)
+    adapter.schemas = schemas
+    try:
+        adapter.connect(params, timeout)
+    except ImportError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+    except Exception as exc:  # driver-specific connection failures
+        typer.echo(f"Could not connect: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+    fetch = adapter.fetch_workload(since_delta, limit)
+    workload = ingest(fetch, params.engine, keep_literals=keep_literals)
+    db_schema = adapter.fetch_schema(schemas)
+    aggregation = aggregate(workload, db_schema, params.engine)
+    facts = adapter.fetch_table_facts(schemas, aggregation.tables)
+    proposals = adapter.propose(aggregation, facts, workload, min_cost_share=min_cost_share)
+
+    payload = advise_payload(
+        proposals,
+        workload,
+        aggregation,
+        engine=params.engine,
+        redacted=not keep_literals,
+        degraded=adapter.degraded,
+    )
+    if markdown is not None:
+        markdown.write_text(
+            render_advise_markdown(
+                proposals,
+                workload,
+                aggregation,
+                engine=params.engine,
+                redacted=not keep_literals,
+                degraded=adapter.degraded,
+            )
+        )
+    if ddl is not None:
+        ddl.write_text(adapter.render_ddl(proposals))
+
+    if json_out:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        raise typer.Exit(code=0)
+
+    for capability, reason in adapter.degraded:
+        typer.echo(f"reduced coverage — {capability}: {reason}", err=True)
+    typer.echo(f"window: {workload.window_description}", err=True)
+    coverage = _coverage_warning(workload, aggregation)
+    if coverage is not None:
+        typer.echo(coverage, err=True)
+
+    table = Table(
+        title=(
+            f"Advise — {params.engine} "
+            f"({len(proposals)} proposals, {len(workload.stats)} query groups)"
+        )
+    )
+    table.add_column("code")
+    table.add_column("conf")
+    table.add_column("cost share", justify="right")
+    table.add_column("proposal")
+    for proposal in proposals:
+        share = proposal.evidence.get("cost_share")
+        share_text = f"{float(share):.1%}" if isinstance(share, (int, float)) else "—"
+        table.add_row(proposal.code, proposal.confidence.value, share_text, proposal.title)
+    console.print(table)
+    # Proposals are advisory: advise never gates.
+    raise typer.Exit(code=0)
 
 
 def main() -> None:
