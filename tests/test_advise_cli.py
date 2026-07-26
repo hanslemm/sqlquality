@@ -177,6 +177,72 @@ def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
     assert "REVIEW BEFORE RUNNING" in ddl.read_text()
 
 
+def test_real_adapter_connection_failure_is_reported_once(monkeypatch):
+    """Exercises the real adapter's error string through the CLI's handler.
+
+    Every other connection test monkeypatches `PostgresWorkloadAdapter.connect` itself, so
+    none of them cover the seam between the adapter's message and the CLI's prefix — which
+    is where a doubled "Could not connect: Could not connect: ..." went unnoticed. This
+    patches `psycopg` instead, leaving the real `connect()` to run.
+    """
+    import sys
+    import types
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def explode(conninfo, **kwargs):
+        raise RuntimeError('connection to server at "db" failed')
+
+    fake_psycopg.connect = explode  # type: ignore[attr-defined]
+    fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u:hunter2@db/x"])
+    assert result.exit_code == 2
+    assert result.output.count("Could not connect") == 1
+    assert "connection to server" in result.output
+    # And the inline DSN password still must not surface on this path.
+    assert "hunter2" not in result.output
+
+
+def test_dry_run_honours_json(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("--dry-run must not connect")
+
+    monkeypatch.setattr("sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode)
+    result = runner.invoke(app, ["advise", "--engine", "postgres", "--dry-run", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["engine"] == "postgres"
+    capabilities = {s["capability"] for s in payload["statements"]}
+    assert "workload" in capabilities
+    assert all(s["privilege_hint"] for s in payload["statements"])
+
+
+def test_coverage_is_disclosed_even_on_a_clean_run(monkeypatch):
+    """The terminal path should not be the one place coverage is invisible."""
+    _stub_adapter(
+        monkeypatch,
+        {
+            "pg_stat_statements": [
+                ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+            "information_schema.columns": WIDE_COLUMNS,
+            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
+            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_index": [],
+        },
+    )
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "analyzed 1 query group(s)" in result.output
+    assert "unparseable" in result.output
+    assert "low coverage" not in result.output
+
+
 def test_connection_failure_exits_2(monkeypatch):
     from sqlquality.workload.postgres import PostgresWorkloadAdapter
 

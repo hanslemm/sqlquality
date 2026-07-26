@@ -739,7 +739,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             # Raised after the handler, and scrubbed: Task 6 established that a dependency's
             # exception text is exactly where this class of leak hides, and that leaving the
             # handler is the only way to keep the original out of __context__.
-            raise ConnectionError(f"Could not connect: {failure}")
+            # No "Could not connect" prefix here — the CLI adds it. Prefixing at both
+            # layers printed "Could not connect: Could not connect: ..." on the most
+            # common failure a user hits.
+            raise ConnectionError(failure)
 
         def query(sql: str, bind: tuple[object, ...]) -> list[tuple[object, ...]]:
             with connection.cursor() as cur:

@@ -563,6 +563,11 @@ _TIMEOUT_MAX_S = 3600
 _LOW_COVERAGE_FRACTION = 0.2
 
 
+def _plural(count: int, noun: str) -> str:
+    """`3 proposals` / `1 proposal`. Small, but "1 proposals" reads as a bug in the tool."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 def _validate_timeout(value: int) -> int:
     """Return a timeout in seconds, or exit 2 with a message naming the accepted range."""
     if not _TIMEOUT_MIN_S <= value <= _TIMEOUT_MAX_S:
@@ -659,7 +664,29 @@ def advise(
         except ValueError as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(code=2)
-        for statement in adapter.introspection_sql():
+        statements = adapter.introspection_sql()
+        if json_out:
+            # Honour --json here too: auditing what a tool would run against your database
+            # is exactly the kind of thing someone wants to diff or feed to review tooling.
+            typer.echo(
+                json.dumps(
+                    {
+                        "engine": engine or "postgres",
+                        "statements": [
+                            {
+                                "capability": s.capability,
+                                "privilege_hint": s.privilege_hint,
+                                "sql": s.sql,
+                            }
+                            for s in statements
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(code=0)
+        for statement in statements:
             typer.echo(f"-- {statement.capability}: {statement.privilege_hint}")
             typer.echo(statement.sql)
             typer.echo("")
@@ -728,6 +755,15 @@ def advise(
     for capability, reason in adapter.degraded:
         typer.echo(f"reduced coverage — {capability}: {reason}", err=True)
     typer.echo(f"window: {workload.window_description}", err=True)
+    # Disclose coverage on every run, not only when it is bad. The markdown and JSON
+    # reports always carry these counts; the terminal path should not be the one place a
+    # user cannot see how much of their workload was actually understood.
+    typer.echo(
+        f"analyzed {len(workload.stats)} query group(s); skipped "
+        f"{workload.skipped_unparseable} unparseable, {workload.skipped_noise} "
+        f"introspection/DDL, {aggregation.skipped_unqualifiable} unresolvable",
+        err=True,
+    )
     coverage = _coverage_warning(workload, aggregation)
     if coverage is not None:
         typer.echo(coverage, err=True)
@@ -735,7 +771,8 @@ def advise(
     table = Table(
         title=(
             f"Advise — {params.engine} "
-            f"({len(proposals)} proposals, {len(workload.stats)} query groups)"
+            f"({_plural(len(proposals), 'proposal')}, "
+            f"{_plural(len(workload.stats), 'query group')})"
         )
     )
     table.add_column("code")
