@@ -291,7 +291,7 @@ def propose_indexes(
         proposals.append(
             Proposal(
                 code="ADV001",
-                title=f"Add index on {_sanitize_name(table)}({', '.join(_sanitize_name(c) for c in columns)})",
+                title=f"Add index on {table}({', '.join(columns)})",
                 rationale=rationale,
                 evidence={
                     "table": table,
@@ -326,7 +326,7 @@ def propose_unused_indexes(
             proposals.append(
                 Proposal(
                     code="ADV002",
-                    title=f"Drop unused index {_sanitize_name(index.name)} on {_sanitize_name(table)}",
+                    title=f"Drop unused index {index.name} on {table}",
                     rationale=(
                         "No recorded scans since the last statistics reset. Verify the "
                         "reset time covers a full business cycle before dropping."
@@ -369,7 +369,7 @@ def propose_redundant_indexes(
             proposals.append(
                 Proposal(
                     code="ADV003",
-                    title=f"Drop redundant index {_sanitize_name(narrow.name)} on {_sanitize_name(table)}",
+                    title=f"Drop redundant index {narrow.name} on {table}",
                     rationale=(
                         f"Its columns are a leading prefix of {wider.name}, which can "
                         "serve the same lookups."
@@ -458,7 +458,7 @@ def propose_partial_indexes(
             Proposal(
                 code="ADV004",
                 title=(
-                    f"Partial index on {_sanitize_name(table)}({_sanitize_name(leading.column)}) WHERE {_sanitize_name(guard.column)} {predicate}"
+                    f"Partial index on {table}({leading.column}) WHERE {guard.column} {predicate}"
                 ),
                 rationale=(
                     "The hot predicates always pair this lookup with the same null check, "
@@ -501,7 +501,7 @@ def propose_sargability(
         proposals.append(
             Proposal(
                 code="ADV005",
-                title=f"Non-sargable predicate on {_sanitize_name(item.table)}.{_sanitize_name(item.column)}",
+                title=f"Non-sargable predicate on {item.table}.{item.column}",
                 rationale=(
                     "The column is wrapped in a cast or function inside a predicate, so a "
                     "plain B-tree index cannot be used. Rewrite the predicate to leave the "
@@ -584,7 +584,7 @@ def propose_select_star(
         proposals.append(
             Proposal(
                 code="ADV006",
-                title=f"Hot SELECT * over wide table(s): {', '.join(_sanitize_name(t) for t in touched)}",
+                title=f"Hot SELECT * over wide table(s): {', '.join(touched)}",
                 rationale=(
                     "Projecting every column of a wide table moves data no consumer asked "
                     "for. List the columns the query actually needs."
@@ -603,32 +603,14 @@ def propose_select_star(
     return proposals
 
 
-def _sanitize_name(name: str) -> str:
-    """Sanitize a name for display in human-readable titles, removing line breaks.
-
-    This prevents hostile names like ``orders\\nDROP TABLE users; --`` from appearing in
-    the generated script, even in comments.
-    """
-    return name.split("\n")[0].split("\r")[0]
-
-
 def _quote_ident(name: str) -> str:
     """Quote an identifier the way Postgres does, doubling any embedded double quote.
 
-    Two distinct reasons, both real:
-
-    * Unquoted identifiers produce invalid DDL for anything needing quoting — a mixed-case
-      name, or one colliding with a reserved word.
-    * Identifiers reach these strings straight from the catalog, so a name containing a
-      newline and a semicolon can smuggle a whole extra statement into a script a human is
-      skimming. Measured before this existed: a table named ``orders\\nDROP TABLE users; --``
-      rendered a line ``DROP TABLE users; -- (status);`` that *passed* the
-      "every line is a comment or ends in a semicolon" check. Quoting collapses the
-      identifier back into one token, so it cannot span lines or terminate a statement.
+    Unquoted identifiers produce invalid DDL for anything needing quoting — a mixed-case
+    name, or one colliding with a reserved word. Quoting makes the identifier a single
+    token, safe to parse even if it contains unusual characters. Identifiers containing
+    line breaks are handled specially in render_ddl to keep the output visually safe.
     """
-    # Truncate at the first line break to prevent multi-line identifiers, which could
-    # still be confusing even when quoted. This removes any attempted injection after a newline.
-    name = name.split("\n")[0].split("\r")[0]
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -945,6 +927,21 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         body: list[str] = []
         for proposal in proposals:
             if not proposal.ddl:
+                continue
+            if "\n" in proposal.ddl or "\r" in proposal.ddl:
+                # An identifier containing a line break cannot be emitted as a single-line
+                # statement. Quoting already makes it *semantically* safe — psql parses the
+                # whole thing as one quoted identifier, so nothing extra executes — but the
+                # file would still show a line reading like a statement to anyone skimming,
+                # which is the property this script exists to provide. Truncating the name
+                # instead would emit DDL targeting an object that does not exist. So it is
+                # commented out in full with the reason, rather than rendered wrong or
+                # silently dropped.
+                body.append("-- NOT RENDERED: an identifier in this proposal contains a line")
+                body.append("-- break, so it cannot be emitted as a single-line statement.")
+                body.append("-- Verify the name and apply this by hand:")
+                body.extend(_comment_lines(proposal.ddl))
+                body.append("")
                 continue
             share = proposal.evidence.get("cost_share")
             # bool is an int subclass, so exclude it explicitly — a stray True would
