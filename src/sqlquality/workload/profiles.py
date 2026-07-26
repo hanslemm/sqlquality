@@ -85,16 +85,31 @@ def read_profiles_file(profiles_dir: Path) -> dict:
     # reachable to anything that walks the chain. Since PyYAML's message quotes the
     # offending source line, a syntax error on a `password:` line would otherwise leave
     # the secret retrievable. Leaving the handler first is what actually removes it.
+    #
+    # `UnicodeDecodeError` is recorded and re-raised the same way, for the same reason and
+    # then some: its `.object` attribute holds the *entire undecodable file*, so chaining it
+    # would leave every byte of a `password:` line reachable. Its own message
+    # ("can't decode byte 0xff in position 53") also names a byte from that content, so it
+    # is not repeated either — the file name and the required encoding are what is
+    # actionable.
     yaml_problem: str | None = None
+    not_utf8 = False
     try:
-        raw = yaml.safe_load(path.read_text())
+        # Explicit encoding: `read_text()` with none uses the *platform's* preferred
+        # encoding, so on a cp1252 machine a UTF-8 profiles.yml decodes to mojibake and a
+        # non-ASCII password corrupts into a baffling authentication failure.
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ProfileError(f"No profiles.yml in {profiles_dir}") from None
+    except UnicodeDecodeError:
+        not_utf8 = True
     except OSError as exc:
         # OSError carries the path and errno, never file content — safe to chain.
         raise ProfileError(f"Could not read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
         yaml_problem = _yaml_location(exc)
+    if not_utf8:
+        raise ProfileError(f"{path} is not valid UTF-8 — profiles.yml must be UTF-8 encoded.")
     if yaml_problem is not None:
         raise ProfileError(f"Malformed YAML in {path}{yaml_problem}")
     if not isinstance(raw, dict):

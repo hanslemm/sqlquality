@@ -536,3 +536,74 @@ def test_connect_without_psycopg_installed_raises_a_helpful_import_error(monkeyp
     with pytest.raises(ImportError) as exc:
         adapter.connect(params, 30)
     assert "sqlquality[postgres]" in str(exc.value)
+
+
+def test_the_ranking_key_ignores_a_boolean_cost_share():
+    """The proposal sort had the same missing bool guard as the two renderers.
+
+    `-float(True)` is -1.0, so a proposal carrying a stray True would sort ahead of a
+    genuinely hot one at the same confidence — the ordering the CLI presents as "read this
+    first".
+    """
+    from sqlquality.models import Confidence, Proposal
+
+    stray = Proposal(
+        code="ADV001",
+        title="t",
+        rationale="r",
+        evidence={"cost_share": True},
+        confidence=Confidence.HIGH,
+    )
+    hot = Proposal(
+        code="ADV001",
+        title="t",
+        rationale="r",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.HIGH,
+    )
+    key = PostgresWorkloadAdapter._ranking_key
+    assert key(hot) < key(stray)
+
+
+def test_the_schema_statement_runs_once_per_run():
+    """CAP_SCHEMA was executed by both fetch_schema and fetch_table_facts.
+
+    Twice the catalog work, and — worse — two identical `degraded` entries when it is
+    denied, so the user is told the same thing twice.
+    """
+    querier = FakeQuerier({"information_schema.columns": [("orders", "id", "integer")]})
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    adapter.fetch_schema(("public",))
+    adapter.fetch_table_facts(("public",), frozenset({"orders"}))
+    schema_calls = [sql for sql, _ in querier.calls if "information_schema.columns" in sql]
+    assert len(schema_calls) == 1
+
+
+def test_a_denied_schema_statement_is_reported_once_not_twice():
+    querier = FakeQuerier({}, fail_markers=("information_schema.columns",))
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    adapter.fetch_schema(("public",))
+    adapter.fetch_table_facts(("public",), frozenset({"orders"}))
+    assert [cap for cap, _ in adapter.degraded].count(CAP_SCHEMA) == 1
+
+
+def test_the_timeout_bounds_have_a_single_definition():
+    """Two independent constant pairs drift: the CLI would reject what the adapter accepts,
+    or the adapter would silently clamp past the range the CLI's error message promises."""
+    import inspect
+    from pathlib import Path
+
+    from sqlquality import cli
+    from sqlquality.workload import base
+
+    assert cli.MIN_TIMEOUT_S is base.MIN_TIMEOUT_S
+    assert cli.MAX_TIMEOUT_S is base.MAX_TIMEOUT_S
+    from sqlquality.workload import postgres
+
+    assert postgres.MAX_TIMEOUT_S is base.MAX_TIMEOUT_S
+    # And imported, not re-typed — equal literals in two files are still two definitions.
+    for module in (cli, postgres):
+        source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
+        assert str(base.MAX_TIMEOUT_S) not in source, (
+            f"{module.__name__} restates the --timeout ceiling as a literal"
+        )

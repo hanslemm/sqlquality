@@ -910,3 +910,57 @@ def test_propose_passes_the_adapters_schema_into_the_ddl():
         aggregation, facts(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
     )
     assert any('"analytics"."orders"' in (p.ddl or "") for p in proposals)
+
+
+def test_adv005_reports_a_short_fingerprint_id_and_keeps_the_sql_separately():
+    """`fingerprint` was the entire canonical SQL, so ADV005 printed the query twice.
+
+    Once as `fingerprint`, once as `sql` — for a long statement that is the bulk of the
+    proposal's evidence block, duplicated. `fingerprint` is an identity, so a short stable
+    hash is what it should carry.
+    """
+    canonical = 'SELECT "note" FROM "orders" WHERE "note" LIKE ? AND "status" = ?'
+    stat = QueryStat(
+        fingerprint=canonical,
+        sql="select note from orders where note like $1 and status = $2",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_LEADING_WILDCARD_LIKE}),
+    )
+    proposals = propose_sargability([], _workload(stat), min_cost_share=0.01)
+    fingerprint = proposals[0].evidence["fingerprint"]
+    assert fingerprint != canonical
+    assert len(fingerprint) <= 16
+    # The text is still there — the identity is what got shorter, not the evidence.
+    assert proposals[0].evidence["sql"] == stat.sql
+
+
+def test_the_fingerprint_id_is_stable_and_distinguishing():
+    """It is an identity: the same query group must always get the same id, and two
+    different groups must not collide."""
+    from sqlquality.workload.postgres import _fingerprint_id
+
+    assert _fingerprint_id("select 1") == _fingerprint_id("select 1")
+    assert _fingerprint_id("select 1") != _fingerprint_id("select 2")
+
+
+def test_adv006_also_reports_the_short_id_without_losing_the_query():
+    canonical = 'SELECT * FROM "orders"'
+    stat = QueryStat(
+        fingerprint=canonical,
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    wide = {
+        "orders": TableFacts(
+            name="orders",
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        )
+    }
+    proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
+    assert proposals[0].evidence["fingerprint"] != canonical
+    assert proposals[0].evidence["sql"] == stat.sql

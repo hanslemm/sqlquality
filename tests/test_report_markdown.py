@@ -278,3 +278,47 @@ def test_markdown_ddl_fence_survives_embedded_triple_backticks():
     assert opening[:-3] == closing  # same backtick run, minus the "sql" language tag
     assert len(closing) > 3  # wider than the embedded ``` run, so it isn't closed early
     assert "# Fake Header" in lines[open_idx + 1 : close_idx]
+
+
+def test_markdown_does_not_render_a_stray_true_as_a_full_cost_share():
+    """bool is an int subclass, so `isinstance(share, (int, float))` accepts True.
+
+    render_ddl guards this explicitly and documents why; markdown and the terminal table
+    did not, and rendered `cost_share=True` as "100.0% of workload cost" — the single most
+    prominent number in the report, fabricated.
+    """
+    stray = [
+        Proposal(
+            code="ADV001",
+            title="t",
+            rationale="r",
+            evidence={"cost_share": True},
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        stray, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "100.0%" not in md
+    assert "—" in md
+
+
+def test_markdown_renders_evidence_the_way_json_does():
+    """`str(("status",))` is a Python repr — the markdown reader sees `('status',)` where
+    the JSON reader sees `["status"]` for the same run."""
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="t",
+            rationale="r",
+            evidence={"columns": ("status", "created_at"), "cost_share": 0.5},
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        proposals, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "columns=['status', 'created_at']" in md
+    assert "('status', 'created_at')" not in md

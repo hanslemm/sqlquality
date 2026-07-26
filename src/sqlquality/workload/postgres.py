@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,9 +20,16 @@ from sqlquality.models import (
     TableFacts,
     Workload,
     WorkloadFetch,
+    cost_share_of,
 )
 from sqlquality.workload.aggregate import mentions_table
-from sqlquality.workload.base import IntrospectionStatement, Querier, WorkloadAdapter
+from sqlquality.workload.base import (
+    MAX_TIMEOUT_S,
+    MIN_TIMEOUT_S,
+    IntrospectionStatement,
+    Querier,
+    WorkloadAdapter,
+)
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
 
 CAP_WORKLOAD = "workload"
@@ -74,10 +82,6 @@ _PG_PASSTHROUGH_FIELDS = frozenset(
 )
 #: profiles.yml keys whose values must never appear in any message we emit.
 _SECRET_FIELDS = frozenset({"password", "pass"})
-#: Bounds for --timeout, in seconds. A statement timeout of 0 means "no limit" in Postgres,
-#: which would defeat the point, and an absurd value is more likely a typo than an intent.
-_MIN_TIMEOUT_S = 1
-_MAX_TIMEOUT_S = 3600
 
 
 def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
@@ -99,8 +103,12 @@ def _dropped_pg_fields(fields: dict[str, str]) -> tuple[str, ...]:
 
 
 def _clamp_timeout_ms(timeout_s: int) -> int:
-    """Statement timeout in milliseconds, clamped into a sane range."""
-    return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S)) * 1000
+    """Statement timeout in milliseconds, clamped into a sane range.
+
+    The CLI rejects an out-of-range value before reaching here; this is the safety net
+    for any other caller. Bounds come from workload.base so the two cannot drift.
+    """
+    return max(MIN_TIMEOUT_S, min(int(timeout_s), MAX_TIMEOUT_S)) * 1000
 
 
 #: A secret shorter than this cannot be redacted by substring replacement without
@@ -155,6 +163,26 @@ def _scrub(text: str, secrets: Iterable[str]) -> str:
     for secret in present:
         scrubbed = scrubbed.replace(secret, "***")
     return scrubbed
+
+
+#: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
+#: apart the few hundred query groups one run reads, and short enough to sit in a table cell.
+_FINGERPRINT_ID_LEN = 12
+
+
+def _fingerprint_id(fingerprint: str) -> str:
+    """A short, stable identity for a query group.
+
+    `QueryStat.fingerprint` is the *entire* canonical SQL, so emitting it as evidence
+    printed the whole statement a second time next to `sql` — for a long query, most of the
+    proposal's evidence block, duplicated. What the field is for is identity: telling two
+    query groups apart and correlating a proposal with a later run. A digest does that in
+    twelve characters. The readable text stays in `sql`.
+
+    Not a security boundary — the fingerprint is already redacted — so a fast digest is
+    fine; sha256 is used because it is the unsurprising choice.
+    """
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:_FINGERPRINT_ID_LEN]
 
 
 def _as_int(value: object) -> int:
@@ -640,7 +668,7 @@ def propose_sargability(
                     "so the specific column is not attributed here."
                 ),
                 evidence={
-                    "fingerprint": stat.fingerprint,
+                    "fingerprint": _fingerprint_id(stat.fingerprint),
                     "sql": stat.sql,
                     "cost_share": share,
                     "calls": stat.calls,
@@ -687,7 +715,11 @@ def propose_select_star(
                     "column_counts": {name: len(facts[name].columns) for name in touched},
                     "cost_share": share,
                     "calls": stat.calls,
-                    "fingerprint": stat.fingerprint,
+                    "fingerprint": _fingerprint_id(stat.fingerprint),
+                    # The identity above is a digest, so the readable text has to be
+                    # carried explicitly — ADV005 already does this. Redacted by
+                    # default, like every other query text in the report.
+                    "sql": stat.sql,
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=None,
@@ -779,6 +811,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     def __init__(self, querier: Querier | None = None) -> None:
         super().__init__()
         self._query = querier
+        #: CAP_SCHEMA rows per schema tuple. Both fetch_schema and fetch_table_facts need
+        #: them, and running the statement twice did twice the catalog work and — worse —
+        #: appended two identical entries to `degraded` when it was denied, telling the user
+        #: about one missing grant twice.
+        self._schema_cache: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -875,9 +912,15 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             window_description=window,
         )
 
+    def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
+        """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""
+        if schemas not in self._schema_cache:
+            self._schema_cache[schemas] = self._run(CAP_SCHEMA, (list(schemas),))
+        return self._schema_cache[schemas]
+
     def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
         schema: dict[str, dict[str, str]] = {}
-        for table, column, data_type in self._run(CAP_SCHEMA, (list(schemas),)):
+        for table, column, data_type in self._schema_rows(schemas):
             schema.setdefault(str(table), {})[str(column)] = str(data_type)
         return schema
 
@@ -893,7 +936,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
         }
         columns: dict[str, list[str]] = {}
-        for table, column, _type in self._run(CAP_SCHEMA, (list(schemas),)):
+        for table, column, _type in self._schema_rows(schemas):
             if str(table) in tables:
                 columns.setdefault(str(table), []).append(str(column))
 
@@ -1041,16 +1084,23 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             *propose_unused_indexes(existing, hot_tables=aggregation.tables, schema=schema),
             *propose_redundant_indexes(existing, schema=schema),
         ]
-        return sorted(
-            self._dedupe_by_ddl(proposals),
-            key=lambda p: (
-                self._CONFIDENCE_ORDER[p.confidence],
-                -float(p.evidence.get("cost_share", 0.0)),  # type: ignore[arg-type]
-                # Canonical tiebreak, so equal-confidence equal-cost proposals do not
-                # reorder between runs and make the CLI's tests flaky.
-                p.code,
-                p.title,
-            ),
+        return sorted(self._dedupe_by_ddl(proposals), key=self._ranking_key)
+
+    @classmethod
+    def _ranking_key(cls, proposal: Proposal) -> tuple[int, float, str, str]:
+        """Highest confidence first, then largest cost share — the reading order a human
+        wants — with a canonical tiebreak so equal-confidence equal-cost proposals do not
+        reorder between runs and make the CLI's tests flaky.
+
+        `cost_share_of` rather than `float(evidence.get(...))`: bool is an int subclass, so
+        a stray True became -1.0 and sorted a fabricated share ahead of a genuinely hot
+        proposal, at the top of the list the CLI presents as "read this first".
+        """
+        return (
+            cls._CONFIDENCE_ORDER[proposal.confidence],
+            -(cost_share_of(proposal.evidence) or 0.0),
+            proposal.code,
+            proposal.title,
         )
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
@@ -1085,14 +1135,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 body.extend(_comment_lines(proposal.ddl))
                 body.append("")
                 continue
-            share = proposal.evidence.get("cost_share")
-            # bool is an int subclass, so exclude it explicitly — a stray True would
-            # otherwise render as "100.0% of workload cost".
-            share_text = (
-                f", {share:.1%} of workload cost"
-                if isinstance(share, (int, float)) and not isinstance(share, bool)
-                else ""
-            )
+            share = cost_share_of(proposal.evidence)
+            share_text = f", {share:.1%} of workload cost" if share is not None else ""
             body.append(f"-- {proposal.code} [{proposal.confidence.value}{share_text}]")
             body.extend(_comment_lines(proposal.title))
             body.append(proposal.ddl)

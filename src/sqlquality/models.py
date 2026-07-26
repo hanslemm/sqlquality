@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -172,6 +173,22 @@ class Proposal:
     evidence: dict[str, object]
     confidence: Confidence
     ddl: str | None = None
+
+
+def cost_share_of(evidence: Mapping[str, object]) -> float | None:
+    """A proposal's cost share as a number, or None when it is absent or not one.
+
+    ``evidence`` is ``dict[str, object]``, so neither presence nor type is guaranteed —
+    and ``bool`` is an ``int`` subclass, so a plain ``isinstance(value, (int, float))``
+    accepts ``True`` and renders it as "100.0%": the most prominent number in the report,
+    fabricated. That guard existed in the DDL renderer and was documented there, but the
+    markdown renderer, the terminal table and the proposal sort key each re-derived the
+    check and each omitted it. One helper, four call sites, no way to omit it again.
+    """
+    value = evidence.get("cost_share")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 @dataclass(frozen=True)
