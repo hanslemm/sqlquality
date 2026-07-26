@@ -1,6 +1,7 @@
 from sqlquality.delta import ModelDelta
 from sqlquality.gate import GateReport
-from sqlquality.report import render_markdown
+from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Workload
+from sqlquality.report import advise_payload, render_advise_markdown, render_markdown
 
 PASS = GateReport(
     deltas=[ModelDelta("model.demo.orders", 10.7, 11.1, 0.4, False)],
@@ -76,3 +77,161 @@ def test_markdown_injection_is_inert():
     assert " | 0 | ✅ PASS injected |" not in md
     assert "<img" not in md
     assert "&lt;img" in md
+
+
+PROPOSALS = [
+    Proposal(
+        code="ADV001",
+        title="Add index on orders(status)",
+        rationale="hot predicate",
+        evidence={"cost_share": 0.42, "calls": 100, "table": "orders"},
+        confidence=Confidence.HIGH,
+        ddl="CREATE INDEX ON orders (status);",
+    ),
+]
+WORKLOAD = Workload(
+    stats=(
+        QueryStat(
+            fingerprint="fp",
+            sql="select id from orders where status = $1",
+            calls=100,
+            total_time_ms=500.0,
+        ),
+    ),
+    window_description="since stats reset at 2026-07-01",
+    skipped_unparseable=2,
+    skipped_noise=7,
+)
+AGGREGATION = Aggregation(
+    usage=(), total_cost_ms=500.0, skipped_unqualifiable=3, tables=frozenset({"orders"})
+)
+
+
+def _payload():
+    return advise_payload(
+        PROPOSALS,
+        WORKLOAD,
+        AGGREGATION,
+        engine="postgres",
+        redacted=True,
+        degraded=[("ndv", "permission denied")],
+    )
+
+
+def test_payload_reports_proposals_window_and_skips():
+    payload = _payload()
+    assert payload["engine"] == "postgres"
+    assert payload["redacted"] is True
+    assert payload["window"] == "since stats reset at 2026-07-01"
+    assert payload["proposals"][0]["code"] == "ADV001"
+    assert payload["skipped"] == {"unparseable": 2, "noise": 7, "unqualifiable": 3}
+    assert payload["degraded"] == [{"capability": "ndv", "reason": "permission denied"}]
+
+
+def test_payload_is_json_serializable():
+    import json
+
+    json.dumps(_payload())
+
+
+def test_markdown_shows_confidence_and_cost_share():
+    md = render_advise_markdown(
+        PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "ADV001" in md
+    assert "high" in md
+    assert "42.0%" in md
+
+
+def test_markdown_discloses_the_window_and_the_skips():
+    md = render_advise_markdown(
+        PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "since stats reset at 2026-07-01" in md
+    assert "2" in md and "7" in md and "3" in md
+
+
+def test_markdown_escapes_pipes_from_query_text():
+    hostile = [
+        Proposal(
+            code="ADV005",
+            title="a | b",
+            rationale="r",
+            evidence={"cost_share": 0.1},
+            confidence=Confidence.LOW,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        hostile, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "a \\| b" in md
+
+
+def test_markdown_states_when_no_proposals_were_produced():
+    md = render_advise_markdown(
+        [], WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "no proposals" in md.lower()
+
+
+def test_markdown_neutralizes_newlines_in_a_hostile_title():
+    # A schema identifier can legally contain a newline (see workload/postgres.py's
+    # _comment_lines precedent). Left raw, it would split the table row in two —
+    # the tail becomes a bare line no longer prefixed with "|" — and fake a second
+    # heading in the detail section.
+    hostile = [
+        Proposal(
+            code="ADV999",
+            title="line1\nline2 | fake row | more",
+            rationale="r1\nr2",
+            evidence={"cost_share": 0.1},
+            confidence=Confidence.LOW,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        hostile, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    table_lines = [line for line in md.splitlines() if line.startswith("|")]
+    # exactly the header, the separator, and this proposal's single row — no bare
+    # tail line split off by an unescaped newline in the title.
+    assert len(table_lines) == 3
+    assert "line1\\nline2 \\| fake row \\| more" in table_lines[-1]
+    heading_lines = [line for line in md.splitlines() if line.startswith("### ADV999")]
+    assert len(heading_lines) == 1
+    assert "line1\\nline2 \\| fake row \\| more" in heading_lines[0]
+
+
+def test_markdown_ddl_fence_survives_embedded_triple_backticks():
+    # ddl is built from live identifiers (see _quote_ident in workload/postgres.py,
+    # which does not forbid backticks). A fixed ```sql fence would let an identifier
+    # containing "```" close the fence early and inject a fake heading / fake code
+    # block into the report.
+    hostile_ddl = (
+        'CREATE INDEX ON "orders" ("status");\n```\n\n# Fake Header\n\n```sql\nDROP TABLE users;'
+    )
+    hostile = [
+        Proposal(
+            code="ADV001",
+            title="t",
+            rationale="r",
+            evidence={},
+            confidence=Confidence.HIGH,
+            ddl=hostile_ddl,
+        ),
+    ]
+    md = render_advise_markdown(
+        hostile, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    lines = md.splitlines()
+    open_idx = next(i for i, line in enumerate(lines) if line.startswith("`") and "sql" in line)
+    close_idx = next(
+        i
+        for i in range(len(lines) - 1, -1, -1)
+        if lines[i].startswith("`") and "sql" not in lines[i]
+    )
+    opening, closing = lines[open_idx], lines[close_idx]
+    assert opening[:-3] == closing  # same backtick run, minus the "sql" language tag
+    assert len(closing) > 3  # wider than the embedded ``` run, so it isn't closed early
+    assert "# Fake Header" in lines[open_idx + 1 : close_idx]
