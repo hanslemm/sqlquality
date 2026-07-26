@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from sqlquality.models import (
@@ -56,11 +57,68 @@ _PG_FIELD_MAP = {
     "username": "user",
     "password": "password",
 }
+#: profiles.yml keys whose values must never appear in any message we emit.
+_SECRET_FIELDS = frozenset({"password", "pass"})
+#: Bounds for --timeout, in seconds. A statement timeout of 0 means "no limit" in Postgres,
+#: which would defeat the point, and an absurd value is more likely a typo than an intent.
+_MIN_TIMEOUT_S = 1
+_MAX_TIMEOUT_S = 3600
 
 
 def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
     """Translate profiles.yml keys to libpq keywords, dropping anything unrecognized."""
     return {_PG_FIELD_MAP[k]: v for k, v in fields.items() if k in _PG_FIELD_MAP}
+
+
+def _clamp_timeout_ms(timeout_s: int) -> int:
+    """Statement timeout in milliseconds, clamped into a sane range."""
+    return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S)) * 1000
+
+
+def _scrub(text: str, secrets: Iterable[str]) -> str:
+    """Replace any known secret occurring in ``text`` with a redaction marker.
+
+    Defence in depth for driver exceptions. libpq is not believed to echo a password, but
+    the auth-failure path — the most common real connect failure — cannot be exercised
+    without a live server, and we hold the secret anyway, so its absence can be guaranteed
+    instead of trusted.
+    """
+    scrubbed = text
+    for secret in secrets:
+        if secret:
+            scrubbed = scrubbed.replace(secret, "***")
+    return scrubbed
+
+
+def _as_int(value: object) -> int:
+    """Coerce a driver row value to int.
+
+    Querier rows are `tuple[object, ...]`, so this coercion is unavoidably unchecked. It
+    lives in one auditable helper rather than at a dozen call sites.
+    """
+    return int(value)  # type: ignore[call-overload]
+
+
+def _as_float(value: object) -> float:
+    """Coerce a driver row value to float. See _as_int."""
+    return float(value)  # type: ignore[arg-type]
+
+
+@dataclass
+class _IndexRows:
+    """Mutable per-index collector while unnested index rows are grouped.
+
+    A typed accumulator rather than a ``dict[str, object]``: the dict re-boxed already
+    correctly-typed ints and bools as ``object``, forcing them to be re-coerced (and
+    type-ignored) a few lines later for no gain.
+    """
+
+    is_unique: bool
+    is_primary: bool
+    scans: int
+    size_bytes: int
+    #: (ordinality, column) so the column order can be restored by sorting.
+    columns: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -168,11 +226,34 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             ) from exc
 
         conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
-        connection = psycopg.connect(conninfo, autocommit=True)
-        with connection.cursor() as cursor:
-            # Belt and braces: the session cannot write even if a statement tried to.
-            cursor.execute("SET default_transaction_read_only = on")
-            cursor.execute(f"SET statement_timeout = '{int(timeout_s)}s'")
+        # Everything we know to be secret, so a driver exception can be proven clean rather
+        # than trusted. The DSN itself is included because it may embed a password inline.
+        secrets = tuple(
+            value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
+        )
+        if params.dsn:
+            secrets += (params.dsn,)
+
+        failure: str | None = None
+        try:
+            connection = psycopg.connect(conninfo, autocommit=True)
+            with connection.cursor() as cursor:
+                # Belt and braces: the session cannot write even if a statement tried to.
+                cursor.execute("SET default_transaction_read_only = on")
+                # set_config() rather than `SET`, because Postgres does not accept bind
+                # parameters in a SET statement and string-building one with a caller value
+                # is the wrong habit to establish in the one place we talk to a database.
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, false)",
+                    (f"{_clamp_timeout_ms(timeout_s)}ms",),
+                )
+        except Exception as exc:
+            failure = _scrub(str(exc), secrets)
+        if failure is not None:
+            # Raised after the handler, and scrubbed: Task 6 established that a dependency's
+            # exception text is exactly where this class of leak hides, and that leaving the
+            # handler is the only way to keep the original out of __context__.
+            raise ConnectionError(f"Could not connect: {failure}")
 
         def query(sql: str, bind: tuple[object, ...]) -> list[tuple[object, ...]]:
             with connection.cursor() as cur:
@@ -193,11 +274,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             window += " (--since is not supported by pg_stat_statements)"
         return WorkloadFetch(
             rows=tuple(
-                RawQueryRow(
-                    sql=str(sql),
-                    calls=int(calls),  # type: ignore[call-overload]
-                    total_time_ms=float(total_ms),  # type: ignore[arg-type]
-                )
+                RawQueryRow(sql=str(sql), calls=_as_int(calls), total_time_ms=_as_float(total_ms))
                 for sql, calls, total_ms, _rows in rows
             ),
             window_description=window,
@@ -215,8 +292,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         wanted = sorted(tables)
         sizes = {
             str(name): (
-                int(rows),  # type: ignore[call-overload]
-                int(size) if size is not None else None,  # type: ignore[call-overload]
+                _as_int(rows),
+                _as_int(size) if size is not None else None,
             )
             for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
         }
@@ -229,10 +306,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         for table, column, n_distinct in self._run(CAP_NDV, (list(schemas), wanted)):
             if n_distinct is None:
                 continue
-            value = float(n_distinct)  # type: ignore[arg-type]
-            row_estimate = sizes.get(str(table), (0, None))[0]
-            # Postgres encodes "distinct as a fraction of row count" as a negative value.
-            resolved = -value * row_estimate if value < 0 else value
+            value = _as_float(n_distinct)
+            if value < 0:
+                # Postgres encodes "distinct as a fraction of row count" as a negative
+                # value, which is meaningless without the row count. If the row-count query
+                # returned nothing for this table — different statement, so different
+                # privileges can hide it — omit the column so it reads as *unknown*.
+                # Defaulting the row estimate to 0 would fabricate "zero distinct values"
+                # and hand every proposal on this table a false LOW-confidence rating.
+                row_estimate = sizes.get(str(table), (None, None))[0]
+                if row_estimate is None:
+                    continue
+                resolved = -value * row_estimate
+            else:
+                resolved = value
             ndv.setdefault(str(table), {})[str(column)] = resolved
 
         facts: dict[str, TableFacts] = {}
@@ -251,34 +338,34 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         self, schemas: tuple[str, ...], tables: frozenset[str]
     ) -> dict[str, tuple[PgIndex, ...]]:
         """Existing indexes per table, columns in ordinal order."""
-        grouped: dict[tuple[str, str], dict[str, object]] = {}
+        grouped: dict[tuple[str, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), sorted(tables))):
-            table, index, column, _ordinality, unique, primary, scans, size = row
-            size_bytes = int(size) if size is not None else 0  # type: ignore[call-overload]
+            table, index, column, ordinality, unique, primary, scans, size = row
             entry = grouped.setdefault(
                 (str(table), str(index)),
-                {
-                    "columns": [],
-                    "is_unique": bool(unique),
-                    "is_primary": bool(primary),
-                    "scans": int(scans),  # type: ignore[call-overload]
-                    "size_bytes": size_bytes,
-                },
+                _IndexRows(
+                    is_unique=bool(unique),
+                    is_primary=bool(primary),
+                    scans=_as_int(scans),
+                    size_bytes=_as_int(size) if size is not None else 0,
+                ),
             )
-            columns = entry["columns"]
-            assert isinstance(columns, list)
-            columns.append(str(column))
+            # Keyed by ordinality and sorted below rather than trusting arrival order. The
+            # statement does ORDER BY k.ordinality, but composite-index column order decides
+            # whether a proposal is right, and a fixture test that pre-sorts its canned rows
+            # cannot notice the difference. Cheap defence in depth.
+            entry.columns.append((_as_int(ordinality), str(column)))
 
         result: dict[str, list[PgIndex]] = {}
         for (table, index), entry in grouped.items():
             result.setdefault(table, []).append(
                 PgIndex(
                     name=index,
-                    columns=tuple(entry["columns"]),  # type: ignore[arg-type]
-                    is_unique=bool(entry["is_unique"]),
-                    is_primary=bool(entry["is_primary"]),
-                    scans=int(entry["scans"]),  # type: ignore[call-overload]
-                    size_bytes=int(entry["size_bytes"]),  # type: ignore[call-overload]
+                    columns=tuple(column for _ordinality, column in sorted(entry.columns)),
+                    is_unique=entry.is_unique,
+                    is_primary=entry.is_primary,
+                    scans=entry.scans,
+                    size_bytes=entry.size_bytes,
                 )
             )
         return {table: tuple(indexes) for table, indexes in result.items()}
