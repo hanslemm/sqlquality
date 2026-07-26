@@ -604,8 +604,9 @@ def ingest(
                 )
                 for key in calls
             ),
-            key=lambda s: s.total_time_ms,
-            reverse=True,
+            # Descending cost, tiebroken on the fingerprint so the ordering is canonical
+            # rather than dependent on the order the engine happened to return rows in.
+            key=lambda s: (-s.total_time_ms, s.fingerprint),
         )
     )
     return Workload(
@@ -1109,6 +1110,34 @@ def test_usage_is_sorted_by_cost_descending():
     assert agg.usage[0].column == "created_at"
 
 
+def test_equal_cost_entries_are_ordered_canonically_not_by_arrival():
+    """Two workloads differing only in arrival order must aggregate identically.
+
+    Sorting on cost alone leaves ties to Python's stable sort, which preserves insertion
+    order — so the same logical workload yields different output depending on the order
+    the engine happened to return rows in, and downstream tests become order-dependent.
+    """
+    forward = aggregate(
+        _workload(
+            ("select id from orders where status = $1", 1, 10.0),
+            ("select id from orders where created_at > $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    reverse = aggregate(
+        _workload(
+            ("select id from orders where created_at > $1", 1, 10.0),
+            ("select id from orders where status = $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    assert [(u.table, u.column, u.role) for u in forward.usage] == [
+        (u.table, u.column, u.role) for u in reverse.usage
+    ]
+
+
 def test_empty_workload_yields_empty_aggregation_and_no_division_error():
     agg = aggregate(Workload(stats=(), window_description="w"), SCHEMA, "postgres")
     assert agg.usage == ()
@@ -1175,8 +1204,10 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
                 )
                 for (table, column, role) in calls
             ),
-            key=lambda u: u.cost_ms,
-            reverse=True,
+            # Descending cost with a canonical tiebreak. Without the trailing keys, two
+            # logically identical workloads that happened to arrive in a different order
+            # produce different output order, and downstream tasks' tests depend on it.
+            key=lambda u: (-u.cost_ms, u.table, u.column, u.role.value),
         )
     )
     return Aggregation(
@@ -3019,6 +3050,10 @@ Replace `PostgresWorkloadAdapter.propose`:
             key=lambda p: (
                 self._CONFIDENCE_ORDER[p.confidence],
                 -float(p.evidence.get("cost_share", 0.0)),  # type: ignore[arg-type]
+                # Canonical tiebreak, so equal-confidence equal-cost proposals do not
+                # reorder between runs and make the CLI's tests flaky.
+                p.code,
+                p.title,
             ),
         )
 ```
