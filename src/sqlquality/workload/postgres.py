@@ -21,16 +21,27 @@ CAP_TABLE_FACTS = "table_facts"
 CAP_NDV = "ndv"
 CAP_INDEXES = "indexes"
 
+#: What to tell the user when a capability's statement is refused. These strings are what
+#: someone hands their DBA, so they distinguish the one capability needing a real grant
+#: from the four that read views already world-readable in stock Postgres — overstating
+#: the ask would make a routine request look alarming.
 _HINTS = {
     CAP_WORKLOAD: (
-        "requires the pg_stat_statements extension and pg_read_all_stats "
-        "(or superuser); enable via shared_preload_libraries then CREATE EXTENSION"
+        "requires the pg_stat_statements extension (PostgreSQL 13+) and pg_read_all_stats "
+        "or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On "
+        "PostgreSQL 12 and older the view lacks total_exec_time and this will fail."
     ),
-    CAP_STATS_RESET: "requires read access to pg_stat_database",
-    CAP_SCHEMA: "requires read access to information_schema.columns",
-    CAP_TABLE_FACTS: "requires read access to pg_class and pg_namespace",
-    CAP_NDV: "requires read access to pg_stats (per-column statistics)",
-    CAP_INDEXES: "requires read access to pg_index and pg_stat_user_indexes",
+    CAP_STATS_RESET: "reads pg_stat_database; world-readable unless explicitly revoked",
+    CAP_SCHEMA: (
+        "reads information_schema.columns; shows only tables the current role can access, "
+        "so a partial result means missing table privileges rather than a missing grant"
+    ),
+    CAP_TABLE_FACTS: "reads pg_class and pg_namespace; world-readable unless revoked",
+    CAP_NDV: (
+        "reads pg_stats, which exposes only rows for tables the current role owns or can "
+        "select from — a role without table access silently sees no statistics"
+    ),
+    CAP_INDEXES: "reads pg_index and pg_stat_user_indexes; world-readable unless revoked",
 }
 
 
@@ -38,6 +49,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
     SQL: dict[str, str] = {
+        # `s.rows` is selected but currently discarded. It is kept deliberately: rows per
+        # call is the natural selectivity signal for a future confidence refinement
+        # ("returns 3 rows from 8M — an excellent index candidate"), and fetching it costs
+        # nothing. Task 8 unpacks it as `_rows`.
+        # `total_exec_time` requires PostgreSQL 13+; it was `total_time` on 12 and older,
+        # both long past end-of-life. The privilege hint states the floor.
         CAP_WORKLOAD: """
             SELECT s.query, s.calls, s.total_exec_time, s.rows
             FROM pg_stat_statements s
@@ -67,6 +84,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             FROM pg_stats s
             WHERE s.schemaname = ANY(%s) AND s.tablename = ANY(%s)
         """,
+        # Known limitation: the pg_attribute join silently omits expression indexes.
+        # `indkey` holds 0 for an expression column, which matches no pg_attribute row, so
+        # an index on `lower(status)` is invisible here. Consequence: ADV001 may propose an
+        # index whose expression equivalent already exists. Reading pg_get_indexdef() would
+        # fix it; deferred rather than silently ignored.
         CAP_INDEXES: """
             SELECT t.relname, i.relname, a.attname, k.ordinality,
                    ix.indisunique, ix.indisprimary,

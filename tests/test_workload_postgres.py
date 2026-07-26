@@ -48,12 +48,44 @@ def test_every_capability_has_a_statement_and_a_hint():
         assert statement.privilege_hint.strip()
 
 
+#: Write verbs that must never appear in an introspection statement.
+FORBIDDEN_VERBS = (
+    "insert",
+    "update",
+    "delete",
+    "create",
+    "drop",
+    "alter",
+    "truncate",
+    "grant",
+    "revoke",
+)
+
+
+def _write_verbs_in(sql: str) -> set[str]:
+    """Write verbs appearing as whole words in ``sql``.
+
+    Whitespace is collapsed before matching, and the result padded, so a verb preceded by a
+    newline or sitting at the very start of the statement is still caught. A naive
+    ``f" {verb} " in f" {sql.lower()} "`` check misses `"... LIMIT %s;\\ndrop table foo"`
+    entirely — which is precisely the stacked-statement mistake this guard exists to catch.
+    """
+    normalized = f" {' '.join(sql.lower().split())} "
+    return {verb for verb in FORBIDDEN_VERBS if f" {verb} " in normalized}
+
+
+def test_the_write_verb_detector_catches_newline_and_leading_positions():
+    """Guard the guard: this test is the reason the detector normalizes whitespace."""
+    assert _write_verbs_in("select 1 from t limit 1;\ndrop table foo") == {"drop"}
+    assert _write_verbs_in("delete from t") == {"delete"}
+    assert _write_verbs_in("select 1\n\tgrant select on x to y") == {"grant"}
+    assert _write_verbs_in("select 1 from t where a = 2") == set()
+
+
 def test_no_introspection_statement_writes():
-    forbidden = ("insert", "update", "delete", "create", "drop", "alter", "truncate", "grant")
     for statement in PostgresWorkloadAdapter().introspection_sql():
-        lowered = statement.sql.lower()
-        for word in forbidden:
-            assert f" {word} " not in f" {lowered} ", f"{statement.capability} contains {word}"
+        found = _write_verbs_in(statement.sql)
+        assert not found, f"{statement.capability} contains write verb(s): {sorted(found)}"
 
 
 def test_workload_statement_is_scoped_to_the_current_database():
