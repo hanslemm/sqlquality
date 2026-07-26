@@ -4212,7 +4212,8 @@ def test_gate_markdown_also_survives_a_newline_in_a_skip_reason():
     from sqlquality.gate import GateReport
     from sqlquality.report import render_markdown
 
-    report = GateReport(passed=True, mode="warn", warned=False, regressions=[], deltas=[])
+    # `warned` is a computed property on GateReport, not a constructor field.
+    report = GateReport(deltas=[], regressions=[], passed=True, mode="warn")
     md = render_markdown(report, skipped=[("model.demo.x", "line one\nline two")])
     for line in md.splitlines():
         assert not line.startswith("line two"), "a newline broke out of the skipped bullet"
