@@ -234,6 +234,10 @@ class ColumnUsage:
     #:   silently inflating it. Read it alongside the report's skipped counts.
     cost_share: float
     fingerprints: int
+    #: Fingerprints of the query groups that contributed this usage. Needed to ask whether
+    #: two usages *co-occur* — a partial-index proposal is only supported if some single
+    #: query actually filters on the indexed column and the guard column together.
+    fingerprint_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1241,9 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
     calls: dict[_Key, int] = defaultdict(int)
     cost: dict[_Key, float] = defaultdict(float)
     fingerprints: dict[_Key, int] = defaultdict(int)
+    #: Which query groups contributed each usage, so downstream rules can ask whether two
+    #: usages co-occur in a single query rather than merely both being hot on the table.
+    contributors: dict[_Key, set[str]] = defaultdict(set)
     tables: set[str] = set()
     skipped_unqualifiable = 0
 
@@ -1251,6 +1258,7 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
             calls[key] += stat.calls
             cost[key] += stat.total_time_ms
             fingerprints[key] += 1
+            contributors[key].add(stat.fingerprint)
             tables.add(key[0])
 
     # The denominator is the whole window's cost, including stats we could not analyze.
@@ -1271,6 +1279,7 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
                     cost_ms=cost[(table, column, role)],
                     cost_share=(cost[(table, column, role)] / total) if total else 0.0,
                     fingerprints=fingerprints[(table, column, role)],
+                    fingerprint_ids=frozenset(contributors[(table, column, role)]),
                 )
                 for (table, column, role) in calls
             ),
@@ -2935,9 +2944,12 @@ from sqlquality.workload.postgres import (
 )
 
 
-def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders"):
+def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1",)):
+    """`fps` defaults to a single shared fingerprint, so usages co-occur unless a test
+    deliberately gives them disjoint sets."""
     return ColumnUsage(table=table, column=column, role=role, calls=10, cost_ms=cost_ms,
-                       cost_share=cost_share, fingerprints=1)
+                       cost_share=cost_share, fingerprints=len(fps),
+                       fingerprint_ids=frozenset(fps))
 
 
 def facts(rows=1_000_000, ndv=None, columns=("id", "status", "created_at", "customer_id")):
@@ -3424,6 +3436,45 @@ def test_partial_index_polarity_follows_the_predicate():
     assert "IS NOT NULL" not in proposals[0].ddl
 
 
+def test_no_partial_index_when_the_columns_never_co_occur():
+    """Two independently hot columns are not evidence for a partial index.
+
+    If query A filters `status = $1` and query B checks `shipped_at IS NOT NULL`, a partial
+    index on status guarded by shipped_at helps neither — A does not satisfy the guard and
+    B does not use the indexed column. It only costs writes.
+    """
+    proposals = propose_partial_indexes(
+        [usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a",)),
+         usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0,
+               fps=("fp_b",))],
+        facts(), min_cost_share=0.01,
+    )
+    assert proposals == []
+
+
+def test_partial_index_reports_the_co_occurrence_that_justifies_it():
+    proposals = propose_partial_indexes(
+        [usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a", "fp_b")),
+         usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0,
+               fps=("fp_b", "fp_c"))],
+        facts(), min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV004"]
+    assert proposals[0].evidence["co_occurring_fingerprints"] == 1
+
+
+def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
+    """A cheaper pair that co-occurs beats a hotter pair that does not."""
+    proposals = propose_partial_indexes(
+        [usage("status", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp_lonely",)),
+         usage("region", ColumnRole.EQUALITY, cost_ms=50.0, fps=("fp_shared",)),
+         usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0,
+               fps=("fp_shared",))],
+        facts(columns=("status", "region", "shipped_at")), min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("region",)
+
+
 def test_no_partial_index_without_an_equality_column_to_index():
     proposals = propose_partial_indexes(
         [usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4)],
@@ -3525,6 +3576,23 @@ _NULL_ROLE_PREDICATE = {
 }
 
 
+def _first_co_occurring(
+    equality: Sequence[ColumnUsage], null_checks: Sequence[ColumnUsage]
+) -> tuple[ColumnUsage, ColumnUsage, frozenset[str]] | None:
+    """Highest-cost (equality, null-check) pair that some single query uses together.
+
+    Both inputs arrive sorted by cost descending, so the first overlapping pair found is
+    the most expensive supported one. Returns the shared fingerprints alongside, since that
+    overlap *is* the evidence for the proposal.
+    """
+    for left in equality:
+        for right in null_checks:
+            shared = left.fingerprint_ids & right.fingerprint_ids
+            if shared:
+                return left, right, shared
+    return None
+
+
 def propose_partial_indexes(
     usage: Sequence[ColumnUsage],
     facts: Mapping[str, TableFacts],
@@ -3550,7 +3618,15 @@ def propose_partial_indexes(
         )
         if not equality or not null_checks:
             continue
-        leading, guard = equality[0], null_checks[0]
+        # Pair only columns that some single query actually filters on *together*. Taking
+        # the hottest of each list independently can pair a filter from query A with a null
+        # check from query B that never co-occur — and a partial index whose guard no
+        # filtering query uses helps nothing while still costing writes. The overlap is the
+        # evidence for this proposal, so without one there is no proposal.
+        pair = _first_co_occurring(equality, null_checks)
+        if pair is None:
+            continue
+        leading, guard, shared = pair
         cost_share = max(leading.cost_share, guard.cost_share)
         if cost_share < min_cost_share:
             continue
@@ -3575,6 +3651,9 @@ def propose_partial_indexes(
                     "cost_share": cost_share,
                     "calls": max(leading.calls, guard.calls),
                     "row_estimate": table_facts.row_estimate if table_facts else None,
+                    #: How many query groups filter on both columns together. This is what
+                    #: makes the proposal supported rather than a guess.
+                    "co_occurring_fingerprints": len(shared),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=(
