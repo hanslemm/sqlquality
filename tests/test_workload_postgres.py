@@ -191,6 +191,97 @@ def test_fetch_table_facts_resolves_negative_n_distinct_as_a_row_fraction():
     assert facts["orders"].ndv["s"] == 250.0
 
 
+def test_negative_n_distinct_without_a_row_count_is_omitted_not_zeroed():
+    """A negative n_distinct is a *fraction*, so it needs the row count to mean anything.
+
+    The two facts come from different statements, so different privileges can hide one and
+    not the other. Defaulting the missing row estimate to 0 would fabricate "zero distinct
+    values" — a confident, wrong LOW-confidence signal for every proposal on the table.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_stats": [("orders", "id", -0.25)],
+            # No pg_total_relation_size rows: the row count is unknown.
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate is None
+    assert "id" not in facts["orders"].ndv
+
+
+def test_absolute_n_distinct_survives_a_missing_row_count():
+    """A positive n_distinct is an absolute count and needs no row estimate."""
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_stats": [("orders", "id", 500.0)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].ndv["id"] == 500.0
+
+
+def test_fetch_indexes_restores_column_order_from_ordinality():
+    """Rows arriving out of order must still yield the right composite order.
+
+    The statement does ORDER BY k.ordinality, but composite column order decides whether a
+    proposal is correct, and a fixture that pre-sorts its rows cannot catch a regression
+    here. Feeding them backwards is the only way to test the property.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                ("orders", "idx_status_created", "created_at", 2, False, False, 0, 8192),
+                ("orders", "idx_status_created", "status", 1, False, False, 0, 8192),
+            ]
+        }
+    )
+    indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )
+    assert indexes["orders"][0].columns == ("status", "created_at")
+
+
+def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
+    """A driver exception is where this class of leak hides — see Task 6.
+
+    psycopg is not believed to echo a password, but the auth-failure path cannot be
+    exercised without a live server, so the secret is scrubbed rather than trusted.
+    """
+    import sys
+    import types
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def explode(conninfo, **kwargs):
+        raise RuntimeError(f"connection failed for conninfo {conninfo}")
+
+    fake_psycopg.connect = explode  # type: ignore[attr-defined]
+    fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    params = ConnectionParams(
+        engine="postgres",
+        dsn=None,
+        fields={"host": "db", "user": "hans", "password": "hunter2"},
+        source="profiles.yml",
+    )
+    with pytest.raises(ConnectionError) as exc:
+        PostgresWorkloadAdapter().connect(params, 30)
+    assert "hunter2" not in str(exc.value)
+    assert "***" in str(exc.value)
+    # And the unscrubbed original must not be reachable through the chain.
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
 def test_fetch_indexes_groups_columns_in_ordinal_order():
     querier = FakeQuerier(
         {
