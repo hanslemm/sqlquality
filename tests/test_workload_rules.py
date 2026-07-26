@@ -262,6 +262,63 @@ def test_unknown_row_count_is_low_confidence_and_says_why():
     assert "unknown" in proposals[0].rationale.lower()
 
 
+def test_a_denied_index_list_caps_confidence_at_low_and_stops_claiming_coverage():
+    """ "No existing index leads with them" is unknowable when pg_index was denied.
+
+    Absent evidence is not proof of absence — the same mistake the row_estimate branch
+    exists to prevent, three lines away.
+    """
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(ndv={"status": 5000.0}),
+        {},
+        min_cost_share=0.01,
+        have_index_data=False,
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].confidence is Confidence.LOW
+    rationale = proposals[0].rationale
+    assert "no existing index leads with them" not in rationale
+    assert "could not be read" in rationale
+
+
+def test_a_readable_index_list_still_reaches_high():
+    """The other half of the branch: the cap must not fire when the evidence is there."""
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(ndv={"status": 5000.0}),
+        {},
+        min_cost_share=0.01,
+        have_index_data=True,
+    )
+    assert proposals[0].confidence is Confidence.HIGH
+    assert "no existing index leads with them" in proposals[0].rationale
+
+
+def test_propose_lowers_confidence_when_the_indexes_capability_degraded():
+    """The adapter is what knows pg_index was denied, so it must pass that down."""
+
+    def denied(sql, params):
+        if "pg_index" in sql:
+            raise RuntimeError("permission denied for relation pg_index")
+        return []
+
+    aggregation = Aggregation(
+        usage=(usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({"orders"}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=denied)
+    proposals = adapter.propose(
+        aggregation, facts(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
+    )
+    adv001 = [p for p in proposals if p.code == "ADV001"]
+    assert adv001, "the proposal must survive a missing grant, just at lower confidence"
+    assert adv001[0].confidence is Confidence.LOW
+    assert "could not be read" in adv001[0].rationale
+
+
 def test_cost_share_is_the_max_never_the_sum():
     proposals = propose_indexes(
         [
@@ -331,7 +388,27 @@ def test_redundant_prefix_index_proposed_for_drop():
     proposals = propose_redundant_indexes(existing)
     assert codes(proposals) == ["ADV003"]
     assert proposals[0].evidence["index"] == "idx_narrow"
-    assert proposals[0].confidence is Confidence.HIGH
+    # Capped at MEDIUM: PgIndex carries no predicate, so a partial index is
+    # indistinguishable from a full one here. See the test below.
+    assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_redundant_index_rationale_admits_it_cannot_see_a_partial_predicate():
+    """HIGH is the strongest claim the tool makes, and "serves the same lookups" is false
+    for a partial or expression index. The README limitation does not travel inside the
+    .sql file the operator actually runs, so the caveat has to be in the rationale.
+    """
+    existing = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        )
+    }
+    proposals = propose_redundant_indexes(existing)
+    rationale = proposals[0].rationale.lower()
+    assert "column list" in rationale
+    assert "partial" in rationale
+    assert "expression" in rationale
 
 
 def test_a_unique_prefix_index_is_never_called_redundant():
@@ -435,6 +512,40 @@ def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
         min_cost_share=0.01,
     )
     assert proposals[0].evidence["columns"] == ("region",)
+
+
+def test_partial_index_is_suppressed_on_a_small_table():
+    """Two index-creation rules, one small-table gate — ADV004 had none.
+
+    On a 50-row table it emitted ADV004 medium with `evidence.row_estimate: 50` while
+    ADV001 correctly suppressed. An index on a table that fits in a page is pure write
+    overhead whichever rule proposes it.
+    """
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        facts(rows=50),
+        min_cost_share=0.01,
+    )
+    assert proposals == []
+
+
+def test_partial_index_with_an_unknown_row_count_is_low_and_says_why():
+    """Same treatment ADV001 gives an unknown row count: keep the advice, lower the claim."""
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        facts(rows=None),
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV004"]
+    assert proposals[0].confidence is Confidence.LOW
+    assert proposals[0].evidence["row_estimate"] is None
+    assert "unknown" in proposals[0].rationale.lower()
 
 
 def test_no_partial_index_without_an_equality_column_to_index():

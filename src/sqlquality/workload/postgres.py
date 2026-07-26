@@ -186,6 +186,15 @@ MAX_INDEX_ARITY = 3
 #: justify HIGH confidence on its own.
 SELECTIVE_NDV = 100.0
 
+#: Appended to any index-creation rationale when the small-table gate could not run.
+#: Shared by ADV001 and ADV004 so both index-creation rules disclose the same gap in the
+#: same words — the operator reads the report, not the rule that produced it.
+_UNKNOWN_ROWS_NOTE = (
+    " The row count for this table is unknown, so it could not be checked against the "
+    "small-table floor — on a small table an index is pure write overhead. Confirm the "
+    "table's size before applying."
+)
+
 
 def _by_table(usage: Sequence[ColumnUsage]) -> dict[str, list[ColumnUsage]]:
     grouped: dict[str, list[ColumnUsage]] = {}
@@ -237,11 +246,18 @@ def propose_indexes(
     min_rows: int = MIN_ROWS_FOR_INDEX,
     max_arity: int = MAX_INDEX_ARITY,
     schema: str = DEFAULT_SCHEMA,
+    have_index_data: bool = True,
 ) -> list[Proposal]:
     """ADV001 — composite index candidates: equality columns first, one range column last.
 
     Equality-then-range is the standard B-tree ordering: once a range predicate is used,
     later columns can no longer be probed by equality.
+
+    ``have_index_data`` is False when the existing-index catalog query was denied. The
+    rule's central claim — "no existing index leads with these columns" — is then
+    unknowable, so it is not made and confidence is capped at LOW. ``existing`` being
+    empty cannot distinguish "no such index" from "could not look", which is exactly the
+    conflation the row-estimate branch below exists to prevent.
     """
     proposals: list[Proposal] = []
     for table, items in sorted(_by_table(usage).items()):
@@ -292,13 +308,13 @@ def propose_indexes(
 
         ndv = table_facts.ndv if table_facts else {}
         leading_ndv = ndv.get(columns[0])
-        if rows is None:
-            # The small-table gate above could not run, so we cannot rule out that this
-            # index would be pure write overhead on a tiny table. The cost evidence is
-            # real, so the proposal is kept — a user whose row-count grant is missing
-            # should still get advice — but at LOW, and the rationale says why. Reporting
-            # MEDIUM here would be the exact confident-but-wrong failure this rule set
-            # exists to avoid: the size is not assumed large, it is unknown.
+        if rows is None or not have_index_data:
+            # Either the small-table gate could not run, or we could not check whether an
+            # index already leads with these columns. The cost evidence is real, so the
+            # proposal is kept — a user whose grants are incomplete should still get
+            # advice — but at LOW, and the rationale says which check was skipped.
+            # Reporting MEDIUM or HIGH here would be the exact confident-but-wrong failure
+            # this rule set exists to avoid: nothing is assumed away, it is unknown.
             confidence = Confidence.LOW
         elif leading_ndv is None:
             confidence = Confidence.MEDIUM
@@ -307,17 +323,21 @@ def propose_indexes(
         else:
             confidence = Confidence.LOW
 
-        rationale = (
-            "These columns carry the table's hottest predicates and no existing index "
-            "leads with them. Equality columns come first so the range column can be "
-            "scanned last."
-        )
-        if rows is None:
-            rationale += (
-                " The row count for this table is unknown, so it could not be checked "
-                "against the small-table floor — on a small table an index is pure write "
-                "overhead. Confirm the table's size before applying."
+        if have_index_data:
+            rationale = (
+                "These columns carry the table's hottest predicates and no existing index "
+                "leads with them. Equality columns come first so the range column can be "
+                "scanned last."
             )
+        else:
+            rationale = (
+                "These columns carry the table's hottest predicates. Equality columns come "
+                "first so the range column can be scanned last. The existing-index list "
+                "could not be read, so whether an index already leads with these columns "
+                "is unknown — check before applying."
+            )
+        if rows is None:
+            rationale += _UNKNOWN_ROWS_NOTE
 
         proposals.append(
             Proposal(
@@ -387,7 +407,14 @@ def propose_redundant_indexes(
     *,
     schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
-    """ADV003 — an index whose column list is a strict prefix of another's is redundant."""
+    """ADV003 — an index whose column list is a strict prefix of another's is redundant.
+
+    Capped at MEDIUM, not HIGH. ``PgIndex`` carries no ``indpred``/``indexprs``, so a
+    partial index (``WHERE shipped_at IS NULL``) and an expression index are both
+    indistinguishable from plain ones here — and for a partial index "serves the same
+    lookups" is simply false. The README says so, but a README does not travel inside the
+    ``.sql`` file the operator runs, so the rationale carries the caveat too.
+    """
     proposals: list[Proposal] = []
     for table, indexes in sorted(existing.items()):
         for narrow in indexes:
@@ -411,7 +438,11 @@ def propose_redundant_indexes(
                     title=f"Drop redundant index {narrow.name} on {table}",
                     rationale=(
                         f"Its columns are a leading prefix of {wider.name}, which can "
-                        "serve the same lookups."
+                        "serve the same lookups. This comparison is on column lists only: "
+                        "sqlquality cannot see a partial index's WHERE predicate or an "
+                        "expression index's expressions, and a partial index does not "
+                        "cover the same rows as a wider full one. Confirm that neither "
+                        "index is partial or expression-based before dropping."
                     ),
                     evidence={
                         "table": table,
@@ -421,7 +452,7 @@ def propose_redundant_indexes(
                         "superseding_columns": wider.columns,
                         "size_bytes": narrow.size_bytes,
                     },
-                    confidence=Confidence.HIGH,
+                    confidence=Confidence.MEDIUM,
                     ddl=f"DROP INDEX {_qualified(schema, narrow.name)};",
                 )
             )
@@ -459,15 +490,24 @@ def propose_partial_indexes(
     facts: Mapping[str, TableFacts],
     *,
     min_cost_share: float,
+    min_rows: int = MIN_ROWS_FOR_INDEX,
     schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV004 — index the hot equality column, restricted by a hot null-check predicate.
 
     Only structural predicates qualify. Literal-valued partial indexes would need the
     literals retained, which default redaction deliberately discards.
+
+    Gated on table size exactly as ADV001 is: both rules create an index, and below the
+    floor a sequential scan is the right plan whichever rule proposed it. An unknown row
+    count caps confidence at LOW rather than being assumed large.
     """
     proposals: list[Proposal] = []
     for table, items in sorted(_by_table(usage).items()):
+        table_facts = facts.get(table)
+        rows = table_facts.row_estimate if table_facts else None
+        if rows is not None and rows < min_rows:
+            continue
         equality = sorted(
             (i for i in items if i.role is ColumnRole.EQUALITY),
             key=lambda i: i.cost_ms,
@@ -493,17 +533,19 @@ def propose_partial_indexes(
         if cost_share < min_cost_share:
             continue
         predicate = _NULL_ROLE_PREDICATE[guard.role]
-        table_facts = facts.get(table)
+        rationale = (
+            "The hot predicates always pair this lookup with the same null check, "
+            "so a partial index covers them at a fraction of the size."
+        )
+        if rows is None:
+            rationale += _UNKNOWN_ROWS_NOTE
         proposals.append(
             Proposal(
                 code="ADV004",
                 title=(
                     f"Partial index on {table}({leading.column}) WHERE {guard.column} {predicate}"
                 ),
-                rationale=(
-                    "The hot predicates always pair this lookup with the same null check, "
-                    "so a partial index covers them at a fraction of the size."
-                ),
+                rationale=rationale,
                 evidence={
                     "table": table,
                     "columns": (leading.column,),
@@ -511,12 +553,12 @@ def propose_partial_indexes(
                     "guard_predicate": predicate,
                     "cost_share": cost_share,
                     "calls": max(leading.calls, guard.calls),
-                    "row_estimate": table_facts.row_estimate if table_facts else None,
+                    "row_estimate": rows,
                     #: How many query groups filter on both columns together. This is what
                     #: makes the proposal supported rather than a guess.
                     "co_occurring_fingerprints": len(shared),
                 },
-                confidence=Confidence.MEDIUM,
+                confidence=Confidence.LOW if rows is None else Confidence.MEDIUM,
                 ddl=(
                     f"CREATE INDEX ON {_qualified(schema, table)} "
                     f"({_quote_ident(leading.column)}) "
@@ -912,18 +954,33 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         notice they are the same object twice. ADV003 wins ties because prefix redundancy
         is structural — provable from the column lists alone — whereas ADV002 rests on a
         scan counter that only covers the window since the last statistics reset.
+
+        That preference used to fall out of the confidence order on its own, when ADV003
+        was HIGH. Capping ADV003 at MEDIUM (it cannot see partial-index predicates) made
+        the two rules tie, and a tie was resolved by list order — silently handing the
+        collapse to ADV002. `_RULE_PRECEDENCE` states the preference instead of relying on
+        it emerging.
         """
         best: dict[str, Proposal] = {}
         for proposal in proposals:
             if not proposal.ddl:
                 continue
             incumbent = best.get(proposal.ddl)
-            if incumbent is None or (
-                cls._CONFIDENCE_ORDER[proposal.confidence]
-                < cls._CONFIDENCE_ORDER[incumbent.confidence]
-            ):
+            if incumbent is None or cls._dedupe_rank(proposal) < cls._dedupe_rank(incumbent):
                 best[proposal.ddl] = proposal
         return [p for p in proposals if not p.ddl or best[p.ddl] is p]
+
+    #: Lower wins when two rules propose identical DDL at the same confidence. Only ADV003
+    #: is named: its evidence is structural, every other rule's rests on a counter or an
+    #: estimate. Anything unlisted sorts after it.
+    _RULE_PRECEDENCE = {"ADV003": 0}
+
+    @classmethod
+    def _dedupe_rank(cls, proposal: Proposal) -> tuple[int, int]:
+        return (
+            cls._CONFIDENCE_ORDER[proposal.confidence],
+            cls._RULE_PRECEDENCE.get(proposal.code, 1),
+        )
 
     def propose(
         self,
@@ -938,6 +995,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # about. Only one schema is ever introspected (the CLI rejects more than one), so
         # this is unambiguous rather than a guess about which one a proposal belongs to.
         schema = self.schemas[0] if self.schemas else DEFAULT_SCHEMA
+        # An empty `existing` means one of two very different things: this table genuinely
+        # has no indexes, or the catalog query was denied. Only the adapter can tell, so it
+        # is the adapter's job to say — ADV001 must not claim "no existing index leads with
+        # them" on the strength of a permission error.
+        have_index_data = not any(cap == CAP_INDEXES for cap, _ in self.degraded)
         proposals = [
             *propose_indexes(
                 aggregation.usage,
@@ -945,6 +1007,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 existing,
                 min_cost_share=min_cost_share,
                 schema=schema,
+                have_index_data=have_index_data,
             ),
             *propose_partial_indexes(
                 aggregation.usage, facts, min_cost_share=min_cost_share, schema=schema
