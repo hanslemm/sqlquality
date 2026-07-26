@@ -2091,12 +2091,36 @@ def test_every_capability_has_a_statement_and_a_hint():
         assert statement.privilege_hint.strip()
 
 
+#: Write verbs that must never appear in an introspection statement.
+FORBIDDEN_VERBS = (
+    "insert", "update", "delete", "create", "drop", "alter", "truncate", "grant", "revoke",
+)
+
+
+def _write_verbs_in(sql: str) -> set[str]:
+    """Write verbs appearing as whole words in ``sql``.
+
+    Whitespace is collapsed before matching, and the result padded, so a verb preceded by a
+    newline or sitting at the very start of the statement is still caught. A naive
+    ``f" {verb} " in f" {sql.lower()} "`` check misses `"... LIMIT %s;\\ndrop table foo"`
+    entirely — which is precisely the stacked-statement mistake this guard exists to catch.
+    """
+    normalized = f" {' '.join(sql.lower().split())} "
+    return {verb for verb in FORBIDDEN_VERBS if f" {verb} " in normalized}
+
+
+def test_the_write_verb_detector_catches_newline_and_leading_positions():
+    """Guard the guard: this test is the reason the detector normalizes whitespace."""
+    assert _write_verbs_in("select 1 from t limit 1;\ndrop table foo") == {"drop"}
+    assert _write_verbs_in("delete from t") == {"delete"}
+    assert _write_verbs_in("select 1\n\tgrant select on x to y") == {"grant"}
+    assert _write_verbs_in("select 1 from t where a = 2") == set()
+
+
 def test_no_introspection_statement_writes():
-    forbidden = ("insert", "update", "delete", "create", "drop", "alter", "truncate", "grant")
     for statement in PostgresWorkloadAdapter().introspection_sql():
-        lowered = statement.sql.lower()
-        for word in forbidden:
-            assert f" {word} " not in f" {lowered} ", f"{statement.capability} contains {word}"
+        found = _write_verbs_in(statement.sql)
+        assert not found, f"{statement.capability} contains write verb(s): {sorted(found)}"
 
 
 def test_workload_statement_is_scoped_to_the_current_database():
@@ -2139,16 +2163,27 @@ CAP_TABLE_FACTS = "table_facts"
 CAP_NDV = "ndv"
 CAP_INDEXES = "indexes"
 
+#: What to tell the user when a capability's statement is refused. These strings are what
+#: someone hands their DBA, so they distinguish the one capability needing a real grant
+#: from the four that read views already world-readable in stock Postgres — overstating
+#: the ask would make a routine request look alarming.
 _HINTS = {
     CAP_WORKLOAD: (
-        "requires the pg_stat_statements extension and pg_read_all_stats "
-        "(or superuser); enable via shared_preload_libraries then CREATE EXTENSION"
+        "requires the pg_stat_statements extension (PostgreSQL 13+) and pg_read_all_stats "
+        "or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On "
+        "PostgreSQL 12 and older the view lacks total_exec_time and this will fail."
     ),
-    CAP_STATS_RESET: "requires read access to pg_stat_database",
-    CAP_SCHEMA: "requires read access to information_schema.columns",
-    CAP_TABLE_FACTS: "requires read access to pg_class and pg_namespace",
-    CAP_NDV: "requires read access to pg_stats (per-column statistics)",
-    CAP_INDEXES: "requires read access to pg_index and pg_stat_user_indexes",
+    CAP_STATS_RESET: "reads pg_stat_database; world-readable unless explicitly revoked",
+    CAP_SCHEMA: (
+        "reads information_schema.columns; shows only tables the current role can access, "
+        "so a partial result means missing table privileges rather than a missing grant"
+    ),
+    CAP_TABLE_FACTS: "reads pg_class and pg_namespace; world-readable unless revoked",
+    CAP_NDV: (
+        "reads pg_stats, which exposes only rows for tables the current role owns or can "
+        "select from — a role without table access silently sees no statistics"
+    ),
+    CAP_INDEXES: "reads pg_index and pg_stat_user_indexes; world-readable unless revoked",
 }
 
 
@@ -2156,6 +2191,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
     SQL: dict[str, str] = {
+        # `s.rows` is selected but currently discarded. It is kept deliberately: rows per
+        # call is the natural selectivity signal for a future confidence refinement
+        # ("returns 3 rows from 8M — an excellent index candidate"), and fetching it costs
+        # nothing. Task 8 unpacks it as `_rows`.
+        # `total_exec_time` requires PostgreSQL 13+; it was `total_time` on 12 and older,
+        # both long past end-of-life. The privilege hint states the floor.
         CAP_WORKLOAD: """
             SELECT s.query, s.calls, s.total_exec_time, s.rows
             FROM pg_stat_statements s
@@ -2185,6 +2226,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             FROM pg_stats s
             WHERE s.schemaname = ANY(%s) AND s.tablename = ANY(%s)
         """,
+        # Known limitation: the pg_attribute join silently omits expression indexes.
+        # `indkey` holds 0 for an expression column, which matches no pg_attribute row, so
+        # an index on `lower(status)` is invisible here. Consequence: ADV001 may propose an
+        # index whose expression equivalent already exists. Reading pg_get_indexdef() would
+        # fix it; deferred rather than silently ignored.
         CAP_INDEXES: """
             SELECT t.relname, i.relname, a.attname, k.ordinality,
                    ix.indisunique, ix.indisprimary,
