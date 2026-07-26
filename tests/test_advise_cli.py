@@ -293,7 +293,13 @@ def test_real_adapter_connection_failure_is_reported_once(monkeypatch):
     fake_psycopg = types.ModuleType("psycopg")
 
     def explode(conninfo, **kwargs):
-        raise RuntimeError('connection to server at "db" failed')
+        # The conninfo is echoed back deliberately, matching
+        # test_workload_postgres.py::test_connect_scrubs_a_password_from_a_driver_failure.
+        # A fixed message would make the "hunter2 not in output" assertion below unable to
+        # fail: it would be asserting the absence of a string nothing ever produced.
+        # Measured: with `_scrub` replaced by the identity function, that assertion now
+        # fails, and with a fixed message it did not.
+        raise RuntimeError(f"connection failed for conninfo {conninfo}")
 
     fake_psycopg.connect = explode  # type: ignore[attr-defined]
     fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -304,8 +310,8 @@ def test_real_adapter_connection_failure_is_reported_once(monkeypatch):
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u:hunter2@db/x"])
     assert result.exit_code == 2
     assert result.output.count("Could not connect") == 1
-    assert "connection to server" in result.output
-    # And the inline DSN password still must not surface on this path.
+    assert "connection failed for conninfo" in result.output
+    # And the inline DSN password still must not surface on this path — load-bearing now.
     assert "hunter2" not in result.output
 
 
