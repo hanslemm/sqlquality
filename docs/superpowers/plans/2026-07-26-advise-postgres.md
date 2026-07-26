@@ -1092,6 +1092,8 @@ class WorkloadAdapter(ABC):
         #: (capability, reason) for each introspection statement that failed. The command
         #: reports these and continues rather than aborting on a single missing grant.
         self.degraded: list[tuple[str, str]] = []
+        #: Schema(s) to introspect. The CLI overwrites this from --schema before connect().
+        self.schemas: tuple[str, ...] = ("public",)
 
     @abstractmethod
     def introspection_sql(self) -> list[IntrospectionStatement]:
@@ -2789,7 +2791,7 @@ Replace `PostgresWorkloadAdapter.propose`:
         *,
         min_cost_share: float,
     ) -> list[Proposal]:
-        existing = self.fetch_indexes(("public",), aggregation.tables)
+        existing = self.fetch_indexes(self.schemas, aggregation.tables)
         proposals = [
             *propose_indexes(
                 aggregation.usage, facts, existing, min_cost_share=min_cost_share
@@ -2809,7 +2811,7 @@ Replace `PostgresWorkloadAdapter.propose`:
         )
 ```
 
-`propose()` hardcoding `("public",)` is a known wart: the schema tuple should be threaded through from the CLI. Task 13 replaces it by storing the resolved schemas on the adapter in `connect()`; leave the literal here so this task's tests stay self-contained, and remove it in Task 13.
+`propose()` reads `self.schemas`, which `WorkloadAdapter.__init__` defaults to `("public",)` (Task 5). The CLI overwrites it from `--schema` in Task 13. Tests in this task rely on the default, so they stay self-contained.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -3153,12 +3155,12 @@ git commit -m "feat(report): render advise proposals as JSON and markdown"
 ### Task 13: Wire the `advise` CLI command
 
 **Files:**
-- Modify: `src/sqlquality/cli.py`, `src/sqlquality/workload/postgres.py`
+- Modify: `src/sqlquality/cli.py`
 - Test: `tests/test_advise_cli.py`
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–12.
-- Produces: `sqlquality advise` with the spec's full flag set, plus `PostgresWorkloadAdapter.schemas` set by `connect()` (removing the hardcoded `("public",)` from Task 10).
+- Produces: `sqlquality advise` with the spec's full flag set, assigning `adapter.schemas` from `--schema` before `connect()` (the attribute is declared on the ABC in Task 5).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3315,9 +3317,9 @@ Expected: FAIL — `advise` is not a command (exit code 2 with "No such command"
 
 - [ ] **Step 3: Write minimal implementation**
 
-First, in `src/sqlquality/workload/postgres.py`, give the adapter a `schemas` attribute and use it instead of the hardcoded literal. In `__init__`: `self.schemas: tuple[str, ...] = ("public",)`. At the end of `connect()`: nothing more needed — the CLI assigns `adapter.schemas` before calling `connect()`. In `propose()`, replace `self.fetch_indexes(("public",), ...)` with `self.fetch_indexes(self.schemas, ...)`.
+`adapter.schemas` already exists (declared on the ABC in Task 5, read by `propose()` in Task 10), so no adapter change is needed here — the CLI just assigns it before calling `connect()`.
 
-Then add to `src/sqlquality/cli.py`:
+Add to `src/sqlquality/cli.py`:
 
 ```python
 _SINCE_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
@@ -3398,7 +3400,7 @@ def advise(
     typer.echo(f"engine: {params.engine} (credentials from {params.source})", err=True)
 
     schemas = tuple(schema)
-    adapter.schemas = schemas  # type: ignore[attr-defined]
+    adapter.schemas = schemas
     try:
         adapter.connect(params, timeout)
     except ImportError as exc:
@@ -3691,7 +3693,7 @@ git commit -m "docs: document advise and scope the static-tool claim"
 
 Deliberately out of this plan, per the spec's staged build order: Redshift (ADV101–105), Snowflake (ADV201–204), dbt enrichment (ADV301–303), and the opt-in docker-compose integration test. Each gets its own plan.
 
-**Type consistency.** `WorkloadFetch` is produced by `fetch_workload` (Task 8) and consumed by `ingest` (Task 2). `Workload` is produced by `ingest` and consumed by `aggregate` (Task 4), `propose` (Tasks 9–10) and the renderers (Task 12). `Aggregation` is produced by `aggregate` and consumed by `propose` and the renderers. `PgIndex` is produced by `fetch_indexes` (Task 8) and consumed by all three index rules (Task 9). `Proposal` flows from Tasks 9–10 into Tasks 11–13. `ConnectionParams` is produced by `resolve_connection` (Task 6) and consumed by `connect` (Task 8). Capability constants are defined in Task 7 and used in Tasks 7, 8 and 13. `adapter.schemas` is introduced in Task 10 as a hardcoded literal and correctly threaded in Task 13, which is called out explicitly in both tasks.
+**Type consistency.** `WorkloadFetch` is produced by `fetch_workload` (Task 8) and consumed by `ingest` (Task 2). `Workload` is produced by `ingest` and consumed by `aggregate` (Task 4), `propose` (Tasks 9–10) and the renderers (Task 12). `Aggregation` is produced by `aggregate` and consumed by `propose` and the renderers. `PgIndex` is produced by `fetch_indexes` (Task 8) and consumed by all three index rules (Task 9). `Proposal` flows from Tasks 9–10 into Tasks 11–13. `ConnectionParams` is produced by `resolve_connection` (Task 6) and consumed by `connect` (Task 8). Capability constants are defined in Task 7 and used in Tasks 7, 8 and 13. `adapter.schemas` is declared on the `WorkloadAdapter` ABC (Task 5), read by `propose()` (Task 10), and assigned from `--schema` by the CLI (Task 13).
 
 **Known plan-level risks.** Two places where an implementer may need to adapt:
 
