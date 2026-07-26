@@ -2496,6 +2496,29 @@ def test_secrets_for_extracts_the_password_from_an_inline_dsn():
     assert "hunter2" not in _scrub(realistic, secrets)
 
 
+def test_secrets_for_covers_a_percent_encoded_dsn_password():
+    """urlparse leaves the password encoded; libpq decodes it before authenticating.
+
+    So the value a real auth-failure message carries is the *decoded* one, and a token of
+    only the encoded form never matches. Any password containing @ : / % or a space hits
+    this, which is most passwords a generator would produce.
+    """
+    params = ConnectionParams(
+        engine="postgres", dsn="postgresql://u:p%40ss@h/db", fields={}, source="--dsn",
+    )
+    secrets = _secrets_for(params)
+    assert "p%40ss" in secrets
+    assert "p@ss" in secrets
+    driver_message = 'connection failed: password authentication failed for user "u" (p@ss)'
+    assert "p@ss" not in _scrub(driver_message, secrets)
+
+
+def test_secrets_for_tolerates_a_dsn_with_no_password_or_a_malformed_one():
+    for dsn in ("postgresql://u@h/db", "not a valid dsn :: at all ///"):
+        params = ConnectionParams(engine="postgres", dsn=dsn, fields={}, source="--dsn")
+        assert _secrets_for(params) == (dsn,)
+
+
 def test_scrub_withholds_rather_than_mangles_an_unredactable_secret():
     """A one-character password would blank every occurrence of that letter.
 
@@ -2794,15 +2817,26 @@ def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
     if the driver echoes the connection string back verbatim, which real libpq errors do
     not do — they report the offending value on its own. Without the extracted password,
     DSN-based connections would have no effective protection at all.
+
+    The password is added in **both** its percent-encoded and decoded forms.
+    ``urlparse().password`` returns it still encoded, but libpq decodes a URI DSN before
+    authenticating, so the value a real auth-failure message carries is the decoded one:
+    for ``postgresql://u:p%40ss@h/db`` the driver reports ``p@ss`` while urlparse yields
+    ``p%40ss``, and a token of only the encoded form never matches. Any password containing
+    ``@``, ``:``, ``/``, ``%`` or a space hits this. The encoded form is kept too, since a
+    URI-parse error can echo the raw string back instead.
     """
     secrets = tuple(
         value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
     )
     if params.dsn:
         secrets += (params.dsn,)
-        dsn_password = urlparse(params.dsn).password
-        if dsn_password:
-            secrets += (dsn_password,)
+        encoded = urlparse(params.dsn).password
+        if encoded:
+            secrets += (encoded,)
+            decoded = unquote(encoded)
+            if decoded != encoded:
+                secrets += (decoded,)
     return secrets
 
 
