@@ -2480,6 +2480,34 @@ def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
     assert exc.value.__context__ is None
 
 
+def test_secrets_for_extracts_the_password_from_an_inline_dsn():
+    """The realistic leak shape: a driver reports the bad password on its own.
+
+    It never echoes the whole connection string back, so a whole-DSN token alone would
+    never match and DSN connections would have no protection.
+    """
+    params = ConnectionParams(
+        engine="postgres", dsn="postgresql://u:hunter2@db:5432/analytics",
+        fields={}, source="--dsn",
+    )
+    secrets = _secrets_for(params)
+    assert "hunter2" in secrets
+    realistic = 'connection failed: password authentication failed for user "u" (hunter2)'
+    assert "hunter2" not in _scrub(realistic, secrets)
+
+
+def test_scrub_withholds_rather_than_mangles_an_unredactable_secret():
+    """A one-character password would blank every occurrence of that letter.
+
+    Nothing leaks either way, but a message redacted into unreadability is worse than an
+    honest refusal to show it.
+    """
+    mangled = _scrub("a database has an admin at a table", ("a",))
+    assert mangled == _WITHHELD
+    # A short secret that does not actually appear must not suppress a usable message.
+    assert _scrub("connection refused", ("a",)) == "connection refused"
+
+
 def test_fetch_indexes_groups_columns_in_ordinal_order():
     querier = FakeQuerier({"pg_index": [
         ("orders", "orders_pkey", "id", 1, True, True, 900, 4096),
@@ -2591,14 +2619,8 @@ Add `from dataclasses import dataclass` and `from sqlquality.models import RawQu
 
         conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
         # Everything we know to be secret, so a driver exception can be proven clean rather
-        # than trusted. The DSN itself is included because it may embed a password inline.
-        secrets = tuple(
-            value
-            for key, value in params.fields.items()
-            if key in _SECRET_FIELDS and value
-        )
-        if params.dsn:
-            secrets += (params.dsn,)
+        # than trusted.
+        secrets = _secrets_for(params)
 
         failure: str | None = None
         try:
@@ -2758,6 +2780,32 @@ def _clamp_timeout_ms(timeout_s: int) -> int:
     return max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S)) * 1000
 
 
+#: A secret shorter than this cannot be redacted by substring replacement without
+#: destroying the message — a one-character password would blank every occurrence of that
+#: letter. When one actually appears, the driver's text is withheld rather than mangled.
+_MIN_SCRUBBABLE_SECRET = 4
+_WITHHELD = "(driver message withheld: it contained a value too short to redact safely)"
+
+
+def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
+    """Every value we know to be secret for this connection.
+
+    A DSN is added *and* its password extracted separately. The whole-DSN token only helps
+    if the driver echoes the connection string back verbatim, which real libpq errors do
+    not do — they report the offending value on its own. Without the extracted password,
+    DSN-based connections would have no effective protection at all.
+    """
+    secrets = tuple(
+        value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
+    )
+    if params.dsn:
+        secrets += (params.dsn,)
+        dsn_password = urlparse(params.dsn).password
+        if dsn_password:
+            secrets += (dsn_password,)
+    return secrets
+
+
 def _scrub(text: str, secrets: Iterable[str]) -> str:
     """Replace any known secret occurring in ``text`` with a redaction marker.
 
@@ -2766,10 +2814,12 @@ def _scrub(text: str, secrets: Iterable[str]) -> str:
     without a live server, and we hold the secret anyway, so its absence can be guaranteed
     instead of trusted.
     """
+    present = [secret for secret in secrets if secret and secret in text]
+    if any(len(secret) < _MIN_SCRUBBABLE_SECRET for secret in present):
+        return _WITHHELD
     scrubbed = text
-    for secret in secrets:
-        if secret:
-            scrubbed = scrubbed.replace(secret, "***")
+    for secret in present:
+        scrubbed = scrubbed.replace(secret, "***")
     return scrubbed
 
 
