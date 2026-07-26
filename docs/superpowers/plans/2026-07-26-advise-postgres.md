@@ -4982,8 +4982,28 @@ COLUMNS = [
     ("orders", "iban", "text"), ("orders", "created_at", "timestamp"),
 ]
 
+#: Load-bearing, and the reason this whole module is not decoration.
+#:
+#: A workload built only from equality/range predicates (like HOT_QUERY) produces index
+#: proposals whose evidence carries *column names and roles*, never raw SQL — so
+#: `redact_tree` could be deleted entirely and no secret would appear in any output. The
+#: guarantee test would pass while guaranteeing nothing.
+#:
+#: Exactly one path in the pipeline copies query text downstream: ADV005's
+#: leading-wildcard-LIKE evidence, which reports at query-group level because the pattern
+#: was redacted before we could attribute a column. This row is what reaches it.
+#:
+#: If a future proposal type starts embedding raw SQL, it needs its own row here — and the
+#: `--keep-literals` test below is the canary that will tell you: it asserts a secret *is*
+#: retained with the opt-in, which can only hold if some output surface actually carries
+#: query text. If that test starts failing, this scenario has gone vacuous.
+LIKE_QUERY = "select note from orders where note like '%hans@betterdoc.de%'"
+
 ROWS = {
-    "pg_stat_statements": [(HOT_QUERY, 500, 90_000.0, 10)],
+    "pg_stat_statements": [
+        (HOT_QUERY, 500, 90_000.0, 10),
+        (LIKE_QUERY, 300, 20_000.0, 5),
+    ],
     "pg_stat_database": [("2026-07-01",)],
     "information_schema.columns": COLUMNS,
     "pg_total_relation_size": [("orders", 8_000_000, 10**9)],
@@ -5032,6 +5052,13 @@ def test_analysis_still_works_on_redacted_sql(stubbed):
     payload = json.loads(result.stdout)
     assert payload["proposals"], "redaction must not silence the analysis"
     assert payload["redacted"] is True
+    # Non-vacuity guard: ADV005 is the only proposal type that carries query text into the
+    # output, so its presence is what makes the leak assertions above meaningful. Without
+    # it, "no secret in the output" holds trivially because no SQL is in the output at all.
+    assert any(p["code"] == "ADV005" for p in payload["proposals"]), (
+        "scenario no longer exercises a raw-SQL output path — the guarantee test above "
+        "would pass vacuously"
+    )
 
 
 def test_keep_literals_is_the_only_way_to_retain_values(stubbed):
