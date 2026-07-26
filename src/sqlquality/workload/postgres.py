@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from urllib.parse import unquote, urlparse
 
 from sqlquality.models import (
     Aggregation,
+    ColumnRole,
+    ColumnUsage,
     ConnectionParams,
+    Confidence,
     Proposal,
     RawQueryRow,
     TableFacts,
@@ -171,6 +174,191 @@ class PgIndex:
     is_primary: bool
     scans: int
     size_bytes: int
+
+
+#: Below this row estimate a sequential scan is the right plan; an index is pure overhead.
+MIN_ROWS_FOR_INDEX = 10_000
+#: Wider composite indexes cost more to maintain than they repay in practice.
+MAX_INDEX_ARITY = 3
+#: An equality column with fewer distinct values than this is not selective enough to
+#: justify HIGH confidence on its own.
+SELECTIVE_NDV = 100.0
+
+
+def _by_table(usage: Sequence[ColumnUsage]) -> dict[str, list[ColumnUsage]]:
+    grouped: dict[str, list[ColumnUsage]] = {}
+    for item in usage:
+        grouped.setdefault(item.table, []).append(item)
+    return grouped
+
+
+def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | None:
+    """Name of an existing index whose leading columns already cover ``candidate``."""
+    for index in existing:
+        if index.columns[: len(candidate)] == candidate:
+            return index.name
+    return None
+
+
+def propose_indexes(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[str, TableFacts],
+    existing: Mapping[str, Sequence[PgIndex]],
+    *,
+    min_cost_share: float,
+    min_rows: int = MIN_ROWS_FOR_INDEX,
+    max_arity: int = MAX_INDEX_ARITY,
+) -> list[Proposal]:
+    """ADV001 — composite index candidates: equality columns first, one range column last.
+
+    Equality-then-range is the standard B-tree ordering: once a range predicate is used,
+    later columns can no longer be probed by equality.
+    """
+    proposals: list[Proposal] = []
+    for table, items in sorted(_by_table(usage).items()):
+        table_facts = facts.get(table)
+        rows = table_facts.row_estimate if table_facts else None
+        if rows is not None and rows < min_rows:
+            continue
+
+        equality = sorted(
+            (i for i in items if i.role is ColumnRole.EQUALITY),
+            key=lambda i: i.cost_ms,
+            reverse=True,
+        )
+        ranges = sorted(
+            (i for i in items if i.role in (ColumnRole.RANGE, ColumnRole.SORT)),
+            key=lambda i: i.cost_ms,
+            reverse=True,
+        )
+        if ranges:
+            chosen = equality[: max_arity - 1] + ranges[:1]
+        else:
+            chosen = equality[:max_arity]
+        if not chosen:
+            continue
+
+        cost_share = max(i.cost_share for i in chosen)
+        if cost_share < min_cost_share:
+            continue
+
+        columns = tuple(i.column for i in chosen)
+        covered_by = _covered(columns, existing.get(table, ()))
+        if covered_by is not None:
+            continue
+
+        ndv = table_facts.ndv if table_facts else {}
+        leading_ndv = ndv.get(columns[0])
+        if rows is None or leading_ndv is None:
+            confidence = Confidence.MEDIUM
+        elif leading_ndv >= SELECTIVE_NDV:
+            confidence = Confidence.HIGH
+        else:
+            confidence = Confidence.LOW
+
+        proposals.append(
+            Proposal(
+                code="ADV001",
+                title=f"Add index on {table}({', '.join(columns)})",
+                rationale=(
+                    "These columns carry the table's hottest predicates and no existing "
+                    "index leads with them. Equality columns come first so the range "
+                    "column can be scanned last."
+                ),
+                evidence={
+                    "table": table,
+                    "columns": columns,
+                    "roles": tuple(i.role.value for i in chosen),
+                    "cost_share": cost_share,
+                    "calls": max(i.calls for i in chosen),
+                    "fingerprints": max(i.fingerprints for i in chosen),
+                    "row_estimate": rows,
+                    "leading_ndv": leading_ndv,
+                },
+                confidence=confidence,
+                ddl=f"CREATE INDEX ON {table} ({', '.join(columns)});",
+            )
+        )
+    return proposals
+
+
+def propose_unused_indexes(
+    existing: Mapping[str, Sequence[PgIndex]], *, hot_tables: frozenset[str]
+) -> list[Proposal]:
+    """ADV002 — indexes with zero recorded scans, excluding constraint-backing indexes.
+
+    Confidence is capped at MEDIUM: idx_scan accumulates only since the last statistics
+    reset, so zero scans cannot prove an index is unused across a full business cycle.
+    """
+    proposals: list[Proposal] = []
+    for table in sorted(hot_tables):
+        for index in existing.get(table, ()):
+            if index.scans != 0 or index.is_unique or index.is_primary:
+                continue
+            proposals.append(
+                Proposal(
+                    code="ADV002",
+                    title=f"Drop unused index {index.name} on {table}",
+                    rationale=(
+                        "No recorded scans since the last statistics reset. Verify the "
+                        "reset time covers a full business cycle before dropping."
+                    ),
+                    evidence={
+                        "table": table,
+                        "index": index.name,
+                        "columns": index.columns,
+                        "scans": index.scans,
+                        "size_bytes": index.size_bytes,
+                    },
+                    confidence=Confidence.MEDIUM,
+                    ddl=f"DROP INDEX {index.name};",
+                )
+            )
+    return proposals
+
+
+def propose_redundant_indexes(
+    existing: Mapping[str, Sequence[PgIndex]],
+) -> list[Proposal]:
+    """ADV003 — an index whose column list is a strict prefix of another's is redundant."""
+    proposals: list[Proposal] = []
+    for table, indexes in sorted(existing.items()):
+        for narrow in indexes:
+            if narrow.is_unique or narrow.is_primary:
+                continue
+            wider = next(
+                (
+                    other
+                    for other in indexes
+                    if other.name != narrow.name
+                    and len(other.columns) > len(narrow.columns)
+                    and other.columns[: len(narrow.columns)] == narrow.columns
+                ),
+                None,
+            )
+            if wider is None:
+                continue
+            proposals.append(
+                Proposal(
+                    code="ADV003",
+                    title=f"Drop redundant index {narrow.name} on {table}",
+                    rationale=(
+                        f"Its columns are a leading prefix of {wider.name}, which can "
+                        "serve the same lookups."
+                    ),
+                    evidence={
+                        "table": table,
+                        "index": narrow.name,
+                        "columns": narrow.columns,
+                        "superseded_by": wider.name,
+                        "superseding_columns": wider.columns,
+                        "size_bytes": narrow.size_bytes,
+                    },
+                    confidence=Confidence.HIGH,
+                    ddl=f"DROP INDEX {narrow.name};",
+                )
+            )
+    return proposals
 
 
 class PostgresWorkloadAdapter(WorkloadAdapter):
