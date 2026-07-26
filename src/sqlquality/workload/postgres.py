@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -20,6 +21,7 @@ from sqlquality.models import (
     WorkloadFetch,
 )
 from sqlquality.workload.base import IntrospectionStatement, Querier, WorkloadAdapter
+from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
 
 CAP_WORKLOAD = "workload"
 CAP_STATS_RESET = "stats_reset"
@@ -387,6 +389,197 @@ def propose_redundant_indexes(
     return proposals
 
 
+#: A table with at least this many columns makes `SELECT *` materially wasteful.
+WIDE_TABLE_COLUMNS = 15
+
+_NULL_ROLE_PREDICATE = {
+    ColumnRole.NULL_CHECK: "IS NULL",
+    ColumnRole.NOT_NULL_CHECK: "IS NOT NULL",
+}
+
+
+def propose_partial_indexes(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[str, TableFacts],
+    *,
+    min_cost_share: float,
+) -> list[Proposal]:
+    """ADV004 — index the hot equality column, restricted by a hot null-check predicate.
+
+    Only structural predicates qualify. Literal-valued partial indexes would need the
+    literals retained, which default redaction deliberately discards.
+    """
+    proposals: list[Proposal] = []
+    for table, items in sorted(_by_table(usage).items()):
+        equality = sorted(
+            (i for i in items if i.role is ColumnRole.EQUALITY),
+            key=lambda i: i.cost_ms,
+            reverse=True,
+        )
+        null_checks = sorted(
+            (i for i in items if i.role in _NULL_ROLE_PREDICATE),
+            key=lambda i: i.cost_ms,
+            reverse=True,
+        )
+        if not equality or not null_checks:
+            continue
+        # The hottest equality column and the hottest null-check column are chosen
+        # independently per table — ColumnUsage carries no per-query link back to which
+        # predicates co-occurred in the same statement, so this pairing is never verified
+        # to come from one query. It could combine two predicates that no single query
+        # actually filters together. That is exactly why confidence stops at MEDIUM rather
+        # than HIGH even when both columns are individually hot: the evidence supports "both
+        # predicates are hot on this table," not "this specific combination is hot."
+        leading, guard = equality[0], null_checks[0]
+        cost_share = max(leading.cost_share, guard.cost_share)
+        if cost_share < min_cost_share:
+            continue
+        predicate = _NULL_ROLE_PREDICATE[guard.role]
+        table_facts = facts.get(table)
+        proposals.append(
+            Proposal(
+                code="ADV004",
+                title=(
+                    f"Partial index on {table}({leading.column}) WHERE {guard.column} {predicate}"
+                ),
+                rationale=(
+                    "The hot predicates always pair this lookup with the same null check, "
+                    "so a partial index covers them at a fraction of the size."
+                ),
+                evidence={
+                    "table": table,
+                    "columns": (leading.column,),
+                    "guard_column": guard.column,
+                    "guard_predicate": predicate,
+                    "cost_share": cost_share,
+                    "calls": max(leading.calls, guard.calls),
+                    "row_estimate": table_facts.row_estimate if table_facts else None,
+                },
+                confidence=Confidence.MEDIUM,
+                ddl=(
+                    f"CREATE INDEX ON {table} ({leading.column}) WHERE {guard.column} {predicate};"
+                ),
+            )
+        )
+    return proposals
+
+
+def propose_sargability(
+    usage: Sequence[ColumnUsage],
+    workload: Workload,
+    *,
+    min_cost_share: float,
+) -> list[Proposal]:
+    """ADV005 — predicates an index cannot serve, ranked by the cost they carry."""
+    proposals: list[Proposal] = []
+    for item in sorted(usage, key=lambda i: i.cost_ms, reverse=True):
+        if item.role is not ColumnRole.NON_SARGABLE or item.cost_share < min_cost_share:
+            continue
+        proposals.append(
+            Proposal(
+                code="ADV005",
+                title=f"Non-sargable predicate on {item.table}.{item.column}",
+                rationale=(
+                    "The column is wrapped in a cast or function inside a predicate, so a "
+                    "plain B-tree index cannot be used. Rewrite the predicate to leave the "
+                    "column bare, or add a matching expression index."
+                ),
+                evidence={
+                    "table": item.table,
+                    "column": item.column,
+                    "cost_share": item.cost_share,
+                    "calls": item.calls,
+                    "fingerprints": item.fingerprints,
+                },
+                confidence=Confidence.HIGH,
+                ddl=None,
+            )
+        )
+
+    total = workload.total_cost_ms
+    for stat in workload.stats:
+        if FLAG_LEADING_WILDCARD_LIKE not in stat.flags:
+            continue
+        share = (stat.total_time_ms / total) if total else 0.0
+        if share < min_cost_share:
+            continue
+        proposals.append(
+            Proposal(
+                code="ADV005",
+                title="Leading-wildcard LIKE in a hot query group",
+                rationale=(
+                    "A LIKE pattern beginning with '%' cannot use a B-tree index. Consider "
+                    "a trigram index or full-text search. The pattern itself was redacted, "
+                    "so the specific column is not attributed here."
+                ),
+                evidence={
+                    "fingerprint": stat.fingerprint,
+                    "sql": stat.sql,
+                    "cost_share": share,
+                    "calls": stat.calls,
+                },
+                confidence=Confidence.MEDIUM,
+                ddl=None,
+            )
+        )
+    return proposals
+
+
+def _mentions_table(name: str, sql: str) -> bool:
+    """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
+
+    A plain `name in sql` test would false-positive three ways: a table `order` inside a
+    query on `orders`, a table `cart` inside `shopping_cart`, and a table `orders` that only
+    appears as part of a column alias like `orders_total`. `\\b` already treats `_` as a word
+    character in Python's `re`, so it rejects all three without a custom boundary class.
+    """
+    return re.search(rf"\b{re.escape(name)}\b", sql) is not None
+
+
+def propose_select_star(
+    workload: Workload,
+    facts: Mapping[str, TableFacts],
+    *,
+    min_cost_share: float,
+    min_columns: int = WIDE_TABLE_COLUMNS,
+) -> list[Proposal]:
+    """ADV006 — hot query groups projecting a star from a wide table."""
+    wide = {name for name, fact in facts.items() if len(fact.columns) >= min_columns}
+    if not wide:
+        return []
+    total = workload.total_cost_ms
+    proposals: list[Proposal] = []
+    for stat in workload.stats:
+        if FLAG_SELECT_STAR not in stat.flags:
+            continue
+        touched = sorted(name for name in wide if _mentions_table(name, stat.sql))
+        if not touched:
+            continue
+        share = (stat.total_time_ms / total) if total else 0.0
+        if share < min_cost_share:
+            continue
+        proposals.append(
+            Proposal(
+                code="ADV006",
+                title=f"Hot SELECT * over wide table(s): {', '.join(touched)}",
+                rationale=(
+                    "Projecting every column of a wide table moves data no consumer asked "
+                    "for. List the columns the query actually needs."
+                ),
+                evidence={
+                    "tables": tuple(touched),
+                    "column_counts": {name: len(facts[name].columns) for name in touched},
+                    "cost_share": share,
+                    "calls": stat.calls,
+                    "fingerprint": stat.fingerprint,
+                },
+                confidence=Confidence.MEDIUM,
+                ddl=None,
+            )
+        )
+    return proposals
+
+
 class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
@@ -620,6 +813,32 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             )
         return {table: tuple(indexes) for table, indexes in result.items()}
 
+    #: Highest confidence first, then largest cost share — the reading order a human wants.
+    _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
+
+    @classmethod
+    def _dedupe_by_ddl(cls, proposals: list[Proposal]) -> list[Proposal]:
+        """Collapse proposals that would run identical DDL, keeping the strongest evidence.
+
+        An index with no recorded scans that is *also* a prefix of a wider index gets
+        flagged by both ADV002 and ADV003, producing two entries with the same
+        `DROP INDEX`. They do not contradict each other, but a reader should not have to
+        notice they are the same object twice. ADV003 wins ties because prefix redundancy
+        is structural — provable from the column lists alone — whereas ADV002 rests on a
+        scan counter that only covers the window since the last statistics reset.
+        """
+        best: dict[str, Proposal] = {}
+        for proposal in proposals:
+            if not proposal.ddl:
+                continue
+            incumbent = best.get(proposal.ddl)
+            if incumbent is None or (
+                cls._CONFIDENCE_ORDER[proposal.confidence]
+                < cls._CONFIDENCE_ORDER[incumbent.confidence]
+            ):
+                best[proposal.ddl] = proposal
+        return [p for p in proposals if not p.ddl or best[p.ddl] is p]
+
     def propose(
         self,
         aggregation: Aggregation,
@@ -628,7 +847,26 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         *,
         min_cost_share: float,
     ) -> list[Proposal]:
-        raise NotImplementedError  # Tasks 9-10
+        existing = self.fetch_indexes(self.schemas, aggregation.tables)
+        proposals = [
+            *propose_indexes(aggregation.usage, facts, existing, min_cost_share=min_cost_share),
+            *propose_partial_indexes(aggregation.usage, facts, min_cost_share=min_cost_share),
+            *propose_sargability(aggregation.usage, workload, min_cost_share=min_cost_share),
+            *propose_select_star(workload, facts, min_cost_share=min_cost_share),
+            *propose_unused_indexes(existing, hot_tables=aggregation.tables),
+            *propose_redundant_indexes(existing),
+        ]
+        return sorted(
+            self._dedupe_by_ddl(proposals),
+            key=lambda p: (
+                self._CONFIDENCE_ORDER[p.confidence],
+                -float(p.evidence.get("cost_share", 0.0)),  # type: ignore[arg-type]
+                # Canonical tiebreak, so equal-confidence equal-cost proposals do not
+                # reorder between runs and make the CLI's tests flaky.
+                p.code,
+                p.title,
+            ),
+        )
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
         raise NotImplementedError  # Task 11
