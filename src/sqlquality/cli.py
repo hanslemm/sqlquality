@@ -799,25 +799,37 @@ def advise(
     # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate
     # failure", which would make CI read a healthy advisory run as a failed gate. Same
     # house pattern as read_sql_file: name the path, exit 2.
+    #
+    # `encoding="utf-8"` for the same reason profiles.py reads with it: without it Python
+    # uses the *platform's* preferred encoding, and both renderers always emit an em dash
+    # (render_ddl's header contains one), so under an ASCII locale every --ddl run failed.
+    # `UnicodeError` is caught alongside `OSError` because UnicodeEncodeError is a
+    # ValueError — it is not an OSError, so the handler let it through and the process
+    # exited 1. utf-8 makes that near-unreachable but not unreachable: a lone surrogate in
+    # a catalog identifier still cannot be encoded.
+    #
+    # Only the write is inside the `try`. The renderers run first, so the handler's
+    # message — which names a path and claims a write failed — can only fire for something
+    # that actually is a write failure.
     if markdown is not None:
+        markdown_text = render_advise_markdown(
+            proposals,
+            workload,
+            aggregation,
+            engine=params.engine,
+            redacted=not keep_literals,
+            degraded=adapter.degraded,
+        )
         try:
-            markdown.write_text(
-                render_advise_markdown(
-                    proposals,
-                    workload,
-                    aggregation,
-                    engine=params.engine,
-                    redacted=not keep_literals,
-                    degraded=adapter.degraded,
-                )
-            )
-        except OSError as exc:
+            markdown.write_text(markdown_text, encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
             typer.echo(f"Could not write --markdown {markdown}: {exc}", err=True)
             raise typer.Exit(code=2)
     if ddl is not None:
+        ddl_text = adapter.render_ddl(proposals)
         try:
-            ddl.write_text(adapter.render_ddl(proposals))
-        except OSError as exc:
+            ddl.write_text(ddl_text, encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
             typer.echo(f"Could not write --ddl {ddl}: {exc}", err=True)
             raise typer.Exit(code=2)
 

@@ -7,6 +7,7 @@ from sqlquality.workload.connection import (
     read_profile,
     resolve_connection,
 )
+from sqlquality.workload.profiles import ProfileError, read_profiles_file
 
 
 def test_dsn_wins_over_env_and_profiles():
@@ -288,24 +289,54 @@ def test_profiles_yml_is_decoded_as_utf8_regardless_of_locale(tmp_path, monkeypa
     assert recorded["encoding"] == "utf-8"
 
 
-def test_a_non_utf8_profiles_file_names_the_file_and_detaches_the_bytes(tmp_path):
-    """UnicodeDecodeError already exits 2 (it is a ValueError), so this is message quality.
+#: A latin-1 profiles.yml whose password contains a byte utf-8 cannot decode.
+UNDECODABLE_PROFILE = "jaffle:\n  outputs:\n    dev:\n      password: SUPERSECRÈT\n".encode(
+    "latin-1"
+)
 
-    But it is also a leak: the exception object holds the *entire undecodable file* in
-    `.object`, secret included, so the chain has to be severed here like the YAML one.
-    """
-    (tmp_path / "profiles.yml").write_bytes(
-        "jaffle:\n  outputs:\n    dev:\n      password: SUPERSECRÈT\n".encode("latin-1")
-    )
+
+def test_a_non_utf8_profiles_file_names_the_file(tmp_path):
+    """UnicodeDecodeError already exits 2 (it is a ValueError), so this is message quality:
+    the raw codec error named a byte offset and nothing a user could act on."""
+    (tmp_path / "profiles.yml").write_bytes(UNDECODABLE_PROFILE)
     with pytest.raises(ConnectionResolutionError) as exc:
         read_profile(tmp_path, "jaffle", None, {})
     message = str(exc.value)
     assert "profiles.yml" in message
     assert "UTF-8" in message
+    assert "SUPERSECR" not in message
+
+
+def test_the_undecodable_file_is_not_reachable_from_the_profile_error(tmp_path):
+    """Walks the chain from `read_profiles_file`, and inspects `.object`, not just `str()`.
+
+    Two things had to be right here, and an earlier version of this test had neither.
+
+    *Where it walks.* Walking from `read_profile` proves nothing about this module: that
+    boundary re-raises outside its own handler, so the chain it hands back is one exception
+    long no matter what `profiles.py` does. A re-chain inside `read_profiles_file` was
+    invisible from there. The walk has to start at the layer that catches the decode error.
+
+    *What it inspects.* `str(UnicodeDecodeError)` is "'utf-8' codec can't decode byte 0xc8
+    in position 53 ..." — it never quotes the content, so a str-only assertion could not
+    fail. The bytes are in `.object`, which holds the *entire* file, `password:` line
+    included. That is the leak, and it is why this error is recorded and re-raised after the
+    handler exits rather than chained.
+    """
+    (tmp_path / "profiles.yml").write_bytes(UNDECODABLE_PROFILE)
+    with pytest.raises(ProfileError) as exc:
+        read_profiles_file(tmp_path)
 
     node: BaseException | None = exc.value
     depth = 0
     while node is not None and depth < 8:
-        assert "SUPERSECR" not in str(node), f"file content reachable at chain depth {depth}"
+        where = f"chain depth {depth} ({type(node).__name__})"
+        assert "SUPERSECR" not in str(node), f"file content reachable in the message at {where}"
+        payload = getattr(node, "object", b"")
+        if isinstance(payload, (bytes, bytearray)):
+            assert b"SUPERSECR" not in payload, f"file content reachable via .object at {where}"
         node = node.__cause__ or node.__context__
         depth += 1
+    # And the chain really is severed, not merely secret-free by luck.
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None

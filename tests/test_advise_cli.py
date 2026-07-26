@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -222,6 +223,56 @@ def test_a_ddl_path_that_is_a_directory_exits_2_not_1(monkeypatch, tmp_path):
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--ddl", str(tmp_path)])
     assert result.exit_code == 2
     assert str(tmp_path) in result.output
+    assert "Traceback" not in result.output
+
+
+def test_reports_are_written_as_utf8_whatever_the_platform_encoding_is(monkeypatch, tmp_path):
+    """Both renderers *always* emit an em dash — render_ddl's header contains one.
+
+    `write_text()` with no encoding uses the platform's preferred encoding, so under an
+    ASCII locale (LC_ALL=C) every single `advise --ddl` run raised UnicodeEncodeError. And
+    UnicodeEncodeError is a ValueError, not an OSError, so the write handler did not catch
+    it and the process exited 1 — the exact CI-misreads-a-healthy-run failure the handler
+    was added to prevent. Same bug class as the read side, which got `encoding="utf-8"`.
+    """
+    real_write_text = Path.write_text
+
+    def ascii_locale(self, data, encoding=None, *args, **kwargs):
+        # Emulate a machine whose preferred encoding is ASCII: an omitted encoding is
+        # resolved to it, exactly as CPython would.
+        resolved = encoding or "ascii"
+        data.encode(resolved)
+        return real_write_text(self, data, encoding=resolved)
+
+    monkeypatch.setattr(Path, "write_text", ascii_locale)
+    _stub_adapter(monkeypatch, STAR_ONLY_ROWS)
+    ddl = tmp_path / "out.sql"
+    md = tmp_path / "out.md"
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--ddl", str(ddl), "--markdown", str(md)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "—" in ddl.read_text(encoding="utf-8")
+    assert md.read_text(encoding="utf-8")
+
+
+def test_an_unencodable_report_exits_2_not_1(monkeypatch, tmp_path):
+    """utf-8 encodes almost everything — but not a lone surrogate.
+
+    Identifiers reach the DDL from a live catalog, so an unencodable string is not purely
+    hypothetical, and the handler must own the whole failure class rather than the one
+    exception type that happens to be an OSError.
+    """
+    from sqlquality.workload.postgres import PostgresWorkloadAdapter
+
+    _stub_adapter(monkeypatch, STAR_ONLY_ROWS)
+    monkeypatch.setattr(
+        PostgresWorkloadAdapter, "render_ddl", lambda self, proposals: "-- \ud800\n"
+    )
+    ddl = tmp_path / "out.sql"
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--ddl", str(ddl)])
+    assert result.exit_code == 2
+    assert str(ddl) in result.output
     assert "Traceback" not in result.output
 
 
