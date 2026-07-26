@@ -1,8 +1,21 @@
-from sqlquality.models import ColumnRole, ColumnUsage, Confidence, TableFacts
+from sqlquality.models import (
+    Aggregation,
+    ColumnRole,
+    ColumnUsage,
+    Confidence,
+    QueryStat,
+    TableFacts,
+    Workload,
+)
+from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
 from sqlquality.workload.postgres import (
     PgIndex,
+    PostgresWorkloadAdapter,
     propose_indexes,
+    propose_partial_indexes,
     propose_redundant_indexes,
+    propose_sargability,
+    propose_select_star,
     propose_unused_indexes,
 )
 
@@ -263,3 +276,182 @@ def test_a_unique_prefix_index_is_never_called_redundant():
         )
     }
     assert propose_redundant_indexes(existing) == []
+
+
+def _workload(*stats):
+    return Workload(stats=tuple(stats), window_description="w")
+
+
+def test_partial_index_proposed_for_a_hot_not_null_check():
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        facts(),
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV004"]
+    assert "IS NOT NULL" in proposals[0].ddl
+
+
+def test_partial_index_polarity_follows_the_predicate():
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
+            usage("shipped_at", ColumnRole.NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        facts(),
+        min_cost_share=0.01,
+    )
+    assert "IS NULL" in proposals[0].ddl
+    assert "IS NOT NULL" not in proposals[0].ddl
+
+
+def test_no_partial_index_without_an_equality_column_to_index():
+    proposals = propose_partial_indexes(
+        [usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4)],
+        facts(),
+        min_cost_share=0.01,
+    )
+    assert proposals == []
+
+
+def test_non_sargable_column_gets_an_attributed_proposal():
+    proposals = propose_sargability(
+        [usage("status", ColumnRole.NON_SARGABLE, cost_share=0.3)],
+        _workload(),
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV005"]
+    assert proposals[0].evidence["column"] == "status"
+    assert proposals[0].confidence is Confidence.HIGH
+
+
+def test_leading_wildcard_reports_without_column_attribution():
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select id from orders where note like $1",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_LEADING_WILDCARD_LIKE}),
+    )
+    proposals = propose_sargability([], _workload(stat), min_cost_share=0.01)
+    assert codes(proposals) == ["ADV005"]
+    assert proposals[0].evidence.get("column") is None
+    # Redaction erased the pattern, so we can name the query group but not the column.
+    assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_hot_select_star_on_a_wide_table():
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    wide = {
+        "orders": TableFacts(
+            name="orders",
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        )
+    }
+    proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
+    assert codes(proposals) == ["ADV006"]
+
+
+def test_select_star_ignored_on_a_narrow_table():
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    narrow = {
+        "orders": TableFacts(name="orders", row_estimate=10**6, size_bytes=1, columns=("a", "b"))
+    }
+    assert propose_select_star(_workload(stat), narrow, min_cost_share=0.01) == []
+
+
+def test_select_star_table_matching_ignores_substring_false_positives():
+    """A plain `name in sql` test would misfire three ways this locks out.
+
+    A wide table `order` must not match a query on `orders` (name is a substring of a
+    different table); a wide table `orders` must not match only because it appears inside
+    a column alias `orders_total`; and a wide table `cart` must not match a query that only
+    touches `shopping_cart`.
+    """
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select id, count(*) as orders_total from shopping_cart",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    wide = {
+        "order": TableFacts(
+            name="order",
+            row_estimate=10**6,
+            size_bytes=1,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+        "orders": TableFacts(
+            name="orders",
+            row_estimate=10**6,
+            size_bytes=1,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+        "cart": TableFacts(
+            name="cart", row_estimate=10**6, size_bytes=1, columns=tuple(f"c{i}" for i in range(30))
+        ),
+    }
+    assert propose_select_star(_workload(stat), wide, min_cost_share=0.01) == []
+
+
+def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
+    """ADV002 and ADV003 can both fire on one index, emitting the same DROP twice.
+
+    ADV003 must survive: prefix redundancy is provable from the column lists alone, while
+    ADV002 rests on a scan counter covering only the window since the last stats reset.
+    """
+    existing = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 0, 4096),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 8192),
+        )
+    }
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    aggregation = Aggregation(
+        usage=(), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
+    )
+    adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
+    proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
+
+    drops = [p for p in proposals if p.ddl == "DROP INDEX idx_narrow;"]
+    assert len(drops) == 1
+    assert drops[0].code == "ADV003"
+
+
+def test_propose_composes_all_rules_and_ranks_high_confidence_first():
+    aggregation = Aggregation(
+        usage=(
+            usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
+            usage("note", ColumnRole.NON_SARGABLE, cost_share=0.2, cost_ms=20.0),
+        ),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({"orders"}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(
+        aggregation,
+        facts(ndv={"status": 9999.0}),
+        _workload(),
+        min_cost_share=0.01,
+    )
+    assert {p.code for p in proposals} >= {"ADV001", "ADV005"}
+    assert proposals[0].confidence is Confidence.HIGH
