@@ -6,13 +6,20 @@ runs per-engine static **performance anti-pattern** checks (with optional
 captured-`EXPLAIN` analysis), sqlfluff-backed **linting**, and optional, advisory
 **LLM suggestions**.
 
-It is a static tool. It does not connect to your warehouse or execute queries:
+sqlquality **never executes your SQL**. `complexity`, `lint`, `perf` and `check` are
+fully offline and never open a connection. `advise` is the one exception: it opens a
+**read-only** session to read query history and catalog metadata, using only a fixed set
+of built-in introspection statements. Run `sqlquality advise --dry-run` to print every
+statement it can issue, without connecting.
 
 - **Complexity** is computed from the SQL AST (via [sqlglot](https://github.com/tobymao/sqlglot)).
 - **Performance** is static anti-pattern detection plus ingestion of an `EXPLAIN`
   plan you captured yourself — no query is ever run.
 - **Neighbors** (a changed model's direct upstream/downstream models) are *reported*
   for context; they are not scored or gated.
+- **Advice** is derived from your query history and catalog statistics, and is emitted as
+  a report plus a DDL file for you to review and apply. sqlquality never writes to your
+  database.
 
 Requires Python 3.11+.
 
@@ -23,6 +30,7 @@ Requires Python 3.11+.
   - [complexity](#complexity)
   - [lint](#lint)
   - [perf](#perf)
+  - [advise](#advise)
   - [check](#check-the-ci-gate)
 - [Configuration](#configuration-sqlqualityyml)
 - [Exit codes](#exit-codes)
@@ -56,6 +64,19 @@ SDK):
 pip install "sqlquality[llm]"
 ```
 
+`advise` needs a database driver. For Postgres:
+
+```bash
+pip install "sqlquality[postgres]"
+# or, for the driver bundle covering every engine advise targets over time:
+pip install "sqlquality[warehouse]"
+```
+
+Today `[warehouse]` pulls in the same driver as `[postgres]` (psycopg) — Redshift and
+Snowflake support is designed but not yet implemented; see
+[Limitations](#limitations). Without the extra, `advise` degrades with an install hint
+instead of a traceback.
+
 `--version` prints the installed version:
 
 ```console
@@ -70,6 +91,7 @@ sqlquality complexity   Score the structural complexity of a single SQL file.
 sqlquality check        Gate a dbt change on the complexity delta of its changed models.
 sqlquality lint         Lint SQL files for best-practice violations (SQLFluff); --fix rewrites them.
 sqlquality perf         Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan).
+sqlquality advise       Propose database optimizations from query history and catalog metadata.
 ```
 
 The `--dialect` / `-d` flag is validated against sqlglot's dialect registry on every
@@ -238,6 +260,234 @@ $ sqlquality perf messy.sql --explain plan.json
 `--json` emits findings and any LLM suggestions. `--suggest` enriches findings with
 advisory LLM suggestions — see [LLM suggestions](#llm-suggestions-optional-advisory).
 
+### advise
+
+Reads a database's query history and catalog metadata over a **read-only** connection,
+weights column usage by the cost of the queries that use it, and proposes concrete
+optimizations — indexes to add, indexes to drop, partial indexes, non-sargable
+predicates, and hot `SELECT *`. Output is an advisory report plus a DDL file for you to
+review. **`advise` never writes to your database and never executes DDL.**
+
+Only **Postgres** is implemented today; Redshift, Snowflake and dbt enrichment are
+designed but not built — see [Limitations](#limitations).
+
+```console
+$ sqlquality advise --dsn postgresql://readonly@db.internal/analytics
+engine: postgres (credentials from --dsn)
+window: since stats reset at 2026-07-19 03:00:00+00
+analyzed 3 of 3 query group(s); skipped 0 unparseable, 0 introspection/DDL, 0 unresolvable
+                Advise — postgres (5 proposals, 3 query groups)
+┏━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ code   ┃ conf   ┃ cost share ┃ proposal                                      ┃
+┡━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ADV001 │ high   │      67.0% │ Add index on orders(status)                   │
+│ ADV005 │ high   │      22.7% │ Non-sargable predicate on orders.email        │
+│ ADV006 │ medium │      22.7% │ Hot SELECT * over wide table(s): orders       │
+│ ADV005 │ medium │      10.3% │ Leading-wildcard LIKE in a hot query group    │
+│ ADV002 │ medium │          — │ Drop unused index idx_orders_customer_ref on  │
+│        │        │            │ orders                                        │
+└────────┴────────┴────────────┴───────────────────────────────────────────────┘
+```
+
+**Credentials**, resolved in precedence order:
+
+1. `--dsn` — a full database URL.
+2. `SQLQUALITY_DSN` — the same, from the environment.
+3. `--profile` (with optional `--target` and `--profiles-dir`, default `~/.dbt`) — reads a
+   dbt `profiles.yml`. `advise` is not dbt-specific; this is a convenience for projects
+   that happen to have one, not a requirement.
+
+The engine is inferred from the DSN scheme (`postgresql://` → `postgres`) or the resolved
+dbt adapter type; `--engine` overrides both. The resolved source is always printed to
+stderr — `engine: postgres (credentials from --dsn)` — the same discipline `check` uses
+for its dialect resolution. Requires the `sqlquality[postgres]` extra (`psycopg`); a
+missing driver degrades with an install hint instead of a traceback.
+
+**Flags:**
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--engine` | inferred | `postgres` is the only engine implemented today. |
+| `--dsn` | — | Database URL. Overrides `SQLQUALITY_DSN`. |
+| `--profile` | — | dbt profile name, read from `profiles.yml`. |
+| `--target` | — | dbt target within the profile. |
+| `--profiles-dir` | `~/.dbt` | Directory holding `profiles.yml`. |
+| `--schema` | `public` | Schema(s) to introspect. Repeatable (`--schema public --schema app`). |
+| `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
+| `--limit` | `500` | Max query-history rows to read. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. |
+| `--keep-literals` | off | Do **not** redact literal values from query text. |
+| `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
+| `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
+| `--json` | off | Emit a machine-readable payload. |
+| `--markdown <path>` | — | Write a markdown report. |
+| `--ddl <path>` | — | Write proposed DDL for review — sqlquality never executes it. |
+
+**`--dry-run`** is how you verify the read-only claim before `advise` ever touches your
+database — it prints the complete, fixed set of statements the adapter can issue and
+exits 0 without connecting:
+
+```console
+$ sqlquality advise --engine postgres --dry-run
+-- workload: requires the pg_stat_statements extension (PostgreSQL 13+) and pg_read_all_stats or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On PostgreSQL 12 and older the view lacks total_exec_time and this will fail.
+SELECT s.query, s.calls, s.total_exec_time, s.rows
+            FROM pg_stat_statements s
+            JOIN pg_database d ON d.oid = s.dbid
+            WHERE d.datname = current_database()
+            ORDER BY s.total_exec_time DESC
+            LIMIT %s
+
+-- stats_reset: reads pg_stat_database; world-readable unless explicitly revoked
+SELECT stats_reset
+            FROM pg_stat_database
+            WHERE datname = current_database()
+```
+
+(truncated here; the real output also lists the `schema`, `table_facts`, `ndv` and
+`indexes` capabilities). `--json` is honored on `--dry-run` too, so the statement list can
+be diffed or fed into review tooling.
+
+**Data protection.** Query history routinely contains personal data inside predicates
+(`WHERE email = 'name@example.com'`). Literal values are **redacted at ingest, by
+default**: every literal in the parsed query is replaced with a placeholder before
+aggregation, before any file is written, before any log line. `--keep-literals` is the
+only way to retain them, and the report states which mode produced it. `advise` never
+writes to your database — proposed DDL only ever goes to a file (`--ddl`) for you to
+review and apply by hand.
+
+**Prerequisites and limits:**
+
+- **`pg_stat_statements`** must be installed (`shared_preload_libraries` +
+  `CREATE EXTENSION`), and the connecting role needs `pg_read_all_stats` or superuser to
+  see queries run by other users.
+- **PostgreSQL 13+.** `pg_stat_statements.total_exec_time` did not exist before version 13
+  (it was `total_time`); older servers fail the workload read outright.
+- **`--since` cannot be honored on Postgres.** `pg_stat_statements` is cumulative since the
+  last statistics reset and carries no per-statement timestamps before PostgreSQL 17
+  (which added `stats_since`). Passing `--since` does not narrow the query — the report
+  states the real window instead: `since stats reset at <timestamp>`.
+
+**Proposal codes** (Postgres):
+
+| Code | Proposal | Evidence |
+|---|---|---|
+| ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3 | cost share, NDV, row estimate, absence of a covering index |
+| ADV002 | Drop an index with zero recorded scans (excludes unique/primary-key indexes) | scans since last stats reset, size |
+| ADV003 | Drop an index whose column list is a strict prefix of a wider index | both column lists |
+| ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
+| ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
+| ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
+
+**Confidence model**, mechanical rather than judgment-based:
+
+- **HIGH** — cost share above `--min-cost-share`, **and** supporting catalog stats present
+  (e.g. NDV), **and** confirmation that the proposed index does not already exist.
+- **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 is
+  capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last statistics
+  reset, so zero scans can never prove an index is unused across a full business cycle.
+- **LOW** — thin evidence, e.g. the row count is unknown so the small-table floor could
+  not be checked.
+
+Every proposal's evidence renders inline (cost share, calls, fingerprints, row estimate,
+NDV, existing index state) so it can be judged from the report alone.
+
+`--ddl` writes a standalone, commented script — never executed by sqlquality:
+
+```sql
+-- Generated by `sqlquality advise` — REVIEW BEFORE RUNNING.
+-- sqlquality does not execute this script and has not validated it against
+-- your workload's write patterns. Each statement is advisory.
+--
+-- On a live table prefer CREATE INDEX CONCURRENTLY / DROP INDEX CONCURRENTLY:
+-- the plain forms below take a lock that blocks writes for the duration.
+-- Note that CONCURRENTLY cannot run inside a transaction block, so apply those
+-- statements individually rather than piping this whole file into one.
+
+-- ADV001 [high, 67.0% of workload cost]
+-- Add index on orders(status)
+CREATE INDEX ON "orders" ("status");
+
+-- ADV002 [medium]
+-- Drop unused index idx_orders_customer_ref on orders
+DROP INDEX "idx_orders_customer_ref";
+```
+
+`--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
+`engine`, `proposals`, `redacted`, `skipped`, `window`). This is the first proposal from
+the run above — the real payload lists all five under `proposals`:
+
+```console
+$ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
+{
+  "analyzed": {
+    "query_groups": 3,
+    "tables": [
+      "orders"
+    ],
+    "total_cost_ms": 925000.0
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "proposals": [
+    {
+      "code": "ADV001",
+      "confidence": "high",
+      "ddl": "CREATE INDEX ON \"orders\" (\"status\");",
+      "evidence": {
+        "calls": 15000,
+        "columns": [
+          "status"
+        ],
+        "cost_share": 0.6702702702702703,
+        "fingerprints": 1,
+        "leading_ndv": 500.0,
+        "roles": [
+          "equality"
+        ],
+        "row_estimate": 5200000,
+        "table": "orders"
+      },
+      "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
+      "title": "Add index on orders(status)"
+    }
+    /* … 4 more proposal objects, same shape … */
+  ],
+  "redacted": true,
+  "skipped": {
+    "noise": 0,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": "since stats reset at 2026-07-19 03:00:00+00"
+}
+```
+
+**Coverage is always disclosed**, not just when it is bad — the terminal, markdown and
+JSON paths all print how many query groups were actually understood:
+
+```console
+analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 introspection/DDL, 1 unresolvable
+low coverage: 33% of candidate statements could not be analyzed (0 unparseable, 1
+unresolvable against the schema). Cost shares are computed against the whole window, so
+they are diluted and --min-cost-share is effectively stricter — few or no proposals may
+reflect coverage rather than a healthy workload.
+```
+
+This matters because `cost_share` is **not** a partition of the workload: a query
+filtering two columns credits its full cost to *both* entries (proposals take the max
+over their columns rather than the sum, since summing would double-count), and the
+denominator always includes queries that could not be parsed or resolved against the
+schema. Poor coverage silently dilutes every proposal's share rather than inflating it —
+read the skip counts alongside every proposal.
+
+A missing grant degrades one capability at a time rather than aborting the whole run:
+
+```console
+reduced coverage — ndv: permission denied for table pg_stats — reads pg_stats, which
+exposes only rows for tables the current role owns or can select from — a role without
+table access silently sees no statistics
+```
+
 ### check (the CI gate)
 
 Scores each changed model on both a candidate and a baseline dbt manifest, and gates
@@ -358,6 +608,10 @@ Per-command nuances of code `1`:
   warnings exit 0.
 - **`check`** exits 1 only when `gate.mode: fail` and a regression is present; `warn`
   mode exits 0 even with regressions.
+- **`advise`** exits 0 on any successful analysis, whether or not proposals were
+  produced — proposals are advisory and never gate. It exits 2 on a usage, config,
+  connection or input error (unresolvable credentials, connection failure, missing
+  driver, malformed `--since`, out-of-range `--timeout`). It never exits 1.
 
 ## CI recipe (a gate that actually gates)
 
@@ -480,12 +734,38 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   AST features (joins, CTEs, subqueries, windows, select depth, …); it is not capped,
   so a large model can exceed 100. As a rough guide, ~100 is very complex. It measures
   shape, not runtime cost or correctness.
-- **Performance is static.** Anti-patterns and captured-`EXPLAIN` ingestion only —
-  `sqlquality` never runs your queries. Perf adapters exist for **postgres** and
-  **redshift** only today.
+- **`perf` is static.** Anti-patterns and captured-`EXPLAIN` ingestion only —
+  `sqlquality` never runs your queries in this command. Perf adapters exist for
+  **postgres** and **redshift** only today.
 - **Jinja analysis is approximate.** Raw dbt models are analyzed by stripping Jinja to
   placeholders (with a stderr notice). Prefer compiled SQL from `target/compiled/` for
   accurate results.
 - **Neighbors are reported, not scored.** A changed model's direct upstream/downstream
   models are surfaced for context; the gate only evaluates the changed models
   themselves.
+- **`advise` proposals are ranked by evidence, not proven.** A HIGH-confidence proposal
+  is well-supported, not guaranteed correct — it is still advice to review, not a
+  decision already made.
+- **Index write cost is not modeled.** Proposals weigh read-side benefit (cost share,
+  selectivity) against the fact that an index exists; they do not estimate the ongoing
+  cost of maintaining it on every write. A hot write path with many proposed indexes
+  needs a human judgment call `advise` does not make.
+- **Conclusions are only as representative as the log window.** `pg_stat_statements` is
+  cumulative since the last statistics reset, with no per-statement timestamps before
+  PostgreSQL 17. A reset an hour ago produces a confident-looking report over an hour of
+  traffic; the report's `window:` line is the only way to know which you have.
+- **`cost_share` is not a partition.** A query filtering two columns credits its full
+  cost to *both* — summing across columns double-counts. The denominator also includes
+  statements that could not be parsed or resolved against the schema, so poor coverage
+  dilutes every share and makes `--min-cost-share` effectively stricter; the CLI warns
+  when coverage is poor, and the report always prints the skip counts.
+- **Expression indexes are invisible to the catalog query.** Postgres's `pg_index.indkey`
+  holds `0` for an expression column, which matches no `pg_attribute` row, so ADV001 may
+  propose a plain-column index whose `lower(col)` expression-index equivalent already
+  exists.
+- **ADV003 cannot see partial-index predicates.** It compares column lists only, so it
+  could recommend dropping a partial index in favor of a wider full index that does not
+  actually cover the same rows.
+- **Redshift, Snowflake and dbt enrichment are designed but not implemented.** `advise`
+  supports Postgres only today; passing another `--engine` fails with a clear error
+  rather than silently degrading.

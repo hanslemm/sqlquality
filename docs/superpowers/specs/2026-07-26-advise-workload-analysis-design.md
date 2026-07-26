@@ -1,7 +1,10 @@
 # Design: `sqlquality advise` — workload-driven database optimization
 
 Date: 2026-07-26
-Status: approved design, not yet implemented
+Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`; Redshift, Snowflake and
+dbt enrichment (steps 5–7) remain design-only, not yet implemented. See
+`docs/superpowers/plans/2026-07-26-advise-postgres.md` for the implementation plan and its
+"Deviations from the spec" section, reconciled into this document below.
 
 ## Summary
 
@@ -96,8 +99,10 @@ class WorkloadAdapter(ABC):
     def connect(self, params: ConnectionParams, timeout_s: int) -> None:
         """Open a read-only session with a statement timeout."""
 
-    def fetch_workload(self, since: timedelta | None, limit: int) -> Workload:
-        """Query history rows, engine-normalized. Literals NOT yet redacted."""
+    def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
+        """Raw query-history rows plus an honest window description. Literals NOT yet
+        redacted — redaction happens once, in the engine-agnostic `ingest()`, so there is
+        exactly one place to audit for literal leakage instead of one per adapter."""
 
     def fetch_schema(self, tables: set[str]) -> dict:
         """Schema mapping for sqlglot qualify()."""
@@ -107,11 +112,20 @@ class WorkloadAdapter(ABC):
 
     def propose(
         self,
-        usage: tuple[ColumnUsage, ...],
+        aggregation: Aggregation,
         facts: dict[str, TableFacts],
         workload: Workload,
+        *,
+        min_cost_share: float,
     ) -> list[Proposal]:
-        """Engine-specific proposal rules."""
+        """Engine-specific proposal rules. `aggregation.usage` carries the weighted
+        column-role index; `aggregation.tables` and `.skipped_unqualifiable` drive the
+        coverage disclosure."""
+
+    #: Schema(s) to introspect (repeatable `--schema`, default `("public",)`). The CLI
+    #: assigns this from the flag before connect(); read by fetch_schema/fetch_table_facts
+    #: and by propose() wherever an adapter needs it (e.g. to re-fetch existing indexes).
+    schemas: tuple[str, ...]
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
         """Engine-specific DDL for the proposals that have any."""
@@ -130,21 +144,41 @@ class ConnectionParams:
     source: str               # "--dsn" | "env" | "profiles.yml" — printed to stderr
 
 @dataclass(frozen=True)
+class RawQueryRow:
+    """One row of query history as read from an engine, literals still present."""
+    sql: str
+    calls: int
+    total_time_ms: float
+    bytes_scanned: int | None = None       # None where the engine doesn't report it
+    partitions_scanned: int | None = None  # Snowflake
+    partitions_total: int | None = None    # Snowflake
+
+@dataclass(frozen=True)
+class WorkloadFetch:
+    """What an adapter's fetch_workload() returns: raw rows plus an honest window label.
+    Redaction has NOT happened yet — that is `ingest()`'s job, in the engine-agnostic
+    core, so there is exactly one place to audit for literal leakage."""
+    rows: tuple[RawQueryRow, ...]
+    window_description: str
+
+@dataclass(frozen=True)
 class QueryStat:
     fingerprint: str          # canonical, literal-free
     sql: str                  # redacted unless --keep-literals
     calls: int
     total_time_ms: float
-    bytes_scanned: int | None      # None where the engine doesn't report it
-    partitions_scanned: int | None  # Snowflake
-    partitions_total: int | None    # Snowflake
+    bytes_scanned: int | None = None
+    partitions_scanned: int | None = None  # Snowflake
+    partitions_total: int | None = None    # Snowflake
+    flags: frozenset[str] = frozenset()    # literal-derived signals captured pre-redaction
 
 @dataclass(frozen=True)
 class Workload:
+    """Produced by `ingest()` from a `WorkloadFetch`: parsed, flagged, redacted, grouped."""
     stats: tuple[QueryStat, ...]
     window_description: str   # human-readable, honest about what the engine gave us
-    skipped_unparseable: int
-    skipped_unqualifiable: int
+    skipped_unparseable: int = 0
+    skipped_noise: int = 0    # our own introspection / DDL / session control, filtered out
 
 class ColumnRole(str, Enum):
     EQUALITY = "equality"
@@ -152,6 +186,9 @@ class ColumnRole(str, Enum):
     JOIN = "join"
     SORT = "sort"
     GROUP = "group"
+    NULL_CHECK = "null_check"          # IS NULL
+    NOT_NULL_CHECK = "not_null_check"  # IS NOT NULL
+    NON_SARGABLE = "non_sargable"      # column wrapped in a cast or function inside a predicate
 
 @dataclass(frozen=True)
 class ColumnUsage:
@@ -160,8 +197,21 @@ class ColumnUsage:
     role: ColumnRole
     calls: int
     cost_ms: float
-    cost_share: float         # fraction of total analyzed workload cost
+    cost_share: float         # fraction of total analyzed workload cost — NOT a partition,
+                              # see the "cost_share is not a partition" note in the README
     fingerprints: int
+    fingerprint_ids: frozenset[str] = frozenset()  # which query groups contributed this
+                                                    # usage, so rules can test co-occurrence
+
+@dataclass(frozen=True)
+class Aggregation:
+    """Produced by `aggregate()`: the rolled-up usage index plus what could not be used."""
+    usage: tuple[ColumnUsage, ...]
+    total_cost_ms: float
+    skipped_unqualifiable: int  # queries that failed qualify() — lives here, not on
+                                # Workload, because qualification happens during
+                                # aggregation, not ingest
+    tables: frozenset[str]
 
 @dataclass(frozen=True)
 class TableFacts:
@@ -196,18 +246,29 @@ by each adapter rather than accumulating as optional fields on a shared god-obje
    `profiles.yml`. Engine is inferred from the DSN scheme or the dbt adapter type;
    `--engine` overrides. This mirrors how `check` resolves dialect from
    `manifest.adapter_type` and prints the resolution to stderr.
-2. **Fetch workload, then parse once and redact.** A single parse per statement yields
-   both the redacted SQL text retained for reporting and the canonical fingerprint.
-   Redaction is the first transform applied — before aggregation, before any file is
-   written, before any log line. Nothing downstream sees a literal unless
-   `--keep-literals` was passed. Raw rows are not retained past this step.
-3. **Roll up by fingerprint.** Exclude our own introspection statements, DDL,
-   `information_schema` reads, and dbt's metadata queries so the tool does not advise on
-   its own noise.
+2. **Fetch workload as a `WorkloadFetch`** (raw rows plus an honest window description),
+   **then parse once and redact.** `ingest()` — engine-agnostic, in `fingerprint.py` —
+   does this: a single parse per statement yields both the redacted SQL text retained
+   for reporting and the canonical fingerprint. Redaction is the first transform applied
+   — before aggregation, before any file is written, before any log line. Nothing
+   downstream sees a literal unless `--keep-literals` was passed. Raw rows are not
+   retained past this step. `ingest()` returns a `Workload`.
+3. **Roll up by fingerprint.** Exclude our own introspection statements, DDL, and
+   `information_schema`/dbt metadata reads so the tool does not advise on its own noise.
+   **All DML is kept as workload** — `INSERT`, `UPDATE` and `DELETE`, not only `SELECT`:
+   a write's `WHERE` clause benefits from an index exactly as a read's does, and write
+   volume is what makes an index expensive to maintain, so excluding DML would both hide
+   index candidates and bias the cost picture toward reads. `qualify()` leaves DML
+   columns bare (Postgres resolves them to a single-table statement's sole target table),
+   and comparison roles are gated on being inside a `WHERE`/`JOIN`/`HAVING` so a DML
+   `SET` assignment is never mistaken for a predicate.
 4. **Fetch schema and `qualify()`.** `sqlglot.optimizer.qualify.qualify` resolves
-   unqualified columns to their tables. Queries that fail to qualify increment
-   `skipped_unqualifiable` and appear in the report — never silently dropped, matching
-   `check`'s existing `skipped` discipline.
+   unqualified columns to their tables. This step is `aggregate()`, which produces an
+   `Aggregation` from a `Workload`: queries that fail to qualify increment
+   `Aggregation.skipped_unqualifiable` and appear in the report — never silently dropped,
+   matching `check`'s existing `skipped` discipline. (`skipped_unqualifiable` lives on
+   `Aggregation`, not `Workload`, because qualification happens during aggregation, not
+   ingest.)
 5. **Extract column roles** and weight each by the cost share of the queries containing
    it. Cost weight is `total_time_ms`, or `bytes_scanned` on Snowflake.
 6. **Fetch table facts only for tables above `--min-cost-share`.** Catalog round-trips
@@ -239,6 +300,14 @@ every `exp.Literal` with a placeholder. Consequences, stated plainly:
   such as `IS NULL` and boolean columns. Literal-valued partial indexes require
   `--keep-literals`.
 - Hot-literal skew detection is unavailable by default. This is an accepted loss.
+- ADV005's leading-wildcard `LIKE` check (`'%x'`) is a genuine casualty of ingest-time
+  redaction: `like '%x'` becomes `like $1` once redacted, and the pattern is gone by the
+  time proposal rules run. As shipped, this is handled with a pre-redaction boolean flag
+  (`ColumnRole`'s `NON_SARGABLE` plus a `QueryStat.flags` entry, `FLAG_LEADING_WILDCARD_LIKE`)
+  captured in `fingerprint.py` before the literal is discarded. Because the flag is
+  query-group-level rather than column-level, this branch of ADV005 reports at the query
+  level with no column attribution ("Leading-wildcard LIKE in a hot query group") — unlike
+  the function/cast branch of ADV005, which keeps full table/column attribution.
 
 `--keep-literals` opts back in. The report header states which mode produced it.
 
@@ -247,11 +316,15 @@ every `exp.Literal` with a placeholder. Consequences, stated plainly:
 ```
 sqlquality advise [--engine postgres|redshift|snowflake]
                   [--dsn URL | --profile NAME --target NAME --profiles-dir DIR]
-                  [--since 7d] [--limit 500] [--min-cost-share 0.01]
+                  [--schema public ...] [--since 7d] [--limit 500] [--min-cost-share 0.01]
                   [--manifest target/manifest.json]
                   [--keep-literals] [--timeout 30] [--dry-run]
                   [--json] [--markdown FILE] [--ddl FILE]
 ```
+
+`--schema` is repeatable (default `public`). Without it, bare table names are ambiguous
+across schemas and the sqlglot schema dict handed to `qualify()` cannot be built
+reliably — this option was added while implementing, not originally specified.
 
 Exit codes follow the existing project contract:
 

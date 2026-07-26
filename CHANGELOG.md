@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `sqlquality advise` — reads Postgres query history (`pg_stat_statements`) and catalog
+  metadata over a read-only connection and proposes indexes, index removals, partial
+  indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV006), with a `--json`
+  and `--markdown` report and a reviewable `--ddl` script.
+- Connections resolve from `--dsn`, `SQLQUALITY_DSN`, or a dbt `profiles.yml`, in that
+  order. dbt is optional throughout.
+- `advise --dry-run` prints every introspection statement without connecting.
+- Optional extras `sqlquality[postgres]` and `sqlquality[warehouse]`.
+
+### Changed
+
+- The "static tool, never connects" claim is now scoped: sqlquality never executes your
+  SQL, and only `advise` opens a (read-only, metadata-only) connection.
+- Query literals are redacted at ingest by default; `--keep-literals` opts back in.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added
