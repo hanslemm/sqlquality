@@ -192,10 +192,20 @@ def _by_table(usage: Sequence[ColumnUsage]) -> dict[str, list[ColumnUsage]]:
     return grouped
 
 
+def _is_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    """True if ``shorter`` is a leading prefix of ``longer`` (equal lists included).
+
+    The slice direction is the whole point and is easy to invert: an index on (a, b) covers
+    a candidate (a), but an index on (a) does *not* cover a candidate (a, b). Both
+    directions are tested.
+    """
+    return longer[: len(shorter)] == shorter
+
+
 def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | None:
     """Name of an existing index whose leading columns already cover ``candidate``."""
     for index in existing:
-        if index.columns[: len(candidate)] == candidate:
+        if _is_prefix(candidate, index.columns):
             return index.name
     return None
 
@@ -249,22 +259,38 @@ def propose_indexes(
 
         ndv = table_facts.ndv if table_facts else {}
         leading_ndv = ndv.get(columns[0])
-        if rows is None or leading_ndv is None:
+        if rows is None:
+            # The small-table gate above could not run, so we cannot rule out that this
+            # index would be pure write overhead on a tiny table. The cost evidence is
+            # real, so the proposal is kept — a user whose row-count grant is missing
+            # should still get advice — but at LOW, and the rationale says why. Reporting
+            # MEDIUM here would be the exact confident-but-wrong failure this rule set
+            # exists to avoid: the size is not assumed large, it is unknown.
+            confidence = Confidence.LOW
+        elif leading_ndv is None:
             confidence = Confidence.MEDIUM
         elif leading_ndv >= SELECTIVE_NDV:
             confidence = Confidence.HIGH
         else:
             confidence = Confidence.LOW
 
+        rationale = (
+            "These columns carry the table's hottest predicates and no existing index "
+            "leads with them. Equality columns come first so the range column can be "
+            "scanned last."
+        )
+        if rows is None:
+            rationale += (
+                " The row count for this table is unknown, so it could not be checked "
+                "against the small-table floor — on a small table an index is pure write "
+                "overhead. Confirm the table's size before applying."
+            )
+
         proposals.append(
             Proposal(
                 code="ADV001",
                 title=f"Add index on {table}({', '.join(columns)})",
-                rationale=(
-                    "These columns carry the table's hottest predicates and no existing "
-                    "index leads with them. Equality columns come first so the range "
-                    "column can be scanned last."
-                ),
+                rationale=rationale,
                 evidence={
                     "table": table,
                     "columns": columns,
@@ -332,7 +358,7 @@ def propose_redundant_indexes(
                     for other in indexes
                     if other.name != narrow.name
                     and len(other.columns) > len(narrow.columns)
-                    and other.columns[: len(narrow.columns)] == narrow.columns
+                    and _is_prefix(narrow.columns, other.columns)
                 ),
                 None,
             )
