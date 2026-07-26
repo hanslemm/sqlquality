@@ -177,6 +177,20 @@ def test_markdown_escapes_an_evidence_key_as_well_as_its_value():
     assert "we|ird" not in md
 
 
+def test_gate_markdown_also_survives_a_newline_in_a_skip_reason():
+    """`_md_escape` is shared with the gate report, so pin the behavior on that side too.
+
+    Today every gate skip reason is a hardcoded literal, so nothing exercises the newline
+    path there — which means a future reason built from an exception message could regress
+    it with no test failing.
+    """
+    # `warned` is a computed property on GateReport, not a constructor field.
+    report = GateReport(deltas=[], regressions=[], passed=True, mode="warn")
+    md = render_markdown(report, skipped=[("model.demo.x", "line one\nline two")])
+    for line in md.splitlines():
+        assert not line.startswith("line two"), "a newline broke out of the skipped bullet"
+
+
 def test_markdown_escapes_pipes_from_query_text():
     hostile = [
         Proposal(
