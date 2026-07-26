@@ -16,7 +16,7 @@ runner = CliRunner()
 #: Distinctive strings that must never appear downstream.
 #:
 #: Be honest about which of these currently discriminate. Measured by disabling
-#: `redact_tree` and sweeping all four surfaces: only `hans@betterdoc.de` leaks, because it
+#: `redact_tree` and sweeping every surface: only `hans@betterdoc.de` leaks, because it
 #: is the only one reaching ADV005's evidence — the single proposal type that copies query
 #: text into output. The other three enter via HOT_QUERY, whose proposals carry column
 #: names, roles and counts but never `stat.sql`, so they cannot leak today whatever
@@ -111,12 +111,18 @@ def test_no_literal_reaches_json_markdown_ddl_or_stdout(stubbed, tmp_path):
     )
     assert result.exit_code == 0
 
-    # `ddl` currently has no live leak channel either: ADV005 (the only evidence block
-    # carrying query text) always sets ddl=None, and generated DDL is built from quoted
-    # identifiers, never predicate literals. Measured: with redaction disabled, stdout,
-    # markdown and json all leak while ddl stays clean. It is asserted anyway, because a
-    # literal-valued partial index would change that — but three surfaces, not four, are
-    # doing real work today.
+    # There are three distinct surfaces here, not four. This run passes --json, so `stdout`
+    # *is* the JSON payload: the `json` entry re-serializes the very same object. (Not
+    # byte-identical — stdout is written with indent=2 and the round-trip is compact — but
+    # the same information, so it cannot catch a leak stdout does not.) The entry stays
+    # anyway: the round-trip is cheap and proves the payload survives json.loads, so a value
+    # that only leaks once re-encoded would still be caught. It is not a fourth surface.
+    #
+    # Of the three, `ddl` has no live leak channel: ADV005 (the only evidence block carrying
+    # query text) always sets ddl=None, and generated DDL is built from quoted identifiers,
+    # never predicate literals. Measured with redaction disabled, stdout and markdown leak
+    # while ddl stays clean. It is asserted anyway, because a literal-valued partial index
+    # would change that — but two of these three checks are doing real work today.
     surfaces = {
         "stdout": result.stdout,
         "markdown": md.read_text(),

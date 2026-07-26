@@ -358,12 +358,41 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
 
 
 def test_a_denied_statement_degrades_and_names_the_privilege():
-    querier = FakeQuerier({"information_schema.columns": []}, fail_markers=("pg_stats",))
+    """The fixture supplies real pg_stats rows *and* denies them.
+
+    Both halves are necessary. `assert facts == {} or facts["orders"].ndv == {}` proved
+    nothing before: `wanted` always populates facts["orders"], and with no pg_stats rows in
+    the fixture `ndv == {}` held whether or not the statement was denied — removing
+    `fail_markers` left the test passing. With rows present, the empty ndv is caused by the
+    denial and by nothing else.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_stats": [("orders", "id", 500.0)],
+        },
+        fail_markers=("pg_stats",),
+    )
     adapter = PostgresWorkloadAdapter(querier=querier)
     facts = adapter.fetch_table_facts(("public",), frozenset({"orders"}))
-    assert facts == {} or facts["orders"].ndv == {}
+    assert facts["orders"].ndv == {}
     assert any(cap == CAP_NDV for cap, _ in adapter.degraded)
     assert any("pg_stats" in reason for _, reason in adapter.degraded)
+
+
+def test_the_denial_fixture_would_otherwise_have_returned_statistics():
+    """Guards the guard above: without the denial the same fixture yields a non-empty ndv,
+    so the emptiness there is attributable to the denial rather than to an empty fixture."""
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_stats": [("orders", "id", 500.0)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].ndv == {"id": 500.0}
 
 
 class _FakeCursor:
