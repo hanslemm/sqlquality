@@ -3513,6 +3513,24 @@ def test_hot_select_star_on_a_wide_table():
     assert codes(proposals) == ["ADV006"]
 
 
+def test_select_star_table_matching_is_whole_identifier_not_substring():
+    """A plain `name in sql` test misattributes ADV006 three ways.
+
+    `order` matches inside `orders`, `cart` inside `shopping_cart`, and `orders` inside the
+    alias `orders_total` — each naming a table the query never touches.
+    """
+    stat = QueryStat(fingerprint="fp", sql="select * from orders_archive", calls=5,
+                     total_time_ms=100.0, flags=frozenset({FLAG_SELECT_STAR}))
+    wide_columns = tuple(f"c{i}" for i in range(30))
+    facts_by_name = {
+        name: TableFacts(name=name, row_estimate=10**6, size_bytes=10**8,
+                         columns=wide_columns)
+        for name in ("order", "orders", "orders_archive")
+    }
+    proposals = propose_select_star(_workload(stat), facts_by_name, min_cost_share=0.01)
+    assert proposals[0].evidence["tables"] == ("orders_archive",)
+
+
 def test_select_star_ignored_on_a_narrow_table():
     stat = QueryStat(fingerprint="fp", sql="select * from orders", calls=5,
                      total_time_ms=100.0, flags=frozenset({FLAG_SELECT_STAR}))
@@ -3726,6 +3744,17 @@ def propose_sargability(
     return proposals
 
 
+def _mentions_table(name: str, sql: str) -> bool:
+    """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
+
+    A plain ``name in sql`` test false-positives three ways: a table ``order`` inside a
+    query on ``orders``, a table ``cart`` inside ``shopping_cart``, and a table ``orders``
+    appearing only in a column alias like ``orders_total``. ``\\b`` already treats ``_`` as
+    a word character in Python's ``re``, so it rejects all three without a custom class.
+    """
+    return re.search(rf"\b{re.escape(name)}\b", sql) is not None
+
+
 def propose_select_star(
     workload: Workload,
     facts: Mapping[str, TableFacts],
@@ -3742,7 +3771,7 @@ def propose_select_star(
     for stat in workload.stats:
         if FLAG_SELECT_STAR not in stat.flags:
             continue
-        touched = sorted(name for name in wide if name in stat.sql)
+        touched = sorted(name for name in wide if _mentions_table(name, stat.sql))
         if not touched:
             continue
         share = (stat.total_time_ms / total) if total else 0.0
