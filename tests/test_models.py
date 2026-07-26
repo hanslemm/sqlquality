@@ -82,8 +82,9 @@ def test_proposal_and_aggregation_construct():
         cost_share=0.5,
         fingerprints=2,
     )
-    agg = Aggregation(usage=(usage,), total_cost_ms=100.0, skipped_unqualifiable=0,
-                      tables=frozenset({"orders"}))
+    agg = Aggregation(
+        usage=(usage,), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
+    )
     assert agg.usage[0].role is ColumnRole.EQUALITY
     proposal = Proposal(
         code="ADV001",
