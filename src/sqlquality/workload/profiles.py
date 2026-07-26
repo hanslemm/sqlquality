@@ -78,18 +78,25 @@ def _yaml_location(exc: yaml.YAMLError) -> str:
 def read_profiles_file(profiles_dir: Path) -> dict:
     """Load profiles.yml from a directory, or raise ProfileError."""
     path = Path(profiles_dir) / "profiles.yml"
+    # The YAML failure is recorded here and raised *after* the handler exits. This is not
+    # style. Raising inside an `except` block populates the new exception's __context__
+    # with the original, whatever the `from` clause says — `from None` only sets
+    # __suppress_context__, which hides it from a printed traceback but leaves it
+    # reachable to anything that walks the chain. Since PyYAML's message quotes the
+    # offending source line, a syntax error on a `password:` line would otherwise leave
+    # the secret retrievable. Leaving the handler first is what actually removes it.
+    yaml_problem: str | None = None
     try:
         raw = yaml.safe_load(path.read_text())
     except FileNotFoundError:
         raise ProfileError(f"No profiles.yml in {profiles_dir}") from None
     except OSError as exc:
-        # OSError carries the path and errno, never file content.
+        # OSError carries the path and errno, never file content — safe to chain.
         raise ProfileError(f"Could not read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
-        # `from None` is load-bearing, not style: a chained cause would let the traceback
-        # print PyYAML's message — and its quoted source line — even though our own
-        # message is clean.
-        raise ProfileError(f"Malformed YAML in {path}{_yaml_location(exc)}") from None
+        yaml_problem = _yaml_location(exc)
+    if yaml_problem is not None:
+        raise ProfileError(f"Malformed YAML in {path}{yaml_problem}")
     if not isinstance(raw, dict):
         raise ProfileError(f"top-level of {path} must be a mapping")
     return raw

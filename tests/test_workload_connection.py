@@ -182,19 +182,28 @@ def test_malformed_yaml_error_never_echoes_a_secret(tmp_path):
     assert "line 6" in message
 
 
-def test_malformed_yaml_error_suppresses_the_leaky_cause(tmp_path):
-    """`from None` is the other half of the fix.
+def test_malformed_yaml_error_is_fully_detached_from_the_leaky_original(tmp_path):
+    """Walks the whole chain, the way an error reporter does.
 
-    A chained cause would let the traceback print PyYAML's snippet even though our own
-    message is clean, so the suppression is load-bearing rather than stylistic.
+    `raise ... from None` is *not* sufficient: raising inside an `except` block sets
+    __context__ regardless of the `from` clause, so the raw YAMLError — whose text quotes
+    the offending source line — stays reachable even though a printed traceback hides it.
+    Both raise sites therefore build their message inside the handler and raise after it
+    exits. This test fails if either one is moved back inside.
     """
     (tmp_path / "profiles.yml").write_text(
         "jaffle:\n  outputs:\n    dev:\n      password: hunter2\tSUPERSECRET\n"
     )
     with pytest.raises(ConnectionResolutionError) as exc:
         read_profile(tmp_path, "jaffle", None, {})
-    assert exc.value.__cause__ is None
-    assert exc.value.__suppress_context__ is True
+
+    node: BaseException | None = exc.value
+    depth = 0
+    while node is not None and depth < 8:
+        assert "SUPERSECRET" not in str(node), f"secret reachable at chain depth {depth}"
+        assert "hunter2" not in str(node), f"secret reachable at chain depth {depth}"
+        node = node.__cause__ or node.__context__
+        depth += 1
 
 
 def test_profile_with_no_default_target_says_so(tmp_path):
