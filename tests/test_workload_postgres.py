@@ -13,6 +13,9 @@ from sqlquality.workload.postgres import (
     CAP_TABLE_FACTS,
     CAP_WORKLOAD,
     PostgresWorkloadAdapter,
+    _scrub,
+    _secrets_for,
+    _WITHHELD,
 )
 
 EXPECTED_CAPABILITIES = {
@@ -280,6 +283,36 @@ def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
     # And the unscrubbed original must not be reachable through the chain.
     assert exc.value.__cause__ is None
     assert exc.value.__context__ is None
+
+
+def test_secrets_for_extracts_the_password_from_an_inline_dsn():
+    """The realistic leak shape: a driver reports the bad password on its own.
+
+    It never echoes the whole connection string back, so a whole-DSN token alone would
+    never match and DSN connections would have no protection.
+    """
+    params = ConnectionParams(
+        engine="postgres",
+        dsn="postgresql://u:hunter2@db:5432/analytics",
+        fields={},
+        source="--dsn",
+    )
+    secrets = _secrets_for(params)
+    assert "hunter2" in secrets
+    realistic = 'connection failed: password authentication failed for user "u" (hunter2)'
+    assert "hunter2" not in _scrub(realistic, secrets)
+
+
+def test_scrub_withholds_rather_than_mangles_an_unredactable_secret():
+    """A one-character password would blank every occurrence of that letter.
+
+    Nothing leaks either way, but a message redacted into unreadability is worse than an
+    honest refusal to show it.
+    """
+    mangled = _scrub("a database has an admin at a table", ("a",))
+    assert mangled == _WITHHELD
+    # A short secret that does not actually appear must not suppress a usable message.
+    assert _scrub("connection refused", ("a",)) == "connection refused"
 
 
 def test_fetch_indexes_groups_columns_in_ordinal_order():
