@@ -122,6 +122,78 @@ def test_read_profile_missing_env_var_reports_the_variable_name(tmp_path):
     assert "PGUSER" in str(exc.value)
 
 
+def test_read_profile_uses_the_env_var_default_when_the_variable_is_unset(tmp_path):
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: \"{{ env_var('PGHOST', 'localhost') }}\"\n"
+    )
+    _engine, fields = read_profile(tmp_path, "jaffle", None, {})
+    assert fields["host"] == "localhost"
+
+
+def test_read_profile_prefers_the_environment_over_the_default(tmp_path):
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: \"{{ env_var('PGHOST', 'localhost') }}\"\n"
+    )
+    _engine, fields = read_profile(tmp_path, "jaffle", None, {"PGHOST": "db.internal"})
+    assert fields["host"] == "db.internal"
+
+
+def test_read_profile_rejects_jinja_it_cannot_resolve(tmp_path):
+    """An unresolved `{{ ... }}` reaching a driver as a hostname is a baffling failure."""
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        '      host: "{{ my_custom_macro() }}"\n'
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    assert "host" in str(exc.value)
+    assert "--dsn" in str(exc.value)
+
+
+def test_profile_errors_never_leak_a_secret_value(tmp_path):
+    """Field values can be passwords; only names may appear in an error message."""
+    (tmp_path / "profiles.yml").write_text(
+        "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        '      password: "hunter2{{ my_custom_macro() }}"\n'
+    )
+    with pytest.raises(ConnectionResolutionError) as exc:
+        read_profile(tmp_path, "jaffle", None, {})
+    assert "hunter2" not in str(exc.value)
+
+
+def test_dsn_means_profiles_yml_is_never_read(tmp_path):
+    """Precedence must short-circuit, not merely be preferred.
+
+    profiles.yml here is malformed, so any attempt to read it raises. A passing test
+    proves the DSN path returns before the file is touched.
+    """
+    (tmp_path / "profiles.yml").write_text("{{{ not valid yaml at all")
+    params = resolve_connection(
+        dsn="postgresql://u@h/db",
+        engine=None,
+        profile="jaffle",
+        target=None,
+        profiles_dir=Path(tmp_path),
+        env={},
+    )
+    assert params.source == "--dsn"
+
+
+def test_env_dsn_means_profiles_yml_is_never_read(tmp_path):
+    (tmp_path / "profiles.yml").write_text("{{{ not valid yaml at all")
+    params = resolve_connection(
+        dsn=None,
+        engine=None,
+        profile="jaffle",
+        target=None,
+        profiles_dir=Path(tmp_path),
+        env={"SQLQUALITY_DSN": "postgresql://u@h/db"},
+    )
+    assert params.source == "env"
+
+
 def test_profiles_path_used_when_no_dsn(tmp_path):
     (tmp_path / "profiles.yml").write_text(
         "jaffle:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n      dbname: a\n"
