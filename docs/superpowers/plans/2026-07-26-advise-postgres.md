@@ -5177,7 +5177,7 @@ Add an `## [Unreleased]` section following the existing format:
 
 - [ ] **Step 4: Reconcile the spec with what shipped**
 
-Apply the five deviations listed in this plan's "Deviations from the spec" section to the spec document, so it describes the built system: `fetch_workload` returning `WorkloadFetch`, the three additional `ColumnRole` members, `skipped_unqualifiable` living on `Aggregation`, the `--schema` option, and ADV005's flag-driven leading-wildcard path.
+Apply the six deviations listed in this plan's "Deviations from the spec" section to the spec document, so it describes the built system: `fetch_workload` returning `WorkloadFetch`, the three additional `ColumnRole` members, `skipped_unqualifiable` living on `Aggregation`, the `--schema` option, ADV005's flag-driven leading-wildcard path, and the inclusion of all DML in the workload.
 
 - [ ] **Step 5: Verify and commit**
 
