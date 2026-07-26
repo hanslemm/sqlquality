@@ -38,6 +38,8 @@ sqlquality = "sqlquality.cli:main"
 
 [project.optional-dependencies]
 llm = ["anthropic>=0.40"]
+postgres = ["psycopg[binary]>=3.1"]
+warehouse = ["psycopg[binary]>=3.1"]
 
 [dependency-groups]
 dev = [
@@ -78,4 +80,8 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["anthropic.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["psycopg.*"]
 ignore_missing_imports = true
