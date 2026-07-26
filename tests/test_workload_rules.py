@@ -3,6 +3,7 @@ from sqlquality.models import (
     ColumnRole,
     ColumnUsage,
     Confidence,
+    Proposal,
     QueryStat,
     TableFacts,
     Workload,
@@ -521,3 +522,51 @@ def test_propose_composes_all_rules_and_ranks_high_confidence_first():
     )
     assert {p.code for p in proposals} >= {"ADV001", "ADV005"}
     assert proposals[0].confidence is Confidence.HIGH
+
+
+def test_render_ddl_emits_a_reviewable_commented_script():
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="Add index on orders(status)",
+            rationale="hot",
+            evidence={"cost_share": 0.5},
+            confidence=Confidence.HIGH,
+            ddl="CREATE INDEX ON orders (status);",
+        ),
+        Proposal(
+            code="ADV005",
+            title="Non-sargable predicate",
+            rationale="cast",
+            evidence={"cost_share": 0.2},
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "CREATE INDEX ON orders (status);" in script
+    assert "-- ADV001" in script
+    assert "high" in script
+    assert "Non-sargable" not in script  # no DDL, so it belongs in the report only
+    assert "review" in script.lower()
+
+
+def test_render_ddl_with_no_ddl_proposals_still_explains_itself():
+    script = PostgresWorkloadAdapter().render_ddl([])
+    assert script.strip().startswith("--")
+    assert "no ddl" in script.lower()
+
+
+def test_render_ddl_recommends_concurrently_for_index_creation():
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="t",
+            rationale="r",
+            evidence={},
+            confidence=Confidence.HIGH,
+            ddl="CREATE INDEX ON orders (status);",
+        ),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "CONCURRENTLY" in script
