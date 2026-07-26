@@ -39,6 +39,7 @@ These are refinements found while verifying the sqlglot API. The spec is updated
 3. `skipped_unqualifiable` moves from `Workload` to `Aggregation`, because qualification happens during aggregation, not ingest.
 4. New `--schema` option (repeatable, default `public`). Without it, bare table names are ambiguous across schemas and the sqlglot schema dict cannot be built reliably.
 5. ADV005's leading-wildcard rule is driven by a pre-redaction boolean flag on `QueryStat`, since `like '%x'` becomes `like $1` after redaction. It reports at query-group level without column attribution; the function/cast rules keep full attribution.
+6. **The workload includes all DML** (`INSERT`, `UPDATE`, `DELETE`), not only `SELECT` — decided by Hans on 2026-07-26 during Task 2's review. A write's `WHERE` clause benefits from an index exactly as a read's does, and write volume is what makes an index expensive to maintain, so excluding DML would both hide index candidates and bias the cost picture toward reads. Two consequences, both handled in Task 3: `qualify()` leaves DML columns bare so single-table DML resolves to its sole target table, and comparison roles are gated on being inside a `WHERE`/`JOIN`/`HAVING` so a `SET` assignment is not mistaken for a predicate.
 
 ## File Structure
 
@@ -357,7 +358,28 @@ def test_is_noise_filters_our_own_introspection_and_ddl():
     assert is_noise("SELECT * FROM pg_stat_statements")
     assert is_noise("select column_name from information_schema.columns")
     assert is_noise("CREATE INDEX idx ON t (a)")
+    assert is_noise("VACUUM ANALYZE orders")
     assert not is_noise("select id from orders where status = $1")
+
+
+def test_is_noise_filters_session_control_but_not_update_set():
+    assert is_noise("SET search_path TO public")
+    assert is_noise("set statement_timeout = '30s'")
+    # The bug this guards: an unanchored `set\s+` also matches `UPDATE ... SET`, which
+    # silently dropped every UPDATE in the workload.
+    assert not is_noise("UPDATE users SET email = $1 WHERE id = $2")
+    assert not is_noise("update orders set status = $1 where created_at < $2")
+
+
+def test_is_noise_keeps_all_dml():
+    assert not is_noise("insert into audit (id, note) values ($1, $2)")
+    assert not is_noise("DELETE FROM sessions WHERE expires_at < $1")
+    assert not is_noise("with recent as (select 1) select * from recent")
+
+
+def test_is_noise_does_not_trip_on_a_keyword_inside_a_literal():
+    assert not is_noise("select id from events where action = 'commit'")
+    assert not is_noise("select id from t where label = 'vacuum the floor'")
 
 
 def test_ingest_groups_by_fingerprint_and_sums_cost():
@@ -388,6 +410,32 @@ def test_ingest_counts_unparseable_and_noise_without_raising():
     assert workload.skipped_unparseable == 1
     assert workload.skipped_noise == 1
     assert len(workload.stats) == 1
+
+
+def test_ingest_captures_literal_flags_before_redaction():
+    """The load-bearing ordering guard.
+
+    `like '%x'` becomes `like %s` once redacted, so if ingest ever computed the flags from
+    the already-redacted tree, FLAG_LEADING_WILDCARD_LIKE would become permanently absent
+    and every other test would still pass.
+    """
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(sql="select id from t where a like '%x'", calls=1, total_time_ms=1.0),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert FLAG_LEADING_WILDCARD_LIKE in workload.stats[0].flags
+    assert "%x" not in workload.stats[0].sql
+
+
+def test_ingest_captures_select_star_flag():
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="select * from t", calls=1, total_time_ms=1.0),),
+        window_description="w",
+    )
+    assert FLAG_SELECT_STAR in ingest(fetch, "postgres").stats[0].flags
 
 
 def test_ingest_keep_literals_preserves_values():
@@ -452,20 +500,36 @@ FLAG_LEADING_WILDCARD_LIKE = "leading_wildcard_like"
 #: The query group projects a star. Captured pre-qualify (qualify runs expand_stars=False).
 FLAG_SELECT_STAR = "select_star"
 
-#: Statements that are our own introspection, dbt's metadata, or DDL — advising on these
-#: would be advising on our own noise.
-_NOISE = re.compile(
-    r"\b(pg_stat_statements|pg_stat_user_indexes|pg_stats|pg_class|pg_index|pg_namespace"
-    r"|information_schema|svv_table_info|svl_statementtext|sys_query_history"
-    r"|account_usage|create\s+index|drop\s+index|create\s+table|alter\s+table"
-    r"|vacuum|analyze|begin|commit|rollback|set\s+)\b",
+#: Statement-leading keywords marking session control, DDL, or maintenance — never user
+#: workload. Anchored at the start deliberately: an unanchored `set\s+` also matches
+#: `UPDATE ... SET`, and an unanchored `commit` matches a literal like `action = 'commit'`.
+_LEADING_NOISE = re.compile(
+    r"^\s*(?:set|reset|begin|start|commit|rollback|savepoint|discard|vacuum|analyze"
+    r"|create|drop|alter|truncate|grant|revoke|comment|reindex|cluster|explain|copy"
+    r"|prepare|deallocate|declare|fetch|close|listen|unlisten|notify|show|call|do)\b",
+    re.IGNORECASE,
+)
+#: Relations only our own introspection (or dbt's metadata) reads. Matched anywhere, since
+#: a statement can reference them in any position.
+_INTROSPECTION = re.compile(
+    r"\b(?:pg_stat_statements|pg_stat_database|pg_stat_user_indexes|pg_stats|pg_class"
+    r"|pg_index|pg_namespace|pg_attribute|pg_database|pg_locks|information_schema"
+    r"|svv_table_info|svv_redshift_columns|svv_alter_table_recommendations"
+    r"|svl_statementtext|svl_query_summary|stl_query|sys_query_history"
+    r"|account_usage)\b",
     re.IGNORECASE,
 )
 
 
 def is_noise(sql: str) -> bool:
-    """True if a statement is introspection, session management, or DDL."""
-    return _NOISE.search(sql) is not None
+    """True for session control, DDL, maintenance, and introspection statements.
+
+    `SELECT`, `INSERT`, `UPDATE` and `DELETE` are all user workload and are always kept.
+    A write's `WHERE` clause benefits from an index exactly as a read's does, and write
+    volume is precisely what makes an index expensive to maintain — so dropping DML would
+    both hide index candidates and bias the cost picture toward reads.
+    """
+    return bool(_LEADING_NOISE.match(sql) or _INTROSPECTION.search(sql))
 
 
 def literal_flags(tree: exp.Expression) -> frozenset[str]:
@@ -580,6 +644,8 @@ git commit -m "feat(workload): ingest query history with literal redaction"
 
 Verified AST shapes this relies on: `qualify()` qualifies columns with the table **alias** (`o`, `c`), so an alias→table map is built from `exp.Table` nodes via `alias_or_name` → `name`. Ancestor chains: WHERE equality → `[EQ, Where]`; join key → `[EQ, Join]`; `ORDER BY` → `[Ordered, Order]`; `a is null` → `[Is, Where]`; `a is not null` → `[Is, Not, Where]`; `lower(a) = x` → `[Lower, EQ, Where]`; `a::text = x` → `[Cast, EQ, Where]`.
 
+Also verified, and the reason this task handles DML specially: `qualify()` does **not** raise on `UPDATE`/`DELETE`/`INSERT` — it returns them with columns left bare (`column.table == ''`). A naive alias lookup therefore drops every DML predicate silently, with no error and no skip count. And an `UPDATE ... SET status = $1` assignment parses to `[EQ, Update]` with no `Where` ancestor, so without the predicate-scope gate it reads as an equality filter on the column being written.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/test_workload_extract.py`:
@@ -680,6 +746,43 @@ def test_projected_columns_produce_no_usage():
     assert _usage("select note from orders") == set()
 
 
+def test_update_where_predicate_is_attributed_to_the_target_table():
+    """qualify() leaves DML columns bare (table == ''), so this needs the sole-table path."""
+    assert ("orders", "created_at", ColumnRole.RANGE) in _usage(
+        "update orders set status = $1 where created_at < $2"
+    )
+
+
+def test_update_set_clause_column_is_not_a_predicate():
+    """`SET status = $1` parses to EQ(status, $1) with no WHERE ancestor.
+
+    Recording it as EQUALITY would make us propose indexing the column being written.
+    """
+    usage = _usage("update orders set status = $1 where created_at < $2")
+    assert ("orders", "status", ColumnRole.EQUALITY) not in usage
+    assert not any(column == "status" for _table, column, _role in usage)
+
+
+def test_delete_where_predicate_is_attributed():
+    assert ("orders", "status", ColumnRole.EQUALITY) in _usage(
+        "delete from orders where status = $1"
+    )
+
+
+def test_insert_values_produces_no_usage():
+    assert _usage("insert into customers (id, email) values ($1, $2)") == set()
+
+
+def test_insert_from_select_attributes_the_source_table():
+    assert ("orders", "status", ColumnRole.EQUALITY) in _usage(
+        "insert into customers (id) select customer_id from orders where status = $1"
+    )
+
+
+def test_projected_comparison_is_not_a_predicate():
+    assert _usage("select status = $1 as is_shipped from orders") == set()
+
+
 def test_unresolvable_column_raises_unqualifiable():
     tree = sqlglot.parse_one("select nope from mystery_table", dialect="postgres")
     with pytest.raises(UnqualifiableQuery):
@@ -729,7 +832,7 @@ def _within(node: exp.Expression, *types: type[exp.Expression]) -> bool:
 
 
 def _role(column: exp.Column) -> ColumnRole | None:
-    """Classify how a column is used, or None if it is merely projected.
+    """Classify how a column is used, or None if it is merely projected or assigned.
 
     A window's PARTITION BY / ORDER BY is not a query-level sort key, so anything under
     an exp.Window is discarded before the ancestor walk begins.
@@ -737,16 +840,21 @@ def _role(column: exp.Column) -> ColumnRole | None:
     if _within(column, exp.Window):
         return None
 
+    # Comparison and null-check roles only count inside a filtering clause. Without this
+    # gate, `UPDATE orders SET status = $1` records `status` as an EQUALITY predicate —
+    # it parses to EQ(status, $1) with no Where ancestor — and we would propose indexing
+    # the column being written. The same gate correctly ignores a projected comparison
+    # such as `SELECT a = b AS flag`.
+    predicate_scope = _within(column, exp.Where, exp.Join, exp.Having)
+
     # A column wrapped in a cast or function inside a predicate cannot use a plain index.
-    if isinstance(column.parent, _SARGABILITY_BREAKERS) and _within(
-        column, exp.Where, exp.Join, exp.Having
-    ):
+    if isinstance(column.parent, _SARGABILITY_BREAKERS) and predicate_scope:
         return ColumnRole.NON_SARGABLE
 
     comparison: ColumnRole | None = None
     node: exp.Expression | None = column.parent
     while node is not None:
-        if isinstance(node, exp.Is):
+        if isinstance(node, exp.Is) and predicate_scope:
             null_side = isinstance(node.expression, exp.Null)
             if null_side:
                 # `is not null` parses as Not(Is(...)), so polarity comes from the parent.
@@ -755,7 +863,7 @@ def _role(column: exp.Column) -> ColumnRole | None:
                     if isinstance(node.parent, exp.Not)
                     else ColumnRole.NULL_CHECK
                 )
-        if comparison is None:
+        if comparison is None and predicate_scope:
             if isinstance(node, _EQUALITY_NODES):
                 comparison = ColumnRole.EQUALITY
             elif isinstance(node, _RANGE_NODES):
@@ -786,11 +894,18 @@ def extract_usage(
     except OptimizeError as exc:
         raise UnqualifiableQuery(str(exc)) from exc
 
-    alias_to_table = {t.alias_or_name: t.name for t in qualified.find_all(exp.Table)}
+    tables = tuple(qualified.find_all(exp.Table))
+    alias_to_table = {t.alias_or_name: t.name for t in tables}
+    # qualify() only qualifies columns inside SELECT scopes. In single-table DML
+    # (`UPDATE orders ... WHERE created_at < $1`) the columns come back bare — verified:
+    # column.table == '' — but the target table is unambiguous, so attribute them to it.
+    # With more than one table in scope (UPDATE ... FROM) the attribution would be a
+    # guess, so those columns are dropped rather than misattributed.
+    sole_table = tables[0].name if len(tables) == 1 else None
 
     seen: set[tuple[str, str, ColumnRole]] = set()
     for column in qualified.find_all(exp.Column):
-        table = alias_to_table.get(column.table)
+        table = alias_to_table.get(column.table) if column.table else sole_table
         if not table or not column.name:
             continue
         role = _role(column)
