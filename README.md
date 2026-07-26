@@ -765,7 +765,10 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   exists.
 - **ADV003 cannot see partial-index predicates.** It compares column lists only, so it
   could recommend dropping a partial index in favor of a wider full index that does not
-  actually cover the same rows.
+  actually cover the same rows. Its confidence is capped at MEDIUM for that reason, and
+  the caveat is repeated in the proposal's own rationale — a README does not travel
+  inside the `.sql` file you run. `advise` cannot tell you which of the two indexes is
+  partial or expression-based; you have to check.
 - **One schema per run.** Every catalog fact is keyed on the bare relation name — table
   sizes, NDV statistics, index lists and the `qualify()` schema all merge across schemas —
   so `orders` in two schemas would alias into one another and the last catalog row read
