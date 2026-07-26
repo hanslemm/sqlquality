@@ -121,6 +121,15 @@ class ColumnUsage:
     role: ColumnRole
     calls: int
     cost_ms: float
+    #: Fraction of the *whole* analyzed window's cost carried by queries using this column
+    #: in this role. Deliberately **not** a partition — the shares do not sum to 1:
+    #:
+    #: * A query filtering on two columns credits its full cost to *both* entries, because
+    #:   both predicates really are involved in that cost. (This is why proposals take the
+    #:   max cost_share over their columns rather than the sum — summing double-counts.)
+    #: * The denominator includes queries that were skipped as unparseable or
+    #:   unqualifiable, so poor schema coverage dilutes every surviving share rather than
+    #:   silently inflating it. Read it alongside the report's skipped counts.
     cost_share: float
     fingerprints: int
 
