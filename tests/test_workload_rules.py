@@ -20,7 +20,9 @@ from sqlquality.workload.postgres import (
 )
 
 
-def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders"):
+def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1",)):
+    """`fps` defaults to a single shared fingerprint, so usages co-occur unless a test
+    deliberately gives them disjoint sets."""
     return ColumnUsage(
         table=table,
         column=column,
@@ -28,7 +30,8 @@ def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders"):
         calls=10,
         cost_ms=cost_ms,
         cost_share=cost_share,
-        fingerprints=1,
+        fingerprints=len(fps),
+        fingerprint_ids=frozenset(fps),
     )
 
 
@@ -306,6 +309,69 @@ def test_partial_index_polarity_follows_the_predicate():
     )
     assert "IS NULL" in proposals[0].ddl
     assert "IS NOT NULL" not in proposals[0].ddl
+
+
+def test_no_partial_index_when_the_columns_never_co_occur():
+    """Two independently hot columns are not evidence for a partial index.
+
+    If query A filters `status = $1` and query B checks `shipped_at IS NOT NULL`, a partial
+    index on status guarded by shipped_at helps neither — A does not satisfy the guard and
+    B does not use the indexed column. It only costs writes.
+    """
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a",)),
+            usage(
+                "shipped_at",
+                ColumnRole.NOT_NULL_CHECK,
+                cost_share=0.4,
+                cost_ms=40.0,
+                fps=("fp_b",),
+            ),
+        ],
+        facts(),
+        min_cost_share=0.01,
+    )
+    assert proposals == []
+
+
+def test_partial_index_reports_the_co_occurrence_that_justifies_it():
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a", "fp_b")),
+            usage(
+                "shipped_at",
+                ColumnRole.NOT_NULL_CHECK,
+                cost_share=0.4,
+                cost_ms=40.0,
+                fps=("fp_b", "fp_c"),
+            ),
+        ],
+        facts(),
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV004"]
+    assert proposals[0].evidence["co_occurring_fingerprints"] == 1
+
+
+def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
+    """A cheaper pair that co-occurs beats a hotter pair that does not."""
+    proposals = propose_partial_indexes(
+        [
+            usage("status", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp_lonely",)),
+            usage("region", ColumnRole.EQUALITY, cost_ms=50.0, fps=("fp_shared",)),
+            usage(
+                "shipped_at",
+                ColumnRole.NOT_NULL_CHECK,
+                cost_share=0.4,
+                cost_ms=40.0,
+                fps=("fp_shared",),
+            ),
+        ],
+        facts(columns=("status", "region", "shipped_at")),
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("region",)
 
 
 def test_no_partial_index_without_an_equality_column_to_index():

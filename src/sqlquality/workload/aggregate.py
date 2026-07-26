@@ -16,6 +16,9 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
     calls: dict[_Key, int] = defaultdict(int)
     cost: dict[_Key, float] = defaultdict(float)
     fingerprints: dict[_Key, int] = defaultdict(int)
+    #: Which query groups contributed each usage, so downstream rules can ask whether two
+    #: usages co-occur in a single query rather than merely both being hot on the table.
+    contributors: dict[_Key, set[str]] = defaultdict(set)
     tables: set[str] = set()
     skipped_unqualifiable = 0
 
@@ -30,6 +33,7 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
             calls[key] += stat.calls
             cost[key] += stat.total_time_ms
             fingerprints[key] += 1
+            contributors[key].add(stat.fingerprint)
             tables.add(key[0])
 
     # The denominator is the whole window's cost, including stats we could not analyze.
@@ -50,6 +54,7 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
                     cost_ms=cost[(table, column, role)],
                     cost_share=(cost[(table, column, role)] / total) if total else 0.0,
                     fingerprints=fingerprints[(table, column, role)],
+                    fingerprint_ids=frozenset(contributors[(table, column, role)]),
                 )
                 for (table, column, role) in calls
             ),
