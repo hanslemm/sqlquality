@@ -685,7 +685,9 @@ def advise(
         None, "--profiles-dir", help="Directory holding profiles.yml (default: ~/.dbt)."
     ),
     schema: list[str] = typer.Option(
-        ["public"], "--schema", help="Schema to introspect. One at a time (see --help notes)."
+        ["public"],
+        "--schema",
+        help="Schema to introspect. One at a time — passing two is rejected.",
     ),
     since: str | None = typer.Option(
         None, "--since", help="Window, e.g. 7d. Not supported by pg_stat_statements."

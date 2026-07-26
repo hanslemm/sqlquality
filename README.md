@@ -382,11 +382,15 @@ review and apply by hand.
 
 - **HIGH** — cost share above `--min-cost-share`, **and** supporting catalog stats present
   (e.g. NDV), **and** confirmation that the proposed index does not already exist.
-- **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 is
-  capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last statistics
-  reset, so zero scans can never prove an index is unused across a full business cycle.
-- **LOW** — thin evidence, e.g. the row count is unknown so the small-table floor could
-  not be checked.
+- **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 and
+  ADV003 are capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last
+  statistics reset, so zero scans can never prove an index is unused across a full business
+  cycle, and ADV003 compares column lists without being able to see a partial index's
+  predicate.
+- **LOW** — thin evidence, and specifically **any check that could not be run**: the row
+  count is unknown so the small-table floor could not be applied, or the existing-index
+  list was denied so "no index already covers this" could not be confirmed. Absent
+  evidence lowers confidence; it is never assumed away.
 
 Every proposal's evidence renders inline (cost share, calls, fingerprints, row estimate,
 NDV, existing index state) so it can be judged from the report alone.
@@ -405,11 +409,11 @@ NDV, existing index state) so it can be judged from the report alone.
 
 -- ADV001 [high, 67.0% of workload cost]
 -- Add index on orders(status)
-CREATE INDEX ON "orders" ("status");
+CREATE INDEX ON "public"."orders" ("status");
 
 -- ADV002 [medium]
 -- Drop unused index idx_orders_customer_ref on orders
-DROP INDEX "idx_orders_customer_ref";
+DROP INDEX "public"."idx_orders_customer_ref";
 ```
 
 `--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
