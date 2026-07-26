@@ -595,11 +595,17 @@ def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
     Says "N of M" rather than just "N". Printing ``len(stats)`` as *analyzed* next to
     "2 unresolvable" contradicts itself on a single line — and does so least accurately
     exactly when coverage is worst, which is the situation the line exists to reveal.
+
+    ``skipped_noise`` is reported as "filtered", not "introspection/DDL". The filter is a
+    statement-prefix match, so it also swallows `DECLARE cur CURSOR FOR SELECT ...` and
+    `COPY (SELECT ...) TO STDOUT` — ordinary reads with real predicates, and what every
+    psycopg2 server-side cursor emits. Calling those introspection or DDL told the user
+    their hot reads were maintenance traffic. "filtered" claims only what is true.
     """
     return (
         f"analyzed {_analyzed_count(workload, aggregation)} of {len(workload.stats)} "
         f"query group(s); skipped {workload.skipped_unparseable} unparseable, "
-        f"{workload.skipped_noise} introspection/DDL, "
+        f"{workload.skipped_noise} filtered, "
         f"{aggregation.skipped_unqualifiable} unresolvable"
     )
 

@@ -275,7 +275,7 @@ designed but not built — see [Limitations](#limitations).
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics
 engine: postgres (credentials from --dsn)
 window: since stats reset at 2026-07-19 03:00:00+00
-analyzed 3 of 3 query group(s); skipped 0 unparseable, 0 introspection/DDL, 0 unresolvable
+analyzed 3 of 3 query group(s); skipped 0 unparseable, 0 filtered, 0 unresolvable
                 Advise — postgres (5 proposals, 3 query groups)
 ┏━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ code   ┃ conf   ┃ cost share ┃ proposal                                      ┃
@@ -466,7 +466,7 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
 JSON paths all print how many query groups were actually understood:
 
 ```console
-analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 introspection/DDL, 1 unresolvable
+analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 filtered, 1 unresolvable
 low coverage: 33% of candidate statements could not be analyzed (0 unparseable, 1
 unresolvable against the schema). Cost shares are computed against the whole window, so
 they are diluted and --min-cost-share is effectively stricter — few or no proposals may
@@ -759,6 +759,22 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   statements that could not be parsed or resolved against the schema, so poor coverage
   dilutes every share and makes `--min-cost-share` effectively stricter; the CLI warns
   when coverage is poor, and the report always prints the skip counts.
+- **Join keys and grouping columns are measured and then ignored.** `advise` classifies
+  eight column roles and cost-weights all of them, but only five are read by the proposal
+  rules. A hot unindexed foreign-key join produces `orders.customer_id join cost_share
+  1.0` and **no proposal at all** — arguably the most valuable index recommendation in a
+  relational workload, measured and discarded. Same for `GROUP BY` columns. Compounding
+  it: any column under a `JOIN` is classified as a join key, so a predicate you placed in
+  an `ON` clause (as `LEFT JOIN` semantics require) is not treated as a filter and drops
+  out of ADV001's reach too. Proposing on join keys is a follow-up, not a bug fix.
+- **`DECLARE` and `COPY` statements are discarded whole.** The noise filter matches on the
+  leading keyword, so `DECLARE cur CURSOR FOR SELECT ... WHERE ...` and
+  `COPY (SELECT ... WHERE ...) TO STDOUT` are dropped along with the session-control and
+  DDL traffic the filter is for — predicates and all. Django's `QuerySet.iterator()` and
+  every psycopg2 server-side cursor emit the first form, so on a Django codebase this can
+  be most of your hot reads. They are counted, and the skip line calls them `filtered`
+  rather than pretending they were introspection or DDL, but they are not analyzed.
+  Unwrapping to the inner `SELECT` is a follow-up.
 - **Expression indexes are invisible to the catalog query.** Postgres's `pg_index.indkey`
   holds `0` for an expression column, which matches no `pg_attribute` row, so ADV001 may
   propose a plain-column index whose `lower(col)` expression-index equivalent already

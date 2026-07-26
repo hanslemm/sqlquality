@@ -154,7 +154,10 @@ def test_markdown_discloses_the_window_and_the_skips():
     )
     assert "since stats reset at 2026-07-01" in md
     assert "2 unparseable" in md
-    assert "7 introspection/DDL" in md
+    # Not "introspection/DDL": the same counter also swallows DECLARE ... CURSOR FOR SELECT
+    # and COPY (SELECT ...), which are ordinary reads. "filtered" claims only what is true.
+    assert "7 filtered" in md
+    assert "introspection/DDL" not in md
     assert "3 unresolvable" in md
 
 

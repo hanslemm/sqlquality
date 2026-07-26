@@ -163,6 +163,30 @@ STAR_ONLY_ROWS = {
 }
 
 
+def test_the_filtered_counter_does_not_claim_introspection_or_ddl(monkeypatch):
+    """`DECLARE cur CURSOR FOR SELECT ...` and `COPY (SELECT ...) TO STDOUT` are reads.
+
+    Django's `QuerySet.iterator()` and every psycopg2 server-side cursor emit exactly the
+    first form, so a Django shop's hot reads land in this counter — and were then reported
+    as "introspection/DDL", i.e. as maintenance traffic nobody needed to care about, on the
+    one line that exists to disclose what was lost.
+    """
+    _stub_adapter(
+        monkeypatch,
+        {
+            "pg_stat_statements": [
+                ("declare cur cursor for select id from orders where status = $1", 9, 900.0, 9),
+                ("copy (select id from orders where status = $1) to stdout", 5, 500.0, 5),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+        },
+    )
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "2 filtered" in result.output
+    assert "introspection/DDL" not in result.output
+
+
 def test_a_bare_select_star_table_is_still_introspected(monkeypatch):
     """ADV006 was inert for exactly the case it exists to catch.
 
