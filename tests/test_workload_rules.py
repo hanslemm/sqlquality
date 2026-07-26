@@ -12,6 +12,7 @@ from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SEL
 from sqlquality.workload.postgres import (
     PgIndex,
     PostgresWorkloadAdapter,
+    _quote_ident,
     propose_indexes,
     propose_partial_indexes,
     propose_redundant_indexes,
@@ -498,7 +499,7 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
     proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
 
-    drops = [p for p in proposals if p.ddl == "DROP INDEX idx_narrow;"]
+    drops = [p for p in proposals if p.ddl == 'DROP INDEX "idx_narrow";']
     assert len(drops) == 1
     assert drops[0].code == "ADV003"
 
@@ -615,3 +616,56 @@ def test_render_ddl_recommends_concurrently_for_index_creation():
     ]
     script = PostgresWorkloadAdapter().render_ddl(proposals)
     assert "CONCURRENTLY" in script
+
+
+def test_generated_ddl_quotes_identifiers():
+    """Unquoted identifiers break on anything needing quotes — mixed case, reserved words."""
+    proposals = propose_indexes(
+        [usage("Status", ColumnRole.EQUALITY, table="Order")],
+        {
+            "Order": TableFacts(
+                name="Order",
+                row_estimate=10**6,
+                size_bytes=10**8,
+                columns=("Status",),
+                ndv={"Status": 5000.0},
+            )
+        },
+        {},
+        min_cost_share=0.01,
+    )
+    assert proposals[0].ddl == 'CREATE INDEX ON "Order" ("Status");'
+
+
+def test_a_newline_in_an_identifier_cannot_smuggle_a_statement():
+    """The invariant test alone is not enough, because a smuggled statement ends in ';'.
+
+    Measured before identifiers were quoted: a table named `orders\\nDROP TABLE users; --`
+    produced a line `DROP TABLE users; -- (status);` that *passed* the comment-or-semicolon
+    check. Quoting collapses the identifier into one token so it cannot span lines.
+    """
+    hostile = "orders\nDROP TABLE users; --"
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY, table=hostile)],
+        {
+            hostile: TableFacts(
+                name=hostile,
+                row_estimate=10**6,
+                size_bytes=10**8,
+                columns=("status",),
+                ndv={"status": 5000.0},
+            )
+        },
+        {},
+        min_cost_share=0.01,
+    )
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "DROP TABLE users;" not in script
+    for line in script.splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith("--") or line.rstrip().endswith(";"), f"bare line: {line!r}"
+
+
+def test_quote_ident_doubles_an_embedded_quote():
+    assert _quote_ident('we"ird') == '"we""ird"'
