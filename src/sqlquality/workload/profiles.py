@@ -13,8 +13,17 @@ from pathlib import Path
 
 import yaml
 
-#: dbt's env_var() Jinja call, the one templating form that appears in real profiles.
-_ENV_VAR = re.compile(r"\{\{\s*env_var\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\)\s*\}\}")
+#: dbt's env_var() Jinja call, in both its forms: env_var('NAME') and the two-argument
+#: env_var('NAME', 'default'). The second form is common in real profiles, and matching
+#: only the first leaves literal `{{ ... }}` text in a host or port value.
+_ENV_VAR = re.compile(
+    r"\{\{\s*env_var\(\s*['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"
+    r"(?:\s*,\s*['\"](?P<default>[^'\"]*)['\"])?\s*\)\s*\}\}"
+)
+#: Any Jinja left after interpolation. sqlquality resolves env_var() only — it is not a
+#: Jinja engine — and passing an unresolved `{{ ... }}` through as a hostname produces a
+#: baffling connection error, so this fails loudly instead.
+_UNRESOLVED_JINJA = re.compile(r"\{\{|\{%")
 
 #: dbt adapter type -> sqlquality engine name.
 ENGINE_BY_DBT_TYPE = {"postgres": "postgres", "redshift": "redshift", "snowflake": "snowflake"}
@@ -24,17 +33,32 @@ class ProfileError(ValueError):
     """Raised when profiles.yml is missing, malformed, or references an unset env var."""
 
 
-def _interpolate(value: object, env: Mapping[str, str]) -> str:
-    """Substitute env_var() references, or raise naming the missing variable."""
+def _interpolate(key: str, value: object, env: Mapping[str, str]) -> str:
+    """Substitute env_var() references, or raise naming the missing variable.
+
+    Never includes the resolved value in an error message: these fields can hold a
+    password, and an exception message ends up in CI logs and stack traces.
+    """
     text = str(value)
 
     def replace(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if name not in env:
-            raise ProfileError(f"profiles.yml references env_var('{name}') but {name} is not set")
-        return env[name]
+        name = match.group("name")
+        if name in env:
+            return env[name]
+        default = match.group("default")
+        if default is not None:
+            return default
+        raise ProfileError(f"profiles.yml references env_var('{name}') but {name} is not set")
 
-    return _ENV_VAR.sub(replace, text)
+    resolved = _ENV_VAR.sub(replace, text)
+    if _UNRESOLVED_JINJA.search(resolved):
+        # The field name only — never the value, which may be or contain a secret.
+        raise ProfileError(
+            f"profiles.yml field '{key}' contains Jinja that sqlquality cannot resolve. "
+            "Only env_var('NAME') and env_var('NAME', 'default') are supported — render "
+            "the profile with dbt first, or pass --dsn instead."
+        )
+    return resolved
 
 
 def read_profiles_file(profiles_dir: Path) -> dict:
@@ -79,5 +103,5 @@ def read_output(
             f"dbt adapter type '{dbt_type}' has no workload adapter. "
             f"Supported: {', '.join(sorted(ENGINE_BY_DBT_TYPE))}."
         )
-    fields = {k: _interpolate(v, env) for k, v in output.items() if k != "type"}
+    fields = {k: _interpolate(k, v, env) for k, v in output.items() if k != "type"}
     return engine, fields
