@@ -366,6 +366,158 @@ def test_a_denied_statement_degrades_and_names_the_privilege():
     assert any("pg_stats" in reason for _, reason in adapter.degraded)
 
 
+class _FakeCursor:
+    """Enough of a psycopg cursor for connect()'s two session-setup statements."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return []
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.cursors: list[_FakeCursor] = []
+
+    def cursor(self):
+        cursor = _FakeCursor()
+        self.cursors.append(cursor)
+        return cursor
+
+
+def _install_fake_psycopg(monkeypatch, seen: dict):
+    """A psycopg that records the conninfo it was handed and connects successfully."""
+    import sys
+    import types
+
+    module = types.ModuleType("psycopg")
+
+    def connect(conninfo, **kwargs):
+        seen["conninfo"] = conninfo
+        return _FakeConnection()
+
+    module.connect = connect  # type: ignore[attr-defined]
+    module.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", module)
+    return module
+
+
+def test_profile_tls_settings_are_forwarded_to_the_driver(monkeypatch):
+    """A profile asking for verify-full must not connect under libpq's default `prefer`.
+
+    Silently downgrading certificate verification for a tool pitched as safe to point at
+    production is the wrong default, and the user was never told.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="postgres",
+        dsn=None,
+        fields={
+            "host": "db",
+            "user": "hans",
+            "password": "hunter2",
+            "sslmode": "verify-full",
+            "sslrootcert": "/etc/ssl/ca.crt",
+            "sslcert": "/etc/ssl/client.crt",
+            "sslkey": "/etc/ssl/client.key",
+            "connect_timeout": "10",
+        },
+        source="profiles.yml",
+    )
+    PostgresWorkloadAdapter().connect(params, 30)
+    conninfo = seen["conninfo"]
+    assert "sslmode=verify-full" in conninfo
+    assert "sslrootcert=/etc/ssl/ca.crt" in conninfo
+    assert "sslcert=/etc/ssl/client.crt" in conninfo
+    assert "sslkey=/etc/ssl/client.key" in conninfo
+    assert "connect_timeout=10" in conninfo
+
+
+def test_dropped_profile_keys_are_named_on_stderr(monkeypatch, capsys):
+    """A key we cannot forward must be reported, not discarded in silence."""
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="postgres",
+        dsn=None,
+        fields={
+            "host": "db",
+            "user": "hans",
+            "password": "hunter2",
+            "search_path": "app",
+            "threads": "4",
+        },
+        source="profiles.yml",
+    )
+    PostgresWorkloadAdapter().connect(params, 30)
+    warning = capsys.readouterr().err
+    assert "search_path" in warning
+    assert "threads" in warning
+    # Key names only — never a value, since one of them could be a secret.
+    assert "hunter2" not in warning
+    assert "app" not in warning
+
+
+def test_forwarded_and_mapped_keys_are_not_reported_as_dropped(monkeypatch, capsys):
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="postgres",
+        dsn=None,
+        fields={"host": "db", "dbname": "x", "user": "u", "password": "p", "sslmode": "require"},
+        source="profiles.yml",
+    )
+    PostgresWorkloadAdapter().connect(params, 30)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_conninfo_build_failure_is_scrubbed_like_a_connect_failure(monkeypatch):
+    """make_conninfo ran outside the scrubbing envelope, so its message was unfiltered.
+
+    psycopg raises from make_conninfo on an unusable keyword, and that message can quote
+    the offending value — which for a `password` keyword is the password.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("psycopg")
+
+    def never_called(conninfo, **kwargs):
+        raise AssertionError("must not reach connect() when the conninfo cannot be built")
+
+    def explode(**kwargs):
+        raise RuntimeError(f"invalid connection option: {sorted(kwargs.items())}")
+
+    module.connect = never_called  # type: ignore[attr-defined]
+    module.conninfo = types.SimpleNamespace(make_conninfo=explode)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", module)
+
+    params = ConnectionParams(
+        engine="postgres",
+        dsn=None,
+        fields={"host": "db", "user": "hans", "password": "hunter2"},
+        source="profiles.yml",
+    )
+    with pytest.raises(ConnectionError) as exc:
+        PostgresWorkloadAdapter().connect(params, 30)
+    assert "hunter2" not in str(exc.value)
+    assert "***" in str(exc.value)
+    assert exc.value.__context__ is None
+
+
 def test_connect_without_psycopg_installed_raises_a_helpful_import_error(monkeypatch):
     import builtins
 

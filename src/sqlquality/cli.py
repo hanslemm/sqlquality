@@ -37,7 +37,7 @@ from sqlquality.report import (
 )
 from sqlquality.sqlast import SqlParseError, analyze_sql, parse, strip_jinja
 from sqlquality.workload import get_workload_adapter
-from sqlquality.workload.aggregate import aggregate
+from sqlquality.workload.aggregate import aggregate, star_tables
 from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
 from sqlquality.workload.fingerprint import ingest
 
@@ -770,7 +770,12 @@ def advise(
     workload = ingest(fetch, params.engine, keep_literals=keep_literals)
     db_schema = adapter.fetch_schema(schemas)
     aggregation = aggregate(workload, db_schema, params.engine)
-    facts = adapter.fetch_table_facts(schemas, aggregation.tables)
+    # A `select *` with no predicates produces no column usage, so its table never reaches
+    # `aggregation.tables` — and the wide-table rule that exists to catch exactly that
+    # query had no column count to test against. Union those tables in before fetching.
+    facts = adapter.fetch_table_facts(
+        schemas, aggregation.tables | star_tables(workload, db_schema)
+    )
     proposals = adapter.propose(aggregation, facts, workload, min_cost_share=min_cost_share)
 
     payload = advise_payload(
@@ -781,19 +786,31 @@ def advise(
         redacted=not keep_literals,
         degraded=adapter.degraded,
     )
+    # Both writes happen after the whole analysis, so an unwritable path would otherwise
+    # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate
+    # failure", which would make CI read a healthy advisory run as a failed gate. Same
+    # house pattern as read_sql_file: name the path, exit 2.
     if markdown is not None:
-        markdown.write_text(
-            render_advise_markdown(
-                proposals,
-                workload,
-                aggregation,
-                engine=params.engine,
-                redacted=not keep_literals,
-                degraded=adapter.degraded,
+        try:
+            markdown.write_text(
+                render_advise_markdown(
+                    proposals,
+                    workload,
+                    aggregation,
+                    engine=params.engine,
+                    redacted=not keep_literals,
+                    degraded=adapter.degraded,
+                )
             )
-        )
+        except OSError as exc:
+            typer.echo(f"Could not write --markdown {markdown}: {exc}", err=True)
+            raise typer.Exit(code=2)
     if ddl is not None:
-        ddl.write_text(adapter.render_ddl(proposals))
+        try:
+            ddl.write_text(adapter.render_ddl(proposals))
+        except OSError as exc:
+            typer.echo(f"Could not write --ddl {ddl}: {exc}", err=True)
+            raise typer.Exit(code=2)
 
     if json_out:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
