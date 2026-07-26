@@ -5,6 +5,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, build_scope
 
 from sqlquality.models import ColumnRole
 
@@ -51,7 +52,7 @@ def _role(column: exp.Column) -> ColumnRole | None:
         return ColumnRole.NON_SARGABLE
 
     comparison: ColumnRole | None = None
-    node = column.parent
+    node: exp.Expr | None = column.parent
     while node is not None:
         if isinstance(node, exp.Is) and predicate_scope:
             null_side = isinstance(node.expression, exp.Null)
@@ -80,6 +81,44 @@ def _role(column: exp.Column) -> ColumnRole | None:
     return comparison
 
 
+def _scope_tables(scope: Scope) -> dict[str, str]:
+    """Alias (or bare name) -> real table name, for one scope only.
+
+    A sub-scope source (CTE, derived table) maps to a ``Scope``, not an ``exp.Table``.
+    Columns resolving to one of those reference a projection rather than a base-table
+    column, so they are omitted here and skipped — the sub-scope contributes its own base
+    tables when ``traverse()`` reaches it.
+    """
+    return {
+        name: source.name for name, source in scope.sources.items() if isinstance(source, exp.Table)
+    }
+
+
+def _record(seen: set[tuple[str, str, ColumnRole]], table: str | None, column: exp.Column) -> None:
+    """Add one (table, column, role) triple, skipping unattributable or unused columns."""
+    if not table or not column.name:
+        return
+    role = _role(column)
+    if role is None:
+        return
+    seen.add((table, column.name, role))
+
+
+def _collect_dml(qualified: exp.Expression, seen: set[tuple[str, str, ColumnRole]]) -> None:
+    """Attribute the columns of an UPDATE/DELETE to its sole target table.
+
+    ``qualify()`` leaves DML columns bare (``column.table == ''``) rather than raising.
+    With exactly one table in the statement the target is unambiguous; with more than one
+    (``UPDATE ... FROM``) attribution would be a guess, so bare columns are dropped
+    instead of misattributed.
+    """
+    tables = tuple(qualified.find_all(exp.Table))
+    aliases = {t.alias_or_name: t.name for t in tables}
+    sole_table = tables[0].name if len(tables) == 1 else None
+    for column in qualified.find_all(exp.Column):
+        _record(seen, aliases.get(column.table) if column.table else sole_table, column)
+
+
 def extract_usage(
     tree: exp.Expression, dialect: str, schema: dict
 ) -> tuple[tuple[str, str, ColumnRole], ...]:
@@ -93,22 +132,18 @@ def extract_usage(
     except OptimizeError as exc:
         raise UnqualifiableQuery(str(exc)) from exc
 
-    tables = tuple(qualified.find_all(exp.Table))
-    alias_to_table = {t.alias_or_name: t.name for t in tables}
-    # qualify() only qualifies columns inside SELECT scopes. In single-table DML
-    # (`UPDATE orders ... WHERE created_at < $1`) the columns come back bare — verified:
-    # column.table == '' — but the target table is unambiguous, so attribute them to it.
-    # With more than one table in scope (UPDATE ... FROM) the attribution would be a
-    # guess, so those columns are dropped rather than misattributed.
-    sole_table = tables[0].name if len(tables) == 1 else None
-
     seen: set[tuple[str, str, ColumnRole]] = set()
-    for column in qualified.find_all(exp.Column):
-        table = alias_to_table.get(column.table) if column.table else sole_table
-        if not table or not column.name:
-            continue
-        role = _role(column)
-        if role is None:
-            continue
-        seen.add((table, column.name, role))
+    root = build_scope(qualified)
+    if root is None:
+        # build_scope() returns None for UPDATE/DELETE — they are not SELECT-rooted.
+        _collect_dml(qualified, seen)
+    else:
+        # Resolve aliases per scope, never with one flat map over the whole tree. Two
+        # different tables in different scopes can share an alias, and a flat map keeps
+        # whichever `find_all` visited last — silently attributing an outer filter to an
+        # inner table and losing the outer one entirely.
+        for scope in root.traverse():
+            aliases = _scope_tables(scope)
+            for column in scope.columns:
+                _record(seen, aliases.get(column.table), column)
     return tuple(sorted(seen, key=lambda triple: (triple[0], triple[1], triple[2].value)))

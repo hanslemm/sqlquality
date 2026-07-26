@@ -13,7 +13,7 @@ SCHEMA = {
         "note": "TEXT",
         "shipped_at": "TIMESTAMP",
     },
-    "customers": {"id": "INT", "email": "TEXT"},
+    "customers": {"id": "INT", "email": "TEXT", "status": "TEXT"},
 }
 
 
@@ -132,6 +132,49 @@ def test_insert_from_select_attributes_the_source_table():
 
 def test_projected_comparison_is_not_a_predicate():
     assert _usage("select status = $1 as is_shipped from orders") == set()
+
+
+def test_reused_alias_across_scopes_does_not_corrupt_attribution():
+    """The bug a flat alias map causes.
+
+    Both scopes alias their table `o`. A single tree-wide map keeps whichever table
+    find_all visited last, so the outer filter on `orders` was attributed to `customers`
+    and the `orders` entries vanished entirely — a wrong index recommendation, silently.
+    """
+    usage = _usage(
+        "select o.id from orders o where o.status = $1 "
+        "and o.id in (select o.id from customers o where o.status = $2)"
+    )
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+    assert ("customers", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_distinct_aliases_across_scopes_both_resolve():
+    usage = _usage(
+        "select o.id from orders o where o.status = $1 "
+        "and o.id in (select c.id from customers c where c.status = $2)"
+    )
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+    assert ("customers", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_self_join_aliases_both_resolve_to_the_same_table():
+    usage = _usage(
+        "select a.id from orders a join orders b on b.customer_id = a.id where a.status = $1"
+    )
+    assert ("orders", "customer_id", ColumnRole.JOIN) in usage
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_cte_predicate_resolves_to_the_underlying_base_table():
+    """A CTE name is not a base table, so the outer predicate on it is skipped; the CTE's
+    own scope still contributes its real base-table predicate."""
+    usage = _usage(
+        "with recent as (select id, status from orders where created_at > $1) "
+        "select id from recent where status = $2"
+    )
+    assert ("orders", "created_at", ColumnRole.RANGE) in usage
+    assert not any(table == "recent" for table, _column, _role in usage)
 
 
 def test_unresolvable_column_raises_unqualifiable():
