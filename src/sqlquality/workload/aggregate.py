@@ -47,8 +47,10 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
                 )
                 for (table, column, role) in calls
             ),
-            key=lambda u: u.cost_ms,
-            reverse=True,
+            # Descending cost with a canonical tiebreak. Without the trailing keys, two
+            # logically identical workloads that happened to arrive in a different order
+            # produce different output order, and downstream tasks' tests depend on it.
+            key=lambda u: (-u.cost_ms, u.table, u.column, u.role.value),
         )
     )
     return Aggregation(

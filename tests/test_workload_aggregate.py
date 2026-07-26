@@ -72,6 +72,34 @@ def test_usage_is_sorted_by_cost_descending():
     assert agg.usage[0].column == "created_at"
 
 
+def test_equal_cost_entries_are_ordered_canonically_not_by_arrival():
+    """Two workloads differing only in arrival order must aggregate identically.
+
+    Sorting on cost alone leaves ties to Python's stable sort, which preserves insertion
+    order — so the same logical workload yields different output depending on the order
+    the engine happened to return rows in, and downstream tests become order-dependent.
+    """
+    forward = aggregate(
+        _workload(
+            ("select id from orders where status = $1", 1, 10.0),
+            ("select id from orders where created_at > $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    reverse = aggregate(
+        _workload(
+            ("select id from orders where created_at > $1", 1, 10.0),
+            ("select id from orders where status = $1", 1, 10.0),
+        ),
+        SCHEMA,
+        "postgres",
+    )
+    assert [(u.table, u.column, u.role) for u in forward.usage] == [
+        (u.table, u.column, u.role) for u in reverse.usage
+    ]
+
+
 def test_empty_workload_yields_empty_aggregation_and_no_division_error():
     agg = aggregate(Workload(stats=(), window_description="w"), SCHEMA, "postgres")
     assert agg.usage == ()
