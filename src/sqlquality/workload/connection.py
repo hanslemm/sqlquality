@@ -41,14 +41,15 @@ def read_profile(
     profiles_dir: Path, profile: str, target: str | None, env: Mapping[str, str]
 ) -> tuple[str, dict[str, str]]:
     """Read (engine, fields) from profiles.yml, re-raising as ConnectionResolutionError."""
+    message: str
     try:
         return read_output(profiles_dir, profile, target, env)
     except ProfileError as exc:
-        # `from None`, not `from exc`: str(exc) is already folded into this message, so
-        # chaining adds nothing — and profiles.py's own suppression (for the YAML-error
-        # case) would otherwise be defeated one boundary up, by re-attaching the
-        # ProfileError as this exception's __cause__.
-        raise ConnectionResolutionError(str(exc)) from None
+        message = str(exc)
+    # Raised outside the handler for the same reason as in read_profiles_file: a raise
+    # inside `except` would make the ProfileError this exception's __context__, and the
+    # chain has to be severed at every boundary crossing to be worth severing at all.
+    raise ConnectionResolutionError(message)
 
 
 def resolve_connection(
