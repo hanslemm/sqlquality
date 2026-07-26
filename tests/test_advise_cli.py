@@ -75,6 +75,7 @@ def test_low_coverage_warns_on_stderr(monkeypatch):
     )
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 0
+    assert "analyzed 1 of 3 query group(s)" in result.output
     assert "low coverage" in result.output
     assert "min-cost-share" in result.output
 
@@ -238,7 +239,7 @@ def test_coverage_is_disclosed_even_on_a_clean_run(monkeypatch):
     )
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 0
-    assert "analyzed 1 query group(s)" in result.output
+    assert "analyzed 1 of 1 query group(s)" in result.output
     assert "unparseable" in result.output
     assert "low coverage" not in result.output
 

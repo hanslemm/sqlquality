@@ -580,6 +580,30 @@ def _validate_timeout(value: int) -> int:
     return value
 
 
+def _analyzed_count(workload: Workload, aggregation: Aggregation) -> int:
+    """Query groups whose usage was actually extracted.
+
+    Unresolvable groups are a *subset* of ``workload.stats``, not a separate pool, so
+    ``len(stats)`` overstates what was understood.
+    """
+    return max(0, len(workload.stats) - aggregation.skipped_unqualifiable)
+
+
+def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
+    """One-line coverage disclosure, printed on every run.
+
+    Says "N of M" rather than just "N". Printing ``len(stats)`` as *analyzed* next to
+    "2 unresolvable" contradicts itself on a single line — and does so least accurately
+    exactly when coverage is worst, which is the situation the line exists to reveal.
+    """
+    return (
+        f"analyzed {_analyzed_count(workload, aggregation)} of {len(workload.stats)} "
+        f"query group(s); skipped {workload.skipped_unparseable} unparseable, "
+        f"{workload.skipped_noise} introspection/DDL, "
+        f"{aggregation.skipped_unqualifiable} unresolvable"
+    )
+
+
 def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | None:
     """A warning when too little of the workload could be analyzed, else None.
 
@@ -587,7 +611,7 @@ def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | Non
     deliberately filtered, not failures to understand. Only statements we tried and failed
     to use count against coverage.
     """
-    analyzed = max(0, len(workload.stats) - aggregation.skipped_unqualifiable)
+    analyzed = _analyzed_count(workload, aggregation)
     unexplained = workload.skipped_unparseable + aggregation.skipped_unqualifiable
     considered = analyzed + unexplained
     if not considered:
@@ -758,12 +782,7 @@ def advise(
     # Disclose coverage on every run, not only when it is bad. The markdown and JSON
     # reports always carry these counts; the terminal path should not be the one place a
     # user cannot see how much of their workload was actually understood.
-    typer.echo(
-        f"analyzed {len(workload.stats)} query group(s); skipped "
-        f"{workload.skipped_unparseable} unparseable, {workload.skipped_noise} "
-        f"introspection/DDL, {aggregation.skipped_unqualifiable} unresolvable",
-        err=True,
-    )
+    typer.echo(_coverage_line(workload, aggregation), err=True)
     coverage = _coverage_warning(workload, aggregation)
     if coverage is not None:
         typer.echo(coverage, err=True)
