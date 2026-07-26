@@ -640,11 +640,14 @@ git commit -m "feat(workload): ingest query history with literal redaction"
 - Consumes: `ColumnRole` (Task 1).
 - Produces:
   - `class UnqualifiableQuery(ValueError)`
-  - `extract_usage(tree: exp.Expression, dialect: str, schema: dict) -> tuple[tuple[str, str, ColumnRole], ...]` returning `(table, column, role)` triples with duplicates removed.
+  - `extract_usage(tree: exp.Expression, dialect: str, schema: dict) -> tuple[tuple[str, str, ColumnRole], ...]` returning `(table, column, role)` triples, deduplicated and deterministically sorted.
+  - Module-private helpers `_within`, `_role`, `_scope_tables`, `_record`, `_collect_dml`.
 
 Verified AST shapes this relies on: `qualify()` qualifies columns with the table **alias** (`o`, `c`), so an alias→table map is built from `exp.Table` nodes via `alias_or_name` → `name`. Ancestor chains: WHERE equality → `[EQ, Where]`; join key → `[EQ, Join]`; `ORDER BY` → `[Ordered, Order]`; `a is null` → `[Is, Where]`; `a is not null` → `[Is, Not, Where]`; `lower(a) = x` → `[Lower, EQ, Where]`; `a::text = x` → `[Cast, EQ, Where]`.
 
 Also verified, and the reason this task handles DML specially: `qualify()` does **not** raise on `UPDATE`/`DELETE`/`INSERT` — it returns them with columns left bare (`column.table == ''`). A naive alias lookup therefore drops every DML predicate silently, with no error and no skip count. And an `UPDATE ... SET status = $1` assignment parses to `[EQ, Update]` with no `Where` ancestor, so without the predicate-scope gate it reads as an equality filter on the column being written.
+
+**Alias resolution must be scope-aware.** A single tree-wide `{alias: table}` map built from `find_all(exp.Table)` is wrong: when two scopes reuse an alias, the map keeps whichever table was visited last. Verified against the built code — for `select o.id from orders o where o.status = $1 and o.id in (select o.id from customers o where o.status = $2)` a flat map yields only `('customers', 'status', EQUALITY)` and `('customers', 'id', EQUALITY)`; the outer filter on `orders` is attributed to `customers` and the `orders` entries disappear. Reused short aliases (`o`, `t`, `a`) are ordinary in hand-written correlated subqueries, so this is a realistic silent-wrong-advice path, not a corner case. `sqlglot.optimizer.scope.build_scope(qualified).traverse()` gives per-scope `sources` and `columns`, which resolves it. Verified: `build_scope` returns `None` for `UPDATE`/`DELETE` (not SELECT-rooted), which is why the DML fallback stays.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -783,6 +786,49 @@ def test_projected_comparison_is_not_a_predicate():
     assert _usage("select status = $1 as is_shipped from orders") == set()
 
 
+def test_reused_alias_across_scopes_does_not_corrupt_attribution():
+    """The bug a flat alias map causes.
+
+    Both scopes alias their table `o`. A single tree-wide map keeps whichever table
+    find_all visited last, so the outer filter on `orders` was attributed to `customers`
+    and the `orders` entries vanished entirely — a wrong index recommendation, silently.
+    """
+    usage = _usage(
+        "select o.id from orders o where o.status = $1 "
+        "and o.id in (select o.id from customers o where o.status = $2)"
+    )
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+    assert ("customers", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_distinct_aliases_across_scopes_both_resolve():
+    usage = _usage(
+        "select o.id from orders o where o.status = $1 "
+        "and o.id in (select c.id from customers c where c.status = $2)"
+    )
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+    assert ("customers", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_self_join_aliases_both_resolve_to_the_same_table():
+    usage = _usage(
+        "select a.id from orders a join orders b on b.customer_id = a.id where a.status = $1"
+    )
+    assert ("orders", "customer_id", ColumnRole.JOIN) in usage
+    assert ("orders", "status", ColumnRole.EQUALITY) in usage
+
+
+def test_cte_predicate_resolves_to_the_underlying_base_table():
+    """A CTE name is not a base table, so the outer predicate on it is skipped; the CTE's
+    own scope still contributes its real base-table predicate."""
+    usage = _usage(
+        "with recent as (select id, status from orders where created_at > $1) "
+        "select id from recent where status = $2"
+    )
+    assert ("orders", "created_at", ColumnRole.RANGE) in usage
+    assert not any(table == "recent" for table, _column, _role in usage)
+
+
 def test_unresolvable_column_raises_unqualifiable():
     tree = sqlglot.parse_one("select nope from mystery_table", dialect="postgres")
     with pytest.raises(UnqualifiableQuery):
@@ -806,6 +852,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, build_scope
 
 from sqlquality.models import ColumnRole
 
@@ -881,6 +928,48 @@ def _role(column: exp.Column) -> ColumnRole | None:
     return comparison
 
 
+def _scope_tables(scope: Scope) -> dict[str, str]:
+    """Alias (or bare name) -> real table name, for one scope only.
+
+    A sub-scope source (CTE, derived table) maps to a ``Scope``, not an ``exp.Table``.
+    Columns resolving to one of those reference a projection rather than a base-table
+    column, so they are omitted here and skipped — the sub-scope contributes its own base
+    tables when ``traverse()`` reaches it.
+    """
+    return {
+        name: source.name
+        for name, source in scope.sources.items()
+        if isinstance(source, exp.Table)
+    }
+
+
+def _record(
+    seen: set[tuple[str, str, ColumnRole]], table: str | None, column: exp.Column
+) -> None:
+    """Add one (table, column, role) triple, skipping unattributable or unused columns."""
+    if not table or not column.name:
+        return
+    role = _role(column)
+    if role is None:
+        return
+    seen.add((table, column.name, role))
+
+
+def _collect_dml(qualified: exp.Expression, seen: set[tuple[str, str, ColumnRole]]) -> None:
+    """Attribute the columns of an UPDATE/DELETE to its sole target table.
+
+    ``qualify()`` leaves DML columns bare (``column.table == ''``) rather than raising.
+    With exactly one table in the statement the target is unambiguous; with more than one
+    (``UPDATE ... FROM``) attribution would be a guess, so bare columns are dropped
+    instead of misattributed.
+    """
+    tables = tuple(qualified.find_all(exp.Table))
+    aliases = {t.alias_or_name: t.name for t in tables}
+    sole_table = tables[0].name if len(tables) == 1 else None
+    for column in qualified.find_all(exp.Column):
+        _record(seen, aliases.get(column.table) if column.table else sole_table, column)
+
+
 def extract_usage(
     tree: exp.Expression, dialect: str, schema: dict
 ) -> tuple[tuple[str, str, ColumnRole], ...]:
@@ -894,24 +983,20 @@ def extract_usage(
     except OptimizeError as exc:
         raise UnqualifiableQuery(str(exc)) from exc
 
-    tables = tuple(qualified.find_all(exp.Table))
-    alias_to_table = {t.alias_or_name: t.name for t in tables}
-    # qualify() only qualifies columns inside SELECT scopes. In single-table DML
-    # (`UPDATE orders ... WHERE created_at < $1`) the columns come back bare — verified:
-    # column.table == '' — but the target table is unambiguous, so attribute them to it.
-    # With more than one table in scope (UPDATE ... FROM) the attribution would be a
-    # guess, so those columns are dropped rather than misattributed.
-    sole_table = tables[0].name if len(tables) == 1 else None
-
     seen: set[tuple[str, str, ColumnRole]] = set()
-    for column in qualified.find_all(exp.Column):
-        table = alias_to_table.get(column.table) if column.table else sole_table
-        if not table or not column.name:
-            continue
-        role = _role(column)
-        if role is None:
-            continue
-        seen.add((table, column.name, role))
+    root = build_scope(qualified)
+    if root is None:
+        # build_scope() returns None for UPDATE/DELETE — they are not SELECT-rooted.
+        _collect_dml(qualified, seen)
+    else:
+        # Resolve aliases per scope, never with one flat map over the whole tree. Two
+        # different tables in different scopes can share an alias, and a flat map keeps
+        # whichever `find_all` visited last — silently attributing an outer filter to an
+        # inner table and losing the outer one entirely.
+        for scope in root.traverse():
+            aliases = _scope_tables(scope)
+            for column in scope.columns:
+                _record(seen, aliases.get(column.table), column)
     return tuple(sorted(seen, key=lambda triple: (triple[0], triple[1], triple[2].value)))
 ```
 
