@@ -2673,7 +2673,10 @@ Add `from dataclasses import dataclass` and `from sqlquality.models import RawQu
             # Raised after the handler, and scrubbed: Task 6 established that a dependency's
             # exception text is exactly where this class of leak hides, and that leaving the
             # handler is the only way to keep the original out of __context__.
-            raise ConnectionError(f"Could not connect: {failure}")
+            # No "Could not connect" prefix here — the CLI adds it. Prefixing at both
+            # layers printed "Could not connect: Could not connect: ..." on the most
+            # common failure a user hits.
+            raise ConnectionError(failure)
 
         def query(sql: str, bind: tuple[object, ...]) -> list[tuple[object, ...]]:
             with connection.cursor() as cur:
@@ -4562,6 +4565,71 @@ def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
     assert "REVIEW BEFORE RUNNING" in ddl.read_text()
 
 
+def test_real_adapter_connection_failure_is_reported_once(monkeypatch):
+    """Exercises the real adapter's error string through the CLI's handler.
+
+    Every other connection test monkeypatches `PostgresWorkloadAdapter.connect` itself, so
+    none of them cover the seam between the adapter's message and the CLI's prefix — which
+    is where a doubled "Could not connect: Could not connect: ..." went unnoticed. This
+    patches `psycopg` instead, leaving the real `connect()` to run.
+    """
+    import sys
+    import types
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def explode(conninfo, **kwargs):
+        raise RuntimeError("connection to server at \"db\" failed")
+
+    fake_psycopg.connect = explode  # type: ignore[attr-defined]
+    fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u:hunter2@db/x"])
+    assert result.exit_code == 2
+    assert result.output.count("Could not connect") == 1
+    assert "connection to server" in result.output
+    # And the inline DSN password still must not surface on this path.
+    assert "hunter2" not in result.output
+
+
+def test_dry_run_honours_json(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("--dry-run must not connect")
+
+    monkeypatch.setattr(
+        "sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode
+    )
+    result = runner.invoke(app, ["advise", "--engine", "postgres", "--dry-run", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["engine"] == "postgres"
+    capabilities = {s["capability"] for s in payload["statements"]}
+    assert "workload" in capabilities
+    assert all(s["privilege_hint"] for s in payload["statements"])
+
+
+def test_coverage_is_disclosed_even_on_a_clean_run(monkeypatch):
+    """The terminal path should not be the one place coverage is invisible."""
+    _stub_adapter(monkeypatch, {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": WIDE_COLUMNS,
+        "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
+        "pg_stats": [("orders", "status", 5000.0)],
+        "pg_index": [],
+    })
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "analyzed 1 query group(s)" in result.output
+    assert "unparseable" in result.output
+    assert "low coverage" not in result.output
+
+
 def test_connection_failure_exits_2(monkeypatch):
     from sqlquality.workload.postgres import PostgresWorkloadAdapter
 
@@ -4610,6 +4678,11 @@ _TIMEOUT_MAX_S = 3600
 #: Without this warning, "no proposals" is indistinguishable from "I understood almost none
 #: of your workload".
 _LOW_COVERAGE_FRACTION = 0.2
+
+
+def _plural(count: int, noun: str) -> str:
+    """`3 proposals` / `1 proposal`. Small, but "1 proposals" reads as a bug in the tool."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _validate_timeout(value: int) -> int:
@@ -4706,7 +4779,29 @@ def advise(
         except ValueError as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(code=2)
-        for statement in adapter.introspection_sql():
+        statements = adapter.introspection_sql()
+        if json_out:
+            # Honour --json here too: auditing what a tool would run against your database
+            # is exactly the kind of thing someone wants to diff or feed to review tooling.
+            typer.echo(
+                json.dumps(
+                    {
+                        "engine": engine or "postgres",
+                        "statements": [
+                            {
+                                "capability": s.capability,
+                                "privilege_hint": s.privilege_hint,
+                                "sql": s.sql,
+                            }
+                            for s in statements
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(code=0)
+        for statement in statements:
             typer.echo(f"-- {statement.capability}: {statement.privilege_hint}")
             typer.echo(statement.sql)
             typer.echo("")
@@ -4763,6 +4858,15 @@ def advise(
     for capability, reason in adapter.degraded:
         typer.echo(f"reduced coverage — {capability}: {reason}", err=True)
     typer.echo(f"window: {workload.window_description}", err=True)
+    # Disclose coverage on every run, not only when it is bad. The markdown and JSON
+    # reports always carry these counts; the terminal path should not be the one place a
+    # user cannot see how much of their workload was actually understood.
+    typer.echo(
+        f"analyzed {len(workload.stats)} query group(s); skipped "
+        f"{workload.skipped_unparseable} unparseable, {workload.skipped_noise} "
+        f"introspection/DDL, {aggregation.skipped_unqualifiable} unresolvable",
+        err=True,
+    )
     coverage = _coverage_warning(workload, aggregation)
     if coverage is not None:
         typer.echo(coverage, err=True)
@@ -4770,7 +4874,8 @@ def advise(
     table = Table(
         title=(
             f"Advise — {params.engine} "
-            f"({len(proposals)} proposals, {len(workload.stats)} query groups)"
+            f"({_plural(len(proposals), 'proposal')}, "
+            f"{_plural(len(workload.stats), 'query group')})"
         )
     )
     table.add_column("code")
