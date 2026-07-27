@@ -975,19 +975,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     ) -> dict[Relation, TableFacts]:
         # The `= ANY(%s)` table parameter stays a list of bare names: Postgres filters on
         # `relname`/`tablename`, and narrowing per-schema would need one statement per
-        # schema. Passing the union of bare names over-fetches slightly — a same-named
-        # table in a schema we did not ask about comes back too — but that row's relation
-        # key then simply has no consumer, since only the relations in `relations` are
-        # ever assembled into the result below.
+        # schema. `n.nspname = ANY(%s)` still restricts rows to `schemas`, so a table in a
+        # schema we were not asked to introspect at all never comes back. What can
+        # over-fetch is a same-named table in a *different requested* schema that is not
+        # itself in `relations` — `schemas=("sales", "staging")` with `relations` naming
+        # only `sales.orders` still returns `staging.orders`, because the bare-name filter
+        # cannot distinguish the two. That row's relation key then simply has no consumer,
+        # since only the relations in `relations` are ever assembled into the result below.
         wanted = sorted({relation.table for relation in relations})
         sizes = {
             Relation(schema=str(schema_name), table=str(name)): (
                 _row_estimate(rows),
                 _as_int(size) if size is not None else None,
             )
-            for schema_name, name, rows, size in self._run(
-                CAP_TABLE_FACTS, (list(schemas), wanted)
-            )
+            for schema_name, name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
         }
         columns: dict[Relation, list[str]] = {}
         for schema_name, table, column, _type in self._schema_rows(schemas):
@@ -996,9 +997,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 columns.setdefault(relation, []).append(str(column))
 
         ndv: dict[Relation, dict[str, float]] = {}
-        for schema_name, table, column, n_distinct in self._run(
-            CAP_NDV, (list(schemas), wanted)
-        ):
+        for schema_name, table, column, n_distinct in self._run(CAP_NDV, (list(schemas), wanted)):
             if n_distinct is None:
                 continue
             value = _as_float(n_distinct)
@@ -1035,8 +1034,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     ) -> dict[Relation, tuple[PgIndex, ...]]:
         """Existing indexes per relation, columns in ordinal order."""
         # See the identical note in fetch_table_facts: the table parameter is bare names,
-        # so a same-named table in an unrequested schema can come back too, and its
-        # relation key then simply has no consumer.
+        # so a same-named table in a *different requested* schema not itself in
+        # `relations` can come back too — `n.nspname = ANY(%s)` still excludes a schema we
+        # were not asked to introspect at all. That row's relation key then simply has no
+        # consumer.
         wanted = sorted({relation.table for relation in relations})
         grouped: dict[tuple[Relation, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), wanted)):
