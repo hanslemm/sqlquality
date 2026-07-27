@@ -382,11 +382,9 @@ review and apply by hand.
 
 - **HIGH** — cost share above `--min-cost-share`, **and** supporting catalog stats present
   (e.g. NDV), **and** confirmation that the proposed index does not already exist.
-- **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 and
-  ADV003 are capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last
-  statistics reset, so zero scans can never prove an index is unused across a full business
-  cycle, and ADV003 compares column lists without being able to see a partial index's
-  predicate.
+- **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 is
+  capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last statistics
+  reset, so zero scans can never prove an index is unused across a full business cycle.
 - **LOW** — thin evidence, and specifically **any check that could not be run**: the row
   count is unknown so the small-table floor could not be applied, or the existing-index
   list was denied so "no index already covers this" could not be confirmed. Absent
@@ -779,16 +777,17 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   be most of your hot reads. They are counted, and the skip line calls them `filtered`
   rather than pretending they were introspection or DDL, but they are not analyzed.
   Unwrapping to the inner `SELECT` is a follow-up.
-- **Expression indexes are invisible to the catalog query.** Postgres's `pg_index.indkey`
-  holds `0` for an expression column, which matches no `pg_attribute` row, so ADV001 may
-  propose a plain-column index whose `lower(col)` expression-index equivalent already
-  exists.
-- **ADV003 cannot see partial-index predicates.** It compares column lists only, so it
-  could recommend dropping a partial index in favor of a wider full index that does not
-  actually cover the same rows. Its confidence is capped at MEDIUM for that reason, and
-  the caveat is repeated in the proposal's own rationale — a README does not travel
-  inside the `.sql` file you run. `advise` cannot tell you which of the two indexes is
-  partial or expression-based; you have to check.
+- **Expression indexes are read but not matched.** `advise` now sees that an index on
+  `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
+  that index already serves a lookup on `status` — so it proposes and says so, rather than
+  suppressing or ignoring. Confirm before applying.
+- **ADV003 only compares plain indexes.** A pair where either index carries a `WHERE`
+  predicate or an indexed expression is skipped entirely rather than proposed at lower
+  confidence: a partial index exists to serve a subset, so recommending its removal is
+  likely wrong rather than merely uncertain. Plain pairs are reported at HIGH.
+- **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
+  shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
+  a candidate index — it is named in the evidence instead.
 - **One schema per run.** Every catalog fact is keyed on the bare relation name — table
   sizes, NDV statistics, index lists and the `qualify()` schema all merge across schemas —
   so `orders` in two schemas would alias into one another and the last catalog row read
