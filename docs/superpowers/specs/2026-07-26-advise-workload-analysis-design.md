@@ -107,16 +107,21 @@ class WorkloadAdapter(ABC):
         redacted — redaction happens once, in the engine-agnostic `ingest()`, so there is
         exactly one place to audit for literal leakage instead of one per adapter."""
 
-    def fetch_schema(self, tables: set[str]) -> dict:
-        """Schema mapping for sqlglot qualify()."""
+    def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
+        """Nested schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+        Nested, not flat, so qualify() can tell two same-named tables in different
+        schemas apart — see "Deviations from the spec (Batch 2)" below."""
 
-    def fetch_table_facts(self, tables: set[str]) -> dict[str, TableFacts]:
-        """Row estimates, sizes, per-column NDV, current physical design."""
+    def fetch_table_facts(
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, TableFacts]:
+        """Row estimates, sizes, per-column NDV, current physical design, keyed by the
+        schema-qualified relation each row belongs to."""
 
     def propose(
         self,
         aggregation: Aggregation,
-        facts: dict[str, TableFacts],
+        facts: dict[Relation, TableFacts],
         workload: Workload,
         *,
         min_cost_share: float,
@@ -139,6 +144,18 @@ class WorkloadAdapter(ABC):
 Added to `models.py` alongside the existing `Finding` / `ComplexityScore`:
 
 ```python
+@dataclass(frozen=True, order=True)
+class Relation:
+    """A schema-qualified relation — the key every catalog fact is stored under.
+    Bare table names aliased: two schemas each holding an `orders` merged into one entry,
+    so the last catalog row read won the row estimate. `order=True` so rules can sort
+    their output for stable report ordering."""
+    schema: str
+    table: str
+
+    def __str__(self) -> str:
+        return f"{self.schema}.{self.table}"
+
 @dataclass(frozen=True)
 class ConnectionParams:
     engine: str               # postgres | redshift | snowflake
@@ -195,16 +212,19 @@ class ColumnRole(str, Enum):
 
 @dataclass(frozen=True)
 class ColumnUsage:
-    table: str
+    relation: Relation
     column: str
     role: ColumnRole
     calls: int
     cost_ms: float
     cost_share: float         # fraction of total analyzed workload cost — NOT a partition,
                               # see the "cost_share is not a partition" note in the README
-    fingerprints: int
     fingerprint_ids: frozenset[str] = frozenset()  # which query groups contributed this
                                                     # usage, so rules can test co-occurrence
+
+    @property
+    def fingerprints(self) -> int:
+        return len(self.fingerprint_ids)
 
 @dataclass(frozen=True)
 class Aggregation:
@@ -214,11 +234,16 @@ class Aggregation:
     skipped_unqualifiable: int  # queries that failed qualify() — lives here, not on
                                 # Workload, because qualification happens during
                                 # aggregation, not ingest
-    tables: frozenset[str]
+    tables: frozenset[Relation]
+    skipped_ambiguous: int = 0  # a bare table name held by 2+ introspected schemas,
+                                # named without qualification — attributing it would be a
+                                # coin flip, so it is counted and dropped instead
 
 @dataclass(frozen=True)
 class TableFacts:
-    name: str
+    relation: Relation        # the schema-qualified key this table is stored under — not
+                              # a display name; two same-named tables in different
+                              # schemas each get their own TableFacts
     row_estimate: int | None
     size_bytes: int | None
     columns: tuple[str, ...]
@@ -374,9 +399,12 @@ per-statement timestamps before PostgreSQL 17 added `stats_since`. On earlier ve
 
 Found and agreed while implementing ADV007/ADV008, multi-schema support and wrapped-read
 handling, after the initial ship this document otherwise describes. The dataclass shapes
-above (`ColumnUsage.table: str`, `Aggregation.tables: frozenset[str]`, `TableFacts.name`,
-`fetch_schema`/`fetch_table_facts` keyed on bare strings) are what shipped first; every one
-of them changed as follows.
+in "Core dataclasses" and "Interface" above already reflect what shipped as a result —
+`ColumnUsage.relation: Relation`, `Aggregation.tables: frozenset[Relation]`,
+`TableFacts.relation`, `fetch_schema`/`fetch_table_facts`/`fetch_indexes` keyed and
+parameterized by `Relation` — not the bare-string shapes (`ColumnUsage.table: str`,
+`Aggregation.tables: frozenset[str]`, `TableFacts.name`) that shipped first. This section
+records why they changed.
 
 1. **Every catalog fact is keyed by `Relation(schema, table)`, not a bare table name.** A
    bare-name key aliased two same-named tables in different schemas: whichever catalog row

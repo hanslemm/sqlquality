@@ -125,13 +125,24 @@ def seeded(live_dsn: str) -> tuple[str, str]:
             cur.execute("ANALYZE staging.orders")
 
             # An unindexed join key (ADV007) and, on the other side of it, a table left
-            # deliberately un-analyzed: `public.order_items.order_id` therefore carries
-            # `reltuples = -1` (Postgres's never-analyzed sentinel) at fetch time, proving
-            # the `row_estimate is None` path still proposes (at LOW confidence) rather
-            # than the pre-fix behaviour of reading -1 as "tiny table" and suppressing the
-            # proposal outright. Deliberately NOT analyzed — do not add an ANALYZE here.
+            # deliberately un-analyzed: `public.order_items` therefore carries
+            # `reltuples = -1` (Postgres's never-analyzed sentinel) for the whole run,
+            # proving the `row_estimate is None` path still proposes (at LOW confidence)
+            # rather than the pre-fix behaviour of reading -1 as "tiny table" and
+            # suppressing the proposal outright.
+            #
+            # `autovacuum_enabled = false` is load-bearing, not decoration: a bare "don't
+            # ANALYZE it" was measured to be non-deterministic — autovacuum picked up this
+            # table and analyzed it mid-run, about 2.5 seconds after seeding, well before
+            # any test's assertions ran, which silently turned this into a *never* case
+            # rather than a "not yet" case. Disabling autovacuum on this table, set before
+            # its INSERT, is what actually keeps `reltuples = -1` for the fixture's whole
+            # lifetime. Do not add an ANALYZE (or remove this setting) here.
             cur.execute("DROP TABLE IF EXISTS public.order_items CASCADE")
-            cur.execute("CREATE TABLE public.order_items (id bigint, order_id bigint, sku text)")
+            cur.execute(
+                "CREATE TABLE public.order_items (id bigint, order_id bigint, sku text) "
+                "WITH (autovacuum_enabled = false)"
+            )
             cur.execute(
                 "INSERT INTO public.order_items "
                 "SELECT g, (g % 20000) + 1, 'sku' || g FROM generate_series(1, 20000) g"
@@ -177,9 +188,18 @@ def seeded(live_dsn: str) -> tuple[str, str]:
             # this connection's per-statement autocommit boundary -- without it the cursor
             # is dropped the instant the DECLARE's own implicit transaction commits, and
             # FETCH fails with "cursor does not exist", not merely a filtered read.
+            #
+            # The predicate is `tenant_id = 3` deliberately, not `status = 'shipped'`:
+            # every other seeded statement filters on `status`, and once literals are
+            # redacted `status = 'shipped'` and `status = 'pending'` fingerprint
+            # identically. A test asserting unwrapping worked would pass just as well if
+            # unwrapping were reverted and this row were dropped as noise, because the
+            # *other* `status` query already produces the exact same query group. Filtering
+            # on a column no other statement filters on makes this query group exist if
+            # and only if the DECLARE was actually unwrapped.
             cur.execute(
                 "DECLARE live_cur CURSOR WITH HOLD FOR "
-                "SELECT id FROM public.orders WHERE status = 'pending'"
+                "SELECT id FROM public.orders WHERE tenant_id = 3"
             )
             cur.execute("FETCH 10 FROM live_cur")
             cur.fetchall()
