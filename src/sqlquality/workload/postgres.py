@@ -134,6 +134,22 @@ def _as_float(value: object) -> float:
     return float(value)  # type: ignore[arg-type]
 
 
+def _row_estimate(value: object) -> int | None:
+    """`pg_class.reltuples`, with Postgres's never-analyzed sentinel translated to unknown.
+
+    Postgres 14+ stores -1 in `reltuples` for a table that has never been analyzed —
+    distinct from 0, which means analyzed and genuinely empty. Passed through as-is, -1
+    reads as a tiny table to the small-table gate in `propose_indexes`, which then
+    suppresses every proposal for that table with no message. The window where this bites
+    is exactly when someone reaches for `advise`: a freshly loaded or migrated table,
+    before autovacuum's first ANALYZE, with slow queries. `None` already means "unknown"
+    throughout — it proposes at LOW and says the row count could not be checked — so
+    translating the sentinel here is the whole fix.
+    """
+    rows = _as_int(value)
+    return None if rows < 0 else rows
+
+
 @dataclass
 class _IndexRows:
     """Mutable per-index collector while unnested index rows are grouped.
@@ -943,7 +959,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         wanted = sorted(tables)
         sizes = {
             str(name): (
-                _as_int(rows),
+                _row_estimate(rows),
                 _as_int(size) if size is not None else None,
             )
             for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
