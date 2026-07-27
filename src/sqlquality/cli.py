@@ -46,6 +46,7 @@ from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.aggregate import aggregate, star_tables
 from sqlquality.workload.base import MAX_TIMEOUT_S, MIN_TIMEOUT_S
 from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
+from sqlquality.workload.dbt import load_dbt_context
 from sqlquality.workload.fingerprint import ingest
 
 console = Console()
@@ -724,6 +725,14 @@ def advise(
     profiles_dir: Path | None = typer.Option(
         None, "--profiles-dir", help="Directory holding profiles.yml (default: ~/.dbt)."
     ),
+    project_dir: Path | None = typer.Option(
+        None,
+        "--project-dir",
+        help="dbt project dir; reads target/manifest.json to enrich proposals (optional).",
+    ),
+    manifest: Path | None = typer.Option(
+        None, "--manifest", help="Path to a dbt manifest.json. Overrides --project-dir."
+    ),
     schema: list[str] = typer.Option(
         ["public"],
         "--schema",
@@ -839,6 +848,13 @@ def advise(
         schemas, aggregation.tables | star_tables(workload, db_schema)
     )
     proposals = adapter.propose(aggregation, facts, workload, min_cost_share=min_cost_share)
+
+    # Optional dbt enrichment: neither option given means (None, None) and nothing below
+    # fires, so every existing `advise` invocation behaves identically without a manifest.
+    # Enrichment rules land in later tasks — this only loads the context and discloses it.
+    _dbt_context, dbt_disclosure = load_dbt_context(project_dir, manifest)
+    if dbt_disclosure is not None:
+        typer.echo(dbt_disclosure, err=True)
 
     payload = advise_payload(
         proposals,
