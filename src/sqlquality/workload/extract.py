@@ -31,6 +31,30 @@ class AmbiguousRelation(UnqualifiableQuery):
     """
 
 
+def _is_negated(node: exp.Is) -> bool:
+    """True when an ``IS`` predicate is the negated form, under either sqlglot encoding.
+
+    sqlglot changed how it represents `IS NOT NULL` *within the version range this package
+    declares* (`sqlglot>=30.12,<31`):
+
+    * up to 30.12 it wraps the node — ``Not(Is(col, Null()))`` — so polarity lives on the parent
+    * from 30.13 it sets a flag on the node itself — ``Is(col, Null(), negate=True)`` — and no
+      ``exp.Not`` appears in the tree at all
+
+    Reading only the parent silently inverted every `IS NOT NULL` into a `NULL_CHECK` on the
+    newer parse, which is not a cosmetic misclassification: ADV004 turns these roles straight
+    into a partial index's `WHERE` clause, so it emitted `WHERE col IS NULL` for a workload that
+    filters `IS NOT NULL` — an index over exactly the wrong subset of rows, at MEDIUM confidence.
+    The lockfile hid it, since `uv sync` pins 30.12 while a fresh `pip install sqlquality`
+    resolves the newest 30.x.
+
+    Both encodings are accepted rather than picking one and tightening the version floor: the
+    flag is additive, so a tree built either way answers correctly, and users are not forced to
+    a particular sqlglot to get correct DDL.
+    """
+    return bool(node.args.get("negate")) or isinstance(node.parent, exp.Not)
+
+
 def _within(node: exp.Expression, *types: type[exp.Expression]) -> bool:
     """True if any ancestor of ``node`` is one of ``types``. Mirrors antipatterns._within_exists."""
     parent = node.parent
@@ -67,12 +91,7 @@ def _role(column: exp.Column) -> ColumnRole | None:
         if isinstance(node, exp.Is) and predicate_scope:
             null_side = isinstance(node.expression, exp.Null)
             if null_side:
-                # `is not null` parses as Not(Is(...)), so polarity comes from the parent.
-                return (
-                    ColumnRole.NOT_NULL_CHECK
-                    if isinstance(node.parent, exp.Not)
-                    else ColumnRole.NULL_CHECK
-                )
+                return ColumnRole.NOT_NULL_CHECK if _is_negated(node) else ColumnRole.NULL_CHECK
         if comparison is None and predicate_scope:
             if isinstance(node, _EQUALITY_NODES):
                 comparison = ColumnRole.EQUALITY

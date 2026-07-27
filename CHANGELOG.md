@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could no longer satisfy the hot query's `ORDER BY`.
 - ADV003 is scoped to the tables the workload was observed using, like ADV002 — it no longer
   proposes `DROP INDEX` for a relation the run never analysed.
+
+### Fixed
+
+- `IS NOT NULL` predicates were classified as `IS NULL` when sqlglot 30.13 or newer was
+  installed, because that release moved the negation from a wrapping `Not` node onto a
+  `negate` flag on the `Is` node itself. Both encodings are now read. This was not cosmetic:
+  ADV004 turns these roles directly into a partial index's `WHERE` clause, so it proposed
+  `WHERE col IS NULL` for a workload filtering `WHERE col IS NOT NULL` — an index over exactly
+  the complement of the intended rows. `uv.lock` pins 30.12, so development and CI never saw
+  it while any fresh `pip install sqlquality` resolved a newer 30.x and did. CI now also runs
+  the suite against the highest versions the declared dependency ranges allow.
 - `advise` unwraps `DECLARE ... CURSOR FOR` and `COPY (...) TO` reads to their inner
   query before filtering, so server-side-cursor and `COPY`-based workloads (what
   psycopg2, Django and SQLAlchemy emit for large result sets) reach the analysis

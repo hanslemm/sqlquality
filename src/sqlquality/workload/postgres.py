@@ -445,6 +445,16 @@ def propose_indexes(
                 f" Only about {leading_ndv:.0f} distinct values, so the index may not be "
                 "selective enough to be worth its write cost."
             )
+        # The MEDIUM rung used to say nothing at all, which reads as a considered judgement
+        # when it is really an absence of evidence: the statistics for the leading column
+        # were not available, so the selectivity check simply did not run. The whole rule set
+        # turns on disclosing a check that could not run rather than assuming its answer, and
+        # this was the one confidence level that stayed silent about why.
+        elif leading_ndv is None and rows is not None and have_index_data:
+            rationale += (
+                f" No distinct-value statistics for {columns[0]}, so how selective this index "
+                "would be could not be checked — run ANALYZE on the table for a firmer answer."
+            )
         if partial_skipped:
             rationale += (
                 f" A partial index ({', '.join(partial_skipped)}) leads with these columns "
@@ -576,6 +586,14 @@ def propose_join_keys(
                 rationale += (
                     f" Only about {column_ndv:.0f} distinct values, so the index may not be "
                     "selective enough to be worth its write cost."
+                )
+            # Same disclosure ADV001 makes at the same rung, in the same words: MEDIUM here
+            # means the selectivity check could not run, not that it ran and was middling.
+            elif column_ndv is None and rows is not None and have_index_data:
+                rationale += (
+                    f" No distinct-value statistics for {item.column}, so how selective this "
+                    "index would be could not be checked — run ANALYZE on the table for a "
+                    "firmer answer."
                 )
             if partial_skipped:
                 rationale += (
@@ -727,7 +745,7 @@ def propose_grouping_indexes(
         if not have_index_data:
             rationale += (
                 " The existing-index list could not be read, so whether an index already "
-                "leads with these columns is unknown."
+                "leads with these columns is unknown — check before applying."
             )
         if rows is None:
             rationale += _UNKNOWN_ROWS_NOTE
@@ -1715,9 +1733,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             # preference equal — only possible today if the same code proposes the same
             # DDL twice) keeps whichever proposal `propose()` happened to append first.
             # That residual is accepted rather than papered over with a further tie-break
-            # key: two proposals with the same code, the same confidence and the same DDL
-            # carry no information that distinguishes them, so which one is kept cannot
-            # matter to a reader the way which *code* is kept does.
+            # key. Note it is not that such proposals are *identical* — `rationale` and
+            # `title` can still differ, and `_fold_discarded` preserves the loser's
+            # rationale either way, so nothing a reader needs is lost. What they no longer
+            # differ in is the thing a tie-break could act on: same code, same confidence,
+            # same DDL leaves no principled basis for preferring one, whereas which *code*
+            # wins is a real editorial choice and `_CODE_PREFERENCE` makes it.
             ranked = sorted(group, key=rank)
             winner, *losers = ranked
             merged[ddl] = cls._fold_discarded(winner, losers, same_index=True)

@@ -22,3 +22,69 @@ jobs:
       - run: uv run mypy src/sqlquality
       - run: uv run pytest
       - run: uv build
+
+  # The `check` job above installs every extra, so it can never catch a test that
+  # quietly starts requiring psycopg or a running database. That matters because the
+  # project promises a plain `uv run pytest` works with no extras and no Docker — the
+  # first thing a new contributor does. A test that acquires such a dependency turns
+  # into a *skip*, which reads as success in a green run, so this job fails on any
+  # skip rather than only on a failure.
+  #
+  # Deliberately not a matrix: the invariant is about dependencies, not interpreter
+  # versions, so one Python is enough and four would just be slower.
+  no-extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      # No --all-extras, and no service container: this is the bare install.
+      - run: uv sync
+      - name: Run the default suite and fail on any skip
+        run: |
+          set -o pipefail
+          # One run, not two. `pytest` exits 0 on skips, so the summary has to be
+          # inspected — and it has to be a real run: a skip decided at runtime (an
+          # ImportError inside a fixture) never shows up in --collect-only.
+          # -rs lists each skip with its reason, so a failure here names the test
+          # instead of only reporting a count. --strict-markers catches a typo'd
+          # `integration` marker, which would otherwise silently select the test.
+          uv run pytest -q -rs --strict-markers 2>&1 | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then
+            echo "::error::The default test suite must not skip anything without extras."
+            echo "A test acquired a dependency on an extra or on Docker. Either mark it"
+            echo "'integration' so it is deselected, or remove the dependency."
+            grep -E '^SKIPPED' result.txt || true
+            exit 1
+          fi
+
+  # `uv sync` installs what uv.lock pins, so every job above tests exactly one point in the
+  # dependency ranges pyproject declares. A user running `pip install sqlquality` gets the
+  # *newest* release satisfying those ranges instead — and that difference has already shipped
+  # a real bug: sqlglot changed `IS NOT NULL` from `Not(Is(...))` to `Is(..., negate=True)`
+  # within `>=30.12,<31`, which inverted the null-check polarity and made ADV004 emit a partial
+  # index over exactly the wrong rows. The lockfile hid it from CI completely.
+  #
+  # This job resolves to the highest allowed versions, so an upstream release that breaks a
+  # declared range fails here rather than in a user's generated DDL. It is blocking on purpose:
+  # the point is to find out before a release, and the remedy is always available — handle both
+  # behaviours, or narrow the range in pyproject. If upstream churn makes it noisy, add
+  # `continue-on-error: true` rather than deleting it.
+  highest-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # An explicit venv rather than `--system`: the runner's Python is Debian-managed and
+      # refuses `pip install` (PEP 668), and `uv run` is no good either because it would sync
+      # from the lockfile — the very thing this job exists to bypass. So the venv is built and
+      # invoked directly.
+      - run: uv venv .venv-highest
+      # Extras included, so the psycopg-dependent paths are exercised too.
+      - run: uv pip install --python .venv-highest --resolution highest -e '.[postgres]' pytest
+      - name: Record what was resolved
+        run: uv pip list --python .venv-highest
+      - run: .venv-highest/bin/python -m pytest -q
