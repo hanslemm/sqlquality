@@ -1,6 +1,8 @@
 import sqlglot
+from sqlglot import exp
 
 from sqlquality.models import RawQueryRow, WorkloadFetch
+from sqlquality.sqlast import parse
 from sqlquality.workload.fingerprint import (
     FLAG_LEADING_WILDCARD_LIKE,
     FLAG_SELECT_STAR,
@@ -154,3 +156,45 @@ def test_ingest_stats_are_sorted_by_cost_descending():
     )
     workload = ingest(fetch, "postgres")
     assert [s.total_time_ms for s in workload.stats] == [99.0, 1.0]
+
+
+def test_redaction_leaves_a_postgres_placeholder_intact():
+    """`$N` parses as Parameter(this=Literal(N)), so a naive literal walk mangles it.
+
+    pg_stat_statements hands us `$1`; redacting the `1` inside it produced `$%s`.
+    """
+    tree = parse("select id from orders where status = $1", "postgres")
+    assert "$1" in redact_tree(tree).sql("postgres")
+
+
+def test_redaction_does_not_dismember_a_normalised_interval():
+    """The shape that was silently dropped, using the real text a live server produced.
+
+    Redacting the literal inside `interval $2` left `INTERVAL` as a bare dangling token.
+    Re-parsed, sqlglot read it as a *column* named INTERVAL, which failed to qualify — so
+    the whole group vanished into skipped_unqualifiable. `created_at > now() - interval
+    '1 day'` is the most ordinary filter shape there is.
+
+    Note: sqlglot's postgres generator renders a unitless `INTERVAL $2` as `INTERVAL '2'`
+    (it reads the parameter's `.name` into its single-string interval form) even for the
+    *untouched* tree, before `redact_tree` ever runs — so the literal text `$2` does not
+    survive rendering regardless of this fix. What the fix guarantees, and what actually
+    caused the query group to vanish, is that the round trip stays parseable and
+    `created_at` keeps being read as a column rather than growing a bogus `INTERVAL`
+    sibling. That is what this test proves instead.
+    """
+    sql = "select id from orders where status = $1 and created_at > now() - interval $2"
+    redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
+    assert not redacted.rstrip().endswith("INTERVAL")
+    reparsed = parse(redacted, "postgres")
+    columns = {c.name.upper() for c in reparsed.find_all(exp.Column)}
+    assert "INTERVAL" not in columns
+    assert "CREATED_AT" in columns
+
+
+def test_redaction_still_erases_a_real_literal_beside_a_placeholder():
+    """The control. Skipping placeholders must not smuggle a genuine literal through."""
+    sql = "select id from orders where status = 'secret-value' and n > $1"
+    redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
+    assert "secret-value" not in redacted
+    assert "$1" in redacted
