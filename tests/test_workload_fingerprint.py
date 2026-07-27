@@ -1,3 +1,4 @@
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -10,6 +11,7 @@ from sqlquality.workload.fingerprint import (
     is_noise,
     literal_flags,
     redact_tree,
+    unwrap,
 )
 
 
@@ -50,14 +52,14 @@ def test_is_noise_filters_our_own_introspection_and_ddl():
     assert not is_noise("select id from orders where status = $1")
 
 
-def test_is_noise_also_discards_predicate_bearing_declare_and_copy():
-    """A documented loss, pinned so it cannot become an undocumented one.
+def test_is_noise_still_discards_the_raw_wrapper_text():
+    """`is_noise` itself is a statement-prefix filter and stays that way.
 
-    `_LEADING_NOISE` is a statement-prefix filter, so a cursor declaration or a COPY that
-    wraps a real SELECT — with real predicates — is discarded whole. Django's
-    `QuerySet.iterator()` emits the first form. Unwrapping to the inner SELECT is a
-    follow-up; until then this is a README limitation and the skip counter says only
-    "filtered", never "introspection/DDL".
+    A cursor declaration or a `COPY (...) TO` still starts with a keyword `_LEADING_NOISE`
+    matches, so calling `is_noise` on the *raw* row still discards it whole. That is no
+    longer a loss: `ingest` calls `unwrap()` first and tests `is_noise` on the inner query,
+    so the real read survives — see `test_a_declared_cursor_is_analyzed_not_filtered` and
+    `test_a_copy_subquery_is_analyzed_not_filtered` below.
     """
     assert is_noise("DECLARE cur CURSOR FOR SELECT id FROM orders WHERE status = $1")
     assert is_noise("COPY (SELECT id FROM orders WHERE status = $1) TO STDOUT")
@@ -198,3 +200,130 @@ def test_redaction_still_erases_a_real_literal_beside_a_placeholder():
     redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
     assert "secret-value" not in redacted
     assert "$1" in redacted
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        (
+            "DECLARE c CURSOR FOR SELECT id FROM orders WHERE status = 'x'",
+            "SELECT id FROM orders WHERE status = 'x'",
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT id FROM orders",
+            "SELECT id FROM orders",
+        ),
+        (
+            "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM orders",
+            "SELECT id FROM orders",
+        ),
+        (
+            "DECLARE c BINARY INSENSITIVE SCROLL CURSOR WITH HOLD FOR SELECT a FROM t",
+            "SELECT a FROM t",
+        ),
+        (
+            'DECLARE "my cursor" CURSOR FOR SELECT a FROM t',
+            "SELECT a FROM t",
+        ),
+        (
+            "COPY (SELECT id FROM orders WHERE status = 'x') TO STDOUT",
+            "SELECT id FROM orders WHERE status = 'x'",
+        ),
+        ("copy (select 1) to stdout", "select 1"),
+    ],
+)
+def test_unwrap_recovers_the_inner_query(sql, expected):
+    assert unwrap(sql) == expected
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM orders",
+        "COPY orders TO STDOUT",
+        "COPY orders (id, status) FROM STDIN",
+        "FETCH 100 FROM c",
+        "CLOSE c",
+        "DECLARE c CURSOR FOR",
+        "DECLARE",
+    ],
+)
+def test_unwrap_leaves_everything_else_alone(sql):
+    """Anything without a recoverable inner query is returned unchanged, not mangled."""
+    assert unwrap(sql) == sql
+
+
+def test_a_declared_cursor_is_analyzed_not_filtered():
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT id FROM orders WHERE status = 'x'",
+                calls=3,
+                total_time_ms=300.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 0
+    assert len(workload.stats) == 1
+    assert "DECLARE" not in workload.stats[0].sql.upper()
+    assert workload.stats[0].calls == 3
+
+
+def test_a_copy_subquery_is_analyzed_not_filtered():
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="COPY (SELECT id FROM orders WHERE status = 'x') TO STDOUT",
+                calls=1,
+                total_time_ms=10.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 0
+    assert len(workload.stats) == 1
+
+
+def test_a_declared_cursor_over_introspection_is_still_filtered():
+    """Unwrapping must not become a way to smuggle our own catalog reads into the workload."""
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT * FROM pg_stat_statements",
+                calls=1,
+                total_time_ms=1.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
+
+
+def test_a_whole_table_copy_is_still_filtered():
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="COPY orders TO STDOUT", calls=1, total_time_ms=1.0),),
+        window_description="w",
+    )
+    assert ingest(fetch, "postgres").skipped_noise == 1
+
+
+def test_the_unwrapped_query_is_still_redacted():
+    """Redaction runs after unwrapping, so the inner literal must not survive."""
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT id FROM orders WHERE email = 'a@b.test'",
+                calls=1,
+                total_time_ms=1.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert "a@b.test" not in workload.stats[0].sql
+    assert "a@b.test" not in workload.stats[0].fingerprint

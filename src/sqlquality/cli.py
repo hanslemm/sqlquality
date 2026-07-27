@@ -631,11 +631,14 @@ def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
     "2 unresolvable" contradicts itself on a single line — and does so least accurately
     exactly when coverage is worst, which is the situation the line exists to reveal.
 
-    ``skipped_noise`` is reported as "filtered", not "introspection/DDL". The filter is a
-    statement-prefix match, so it also swallows `DECLARE cur CURSOR FOR SELECT ...` and
-    `COPY (SELECT ...) TO STDOUT` — ordinary reads with real predicates, and what every
-    psycopg2 server-side cursor emits. Calling those introspection or DDL told the user
-    their hot reads were maintenance traffic. "filtered" claims only what is true.
+    ``skipped_noise`` is reported as "filtered", not "introspection/DDL": it covers session
+    control, DDL, maintenance, introspection, a whole-table `COPY ... TO`, and a cursor
+    statement that carries no query at all (`FETCH`, `CLOSE`). `DECLARE cur CURSOR FOR
+    SELECT ...` and `COPY (SELECT ...) TO STDOUT` — what every psycopg2 server-side cursor
+    emits, and ordinary reads with real predicates — are unwrapped to their inner query
+    before this count is taken, so they are analysed rather than filtered. Calling
+    `skipped_noise` "introspection or DDL" would tell the user their hot reads were
+    maintenance traffic; "filtered" claims only what is true.
     """
     return (
         f"analyzed {_analyzed_count(workload, aggregation)} of {len(workload.stats)} "
