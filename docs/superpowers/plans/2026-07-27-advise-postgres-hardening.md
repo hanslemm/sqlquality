@@ -884,7 +884,18 @@ def test_star_tables_compiles_each_table_pattern_once(monkeypatch):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_models.py -k fingerprints_is_derived tests/test_workload_aggregate.py -k star_tables_compiles -v`
-Expected: FAIL — `fingerprints=` is currently accepted so no `TypeError` is raised, and the compile count is 5 × 21.
+Expected: the `fingerprints` test FAILS — `fingerprints=` is currently accepted, so no `TypeError` is raised.
+
+**The compile-count test will pass pre-fix, and that is not evidence of anything.** The
+current `mentions_identifier` calls `re.search(pattern_string, text)`, which resolves through
+Python's *private* internal cache and never touches the public `re.compile` a monkeypatch can
+see. So a pre-fix run counts zero compiles and passes vacuously — a green RED.
+
+Validate this one from the other end instead: implement the fix, confirm the test passes,
+then remove the `@lru_cache` decorator, confirm it now *fails* (it should report roughly
+`stats x tables` compiles), and restore it. Paste both outputs. A cache-hit test that cannot
+fail is worth nothing, and this plan has already shipped several tests that looked like
+guarantees and were not.
 
 - [ ] **Step 3: Implement**
 
