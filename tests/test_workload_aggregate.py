@@ -163,8 +163,15 @@ def test_empty_workload_yields_empty_aggregation_and_no_division_error():
     assert agg.tables == frozenset()
 
 
-def test_star_tables_compiles_each_table_pattern_once(monkeypatch):
-    """A fresh regex per (stat x table) pair thrashes re's pattern cache on a wide schema."""
+def test_identifier_pattern_is_compiled_once_per_name(monkeypatch):
+    """A fresh regex per identifier check thrashes re's own pattern cache.
+
+    ``star_tables`` no longer text-matches (it parses and resolves through
+    ``resolve_relation`` instead — see the ``star_tables`` tests below for why), so the
+    caching this pins is exercised directly through ``mentions_table``, which is what
+    ADV006's wide-table detection and the expression-index disclosure in ``postgres.py``
+    actually call many times over.
+    """
     import re as _re
 
     from sqlquality.workload import aggregate as agg
@@ -177,24 +184,12 @@ def test_star_tables_compiles_each_table_pattern_once(monkeypatch):
         return real_compile(pattern, *args, **kwargs)
 
     monkeypatch.setattr(agg._re if hasattr(agg, "_re") else _re, "compile", counting_compile)
-    workload = Workload(
-        stats=tuple(
-            QueryStat(
-                fingerprint=f"fp{i}",
-                sql="select * from orders",
-                calls=1,
-                total_time_ms=1.0,
-                flags=frozenset({FLAG_SELECT_STAR}),
-            )
-            for i in range(5)
-        ),
-        window_description="w",
-    )
-    schema = {"public": {f"t{i}": {"c": "int"} for i in range(20)} | {"orders": {"c": "int"}}}
-    assert agg.star_tables(workload, schema) == frozenset({Relation("public", "orders")})
-    table_names = agg._table_names(schema)
-    assert len(compiles) <= len(table_names), (
-        f"compiled {len(compiles)} patterns for {len(table_names)} tables across 5 stats"
+    names = [f"t{i}" for i in range(20)] + ["orders"]
+    for _ in range(5):
+        for name in names:
+            agg.mentions_table(name, "select * from orders")
+    assert len(compiles) <= len(names), (
+        f"compiled {len(compiles)} patterns for {len(names)} distinct identifiers across 5 passes"
     )
 
 
@@ -263,7 +258,7 @@ def test_star_tables_returns_qualified_relations():
                 sql="select * from items",
                 calls=1,
                 total_time_ms=1.0,
-                flags=frozenset({"select_star"}),
+                flags=frozenset({FLAG_SELECT_STAR}),
             ),
         ),
         window_description="test",
@@ -280,9 +275,120 @@ def test_star_tables_skips_an_ambiguous_name():
                 sql="select * from orders",
                 calls=1,
                 total_time_ms=1.0,
-                flags=frozenset({"select_star"}),
+                flags=frozenset({FLAG_SELECT_STAR}),
             ),
         ),
         window_description="test",
     )
     assert star_tables(workload, COLLIDING) == frozenset()
+
+
+def test_star_tables_does_not_attribute_an_unintrospected_schema_qualifier():
+    """`star_tables` must decline exactly what `resolve_relation` declines.
+
+    Text-matching `nosuch.items` against the schema's table names cannot see the
+    qualifier at all, so it would previously resolve through a bare-name collision with
+    `staging.items` — the phantom `resolve_relation`'s `table.db` guard exists to refuse.
+    """
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from nosuch.items",
+                calls=1,
+                total_time_ms=1.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    assert star_tables(workload, TWO_SCHEMAS) == frozenset()
+
+
+def test_star_tables_resolves_an_explicitly_qualified_colliding_name():
+    """`orders` collides across two schemas, but an explicit qualifier is not ambiguous.
+
+    `resolve_relation` resolves `sales.orders` outright; `star_tables`'s old text-match
+    path could not see the qualifier and dropped it as if the query had said `orders`
+    bare. The two must agree.
+    """
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from sales.orders",
+                calls=1,
+                total_time_ms=1.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    assert star_tables(workload, COLLIDING) == frozenset({Relation("sales", "orders")})
+
+
+def test_relation_breaks_ties_when_cost_column_and_role_all_match():
+    """The fifth sort key. Two relations, same column/role/cost — order must be
+    canonical (by `Relation`), not the order the statements happened to arrive in.
+
+    ``alpha`` sorts before ``zeta``, but the ``zeta`` statement is listed — and therefore
+    processed — first, so this only holds if the sort key actually includes `u.relation`.
+    """
+    schema = {
+        "zeta": {"orders": {"id": "int", "status": "text"}},
+        "alpha": {"orders": {"id": "int", "status": "text"}},
+    }
+    agg = aggregate(
+        _mixed_workload(
+            "select id from zeta.orders where status = 'x'",
+            "select id from alpha.orders where status = 'y'",
+        ),
+        schema,
+        "postgres",
+    )
+    matches = [u for u in agg.usage if u.column == "status"]
+    assert [u.relation for u in matches] == [
+        Relation("alpha", "orders"),
+        Relation("zeta", "orders"),
+    ]
+
+
+def test_ambiguous_dml_target_is_counted_not_silently_dropped():
+    """`qualify()` does not validate UPDATE/DELETE targets, so an ambiguous bare DML
+    target used to vanish with no usage recorded and neither counter incremented —
+    reported as analysed by the coverage line when it was not.
+    """
+    result = aggregate(
+        _mixed_workload("update orders set status = 'x' where id = 1"), COLLIDING, "postgres"
+    )
+    assert result.skipped_ambiguous == 1
+    assert result.usage == ()
+
+
+def test_ambiguous_statement_cost_stays_in_the_denominator():
+    """Same 'not a partition' semantics as an unqualifiable statement: an ambiguous
+    statement's cost is not excluded from the denominator merely because it produced no
+    usage (see test_skipped_stats_still_count_toward_the_denominator).
+    """
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp0",
+                sql="select id from orders where status = 'x'",
+                calls=1,
+                total_time_ms=90.0,
+            ),
+            QueryStat(
+                fingerprint="fp1",
+                sql="select id from sales.orders where status = 'y'",
+                calls=1,
+                total_time_ms=10.0,
+            ),
+        ),
+        window_description="test",
+    )
+    result = aggregate(workload, COLLIDING, "postgres")
+    assert result.skipped_ambiguous == 1
+    assert result.total_cost_ms == 100.0
+    usage = next(u for u in result.usage if u.column == "status")
+    assert usage.cost_share == 0.1

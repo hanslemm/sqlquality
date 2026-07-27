@@ -5,6 +5,7 @@ from sqlglot import exp
 from sqlquality.models import ColumnRole, Relation
 from sqlquality.sqlast import parse
 from sqlquality.workload.extract import (
+    AmbiguousRelation,
     UnqualifiableQuery,
     extract_usage,
     resolve_relation,
@@ -295,6 +296,18 @@ def test_dml_with_an_unintrospected_explicit_schema_does_not_leak_a_phantom_rela
     tree = parse("update other.orders set status = 'x' where id = 1", "postgres")
     usage = extract_usage(tree, "postgres", ONE_SCHEMA)
     assert usage == ()
+
+
+def test_ambiguous_bare_dml_target_raises_ambiguous_relation():
+    """`qualify()` does not validate UPDATE/DELETE targets, so a bare name held by two
+    introspected schemas reaches `_collect_dml` with no `SchemaError` ever raised. Left
+    silent, the statement would vanish with no usage and no counter moved — reported as
+    analysed by `aggregate` when it was not. It must raise the same way the SELECT-path
+    ambiguity does.
+    """
+    tree = parse("update orders set status = 'x' where id = 1", "postgres")
+    with pytest.raises(AmbiguousRelation):
+        extract_usage(tree, "postgres", COLLIDING)
 
 
 def test_relation_str_is_schema_dot_table():
