@@ -1457,6 +1457,145 @@ git commit -m "test(advise): end-to-end run against a real postgres; narrow two 
 
 ---
 
+### Task 8: Stop redacting Postgres's own placeholders
+
+**Files:**
+- Modify: `src/sqlquality/workload/fingerprint.py` (`redact_tree`)
+- Test: `tests/test_workload_fingerprint.py`
+
+**Interfaces:** no signature change. `redact_tree(tree) -> exp.Expression` keeps its contract.
+
+**Discovered by Task 7's live run, and the most impactful defect in the feature.**
+`pg_stat_statements` hands us SQL with literals already replaced by `$N` markers. `redact_tree`
+walks every `exp.Literal` — and a `$N` parses as `Parameter(this=Literal(2))`, so the walk
+descends *into the placeholder* and replaces the `2`. Measured against the real text the live
+server produced:
+
+```
+in:   SELECT id FROM orders WHERE status = $1 AND created_at > now() - interval $2
+out:  SELECT id FROM orders WHERE status = $%s AND created_at > CURRENT_TIMESTAMP - INTERVAL
+```
+
+`INTERVAL` is left as a bare dangling token. `ingest()` stores that string as
+`QueryStat.sql`, `aggregate()` re-parses it, and sqlglot reads the trailing `INTERVAL` as a
+**column name** — which then fails to qualify, so the entire query group is dropped and
+counted in `skipped_unqualifiable`.
+
+Reach: any query where Postgres normalised a literal inside an `INTERVAL`. `created_at >
+now() - interval '1 day'` is a time-window filter — the single most ordinary shape in the
+analytical workloads `advise` exists to advise on. It has been silently discarding them.
+
+It is not *entirely* silent — the coverage line reports it as "1 unresolvable" — but a user
+has no way to learn that sqlquality's own redaction broke the query it then failed to parse.
+
+**Why the fix is a skip, not a repair.** A `$N` is not user data. It is Postgres's own marker,
+already standing where a literal used to be, and there is nothing left in it to redact.
+Descending into it can only corrupt.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_workload_fingerprint.py`:
+
+```python
+def test_redaction_leaves_a_postgres_placeholder_intact():
+    """`$N` parses as Parameter(this=Literal(N)), so a naive literal walk mangles it.
+
+    pg_stat_statements hands us `$1`; redacting the `1` inside it produced `$%s`.
+    """
+    tree = parse("select id from orders where status = $1", "postgres")
+    assert "$1" in redact_tree(tree).sql("postgres")
+
+
+def test_redaction_does_not_dismember_a_normalised_interval():
+    """The shape that was silently dropped, using the real text a live server produced.
+
+    Redacting the literal inside `interval $2` left `INTERVAL` as a bare dangling token.
+    Re-parsed, sqlglot read it as a *column* named INTERVAL, which failed to qualify — so
+    the whole group vanished into skipped_unqualifiable. `created_at > now() - interval
+    '1 day'` is the most ordinary filter shape there is.
+    """
+    sql = "select id from orders where status = $1 and created_at > now() - interval $2"
+    redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
+    assert not redacted.rstrip().endswith("INTERVAL")
+    assert "INTERVAL $2" in redacted.upper()
+
+
+def test_redaction_still_erases_a_real_literal_beside_a_placeholder():
+    """The control. Skipping placeholders must not smuggle a genuine literal through."""
+    sql = "select id from orders where status = 'secret-value' and n > $1"
+    redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
+    assert "secret-value" not in redacted
+    assert "$1" in redacted
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_workload_fingerprint.py -k "placeholder or interval or beside" -v`
+Expected: the first two FAIL — `$1` has become `$%s`, and the redacted string ends in a bare
+`INTERVAL`. The third passes already; it is the control that must keep passing.
+
+- [ ] **Step 3: Skip placeholder subtrees**
+
+In `redact_tree`, leave any literal that sits inside an `exp.Parameter` alone:
+
+```python
+def _inside_placeholder(node: exp.Expression) -> bool:
+    """True if ``node`` sits inside a `$N` parameter marker.
+
+    `pg_stat_statements` has already replaced the literal that was there; the integer left
+    behind is Postgres's own index, not user data, and rewriting it corrupts the statement.
+    """
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Parameter):
+            return True
+        parent = parent.parent
+    return False
+
+
+def redact_tree(tree: exp.Expression) -> exp.Expression:
+    """Return a copy of ``tree`` with every literal replaced by a bind placeholder."""
+    copy = tree.copy()
+    for literal in list(copy.find_all(exp.Literal)):
+        if _inside_placeholder(literal):
+            continue
+        literal.replace(exp.Placeholder())
+    return copy
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `uv run pytest -q`
+Expected: PASS. **The pre-existing redaction guarantee suite must still pass unchanged** —
+`tests/test_workload_redaction.py` is the real guard on this function, and if the skip let a
+literal through, that is where it shows.
+
+Then re-run its mutation check: disable the literal replacement, confirm
+`test_no_literal_reaches_json_markdown_ddl_or_stdout` still fails, and restore. The skip
+narrows what gets redacted, so re-proving the guarantee still bites is the point.
+
+- [ ] **Step 5: Confirm the live end-to-end run now produces proposals**
+
+```bash
+docker compose -f tests/integration/docker-compose.yml up -d
+uv run pytest -m integration -v
+docker compose -f tests/integration/docker-compose.yml down
+```
+
+The seeded workload's only non-noise statement is the one this bug was dropping, so before
+the fix the live run analysed it and produced **zero** proposals. It should now produce at
+least one. Report the proposal codes. If it still produces none, the fix is incomplete and
+something else is dropping the query — say so rather than adjusting an assertion.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/sqlquality/workload/fingerprint.py tests/test_workload_fingerprint.py
+git commit -m "fix(workload): stop redaction dismembering Postgres placeholders"
+```
+
+---
+
 ## Self-Review
 
 **Coverage of the recorded items.** Every Batch-1 item from the ledger maps to a task: `secrets.py` extraction → Task 1; expression-index blindness → Tasks 2 and 3; ADV003 partial-predicate blindness → Task 4; `fingerprints` redundancy and `star_tables` regex churn → Task 5; integration test → Tasks 6 and 7; the two README limitations that those fixes narrow → Task 7.
