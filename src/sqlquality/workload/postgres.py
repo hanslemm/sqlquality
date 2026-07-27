@@ -147,6 +147,10 @@ class _IndexRows:
     is_primary: bool
     scans: int
     size_bytes: int
+    is_partial: bool = False
+    predicate: str | None = None
+    has_expressions: bool = False
+    definition: str | None = None
     #: (ordinality, column) so the column order can be restored by sorting.
     columns: list[tuple[int, str]] = field(default_factory=list)
 
@@ -161,6 +165,16 @@ class PgIndex:
     is_primary: bool
     scans: int
     size_bytes: int
+    #: True when the index has a WHERE predicate. A partial index does not serve an
+    #: unfiltered lookup, so it can never be assumed to cover a proposed index.
+    is_partial: bool = False
+    #: The rendered predicate, for showing an operator why a drop was not recommended.
+    predicate: str | None = None
+    #: True when any indexed position is an expression rather than a plain column. Such a
+    #: position contributes no name to `columns`, so the tuple understates the index.
+    has_expressions: bool = False
+    #: The full CREATE INDEX text, the only place an expression is legible.
+    definition: str | None = None
 
 
 #: Below this row estimate a sequential scan is the right plan; an index is pure overhead.
@@ -722,21 +736,29 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             FROM pg_stats s
             WHERE s.schemaname = ANY(%s) AND s.tablename = ANY(%s)
         """,
-        # Known limitation: the pg_attribute join silently omits expression indexes.
-        # `indkey` holds 0 for an expression column, which matches no pg_attribute row, so
-        # an index on `lower(status)` is invisible here. Consequence: ADV001 may propose an
-        # index whose expression equivalent already exists. Reading pg_get_indexdef() would
-        # fix it; deferred rather than silently ignored.
+        # LEFT JOIN, not JOIN: Postgres stores 0 in indkey for an expression column and no
+        # pg_attribute row has attnum 0, so an inner join silently discarded every expression
+        # index's columns — they arrived with an empty tuple. The NULL attname a LEFT JOIN
+        # yields is what tells us the position was an expression.
+        #
+        # indpred / indexprs are selected as booleans plus the rendered predicate, because a
+        # partial index does not serve an unfiltered lookup and an expression index does not
+        # serve its bare column — both of which the coverage and redundancy rules previously
+        # had to guess at.
         CAP_INDEXES: """
             SELECT t.relname, i.relname, a.attname, k.ordinality,
                    ix.indisunique, ix.indisprimary,
-                   COALESCE(psui.idx_scan, 0), pg_relation_size(i.oid)
+                   COALESCE(psui.idx_scan, 0), pg_relation_size(i.oid),
+                   ix.indpred IS NOT NULL,
+                   pg_get_expr(ix.indpred, ix.indrelid),
+                   ix.indexprs IS NOT NULL,
+                   pg_get_indexdef(ix.indexrelid)
             FROM pg_index ix
             JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN pg_class t ON t.oid = ix.indrelid
             JOIN pg_namespace n ON n.oid = t.relnamespace
             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON TRUE
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+            LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
             LEFT JOIN pg_stat_user_indexes psui ON psui.indexrelid = i.oid
             WHERE n.nspname = ANY(%s) AND t.relname = ANY(%s)
             ORDER BY t.relname, i.relname, k.ordinality
@@ -915,7 +937,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         """Existing indexes per table, columns in ordinal order."""
         grouped: dict[tuple[str, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), sorted(tables))):
-            table, index, column, ordinality, unique, primary, scans, size = row
+            (
+                table,
+                index,
+                column,
+                ordinality,
+                unique,
+                primary,
+                scans,
+                size,
+                is_partial,
+                predicate,
+                has_expressions,
+                definition,
+            ) = row
             entry = grouped.setdefault(
                 (str(table), str(index)),
                 _IndexRows(
@@ -923,13 +958,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     is_primary=bool(primary),
                     scans=_as_int(scans),
                     size_bytes=_as_int(size) if size is not None else 0,
+                    is_partial=bool(is_partial),
+                    predicate=str(predicate) if predicate is not None else None,
+                    has_expressions=bool(has_expressions),
+                    definition=str(definition) if definition is not None else None,
                 ),
             )
+            # A NULL attname is an expression position: it has no column name to record, and
+            # `has_expressions` already marks the index, so skip it rather than storing "None".
             # Keyed by ordinality and sorted below rather than trusting arrival order. The
             # statement does ORDER BY k.ordinality, but composite-index column order decides
             # whether a proposal is right, and a fixture test that pre-sorts its canned rows
             # cannot notice the difference. Cheap defence in depth.
-            entry.columns.append((_as_int(ordinality), str(column)))
+            if column is not None:
+                entry.columns.append((_as_int(ordinality), str(column)))
 
         result: dict[str, list[PgIndex]] = {}
         for (table, index), entry in grouped.items():
@@ -941,6 +983,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     is_primary=entry.is_primary,
                     scans=entry.scans,
                     size_bytes=entry.size_bytes,
+                    is_partial=entry.is_partial,
+                    predicate=entry.predicate,
+                    has_expressions=entry.has_expressions,
+                    definition=entry.definition,
                 )
             )
         return {table: tuple(indexes) for table, indexes in result.items()}
