@@ -1862,10 +1862,17 @@ def test_adv008_requires_joint_support_not_just_pairwise_with_the_seed():
     assert proposals[0].evidence["columns"] != ("a", "b", "c")
 
 
-def test_adv008_reports_the_honest_joint_support_count():
+def test_adv008_reports_the_honest_joint_support_count_and_omits_the_plain_one():
     """`co_occurring_fingerprints` must report the running intersection's size, not the
     per-column `fingerprints` max, which would (falsely) read as "two query groups back this
-    three-column composite" when the joint support for `(a, b)` is exactly one query group."""
+    three-column composite" when the joint support for `(a, b)` is exactly one query group.
+
+    The plain `fingerprints` key must be *absent*, not merely unused: `report.py` renders
+    evidence as generic sorted `k=v` pairs with no per-rule text, so a reader sees both
+    numbers side by side with nothing to say which one actually supports the proposal.
+    Unlike ADV001/ADV007 (one candidate, so a per-column count is the whole truth), this
+    rule's claim is about columns appearing *together*, and only the joint count says that.
+    """
     relation = Relation("public", "events")
     usage = (
         _usage(relation, "a", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1", "fp2")),
@@ -1875,6 +1882,7 @@ def test_adv008_reports_the_honest_joint_support_count():
     facts = {relation: _facts(relation, rows=5_000_000)}
     proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
     assert proposals[0].evidence["co_occurring_fingerprints"] == 1
+    assert "fingerprints" not in proposals[0].evidence
 
 
 def test_adv008_composite_is_just_the_seed_when_it_shares_nothing_with_any_other_column():
