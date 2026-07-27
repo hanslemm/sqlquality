@@ -80,7 +80,7 @@ def test_proposal_and_aggregation_construct():
         calls=5,
         cost_ms=50.0,
         cost_share=0.5,
-        fingerprints=2,
+        fingerprint_ids=frozenset({"fp1", "fp2"}),
     )
     agg = Aggregation(
         usage=(usage,), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
@@ -100,3 +100,29 @@ def test_proposal_and_aggregation_construct():
 def test_raw_query_row_requires_only_sql_calls_and_time():
     row = RawQueryRow(sql="SELECT 1", calls=1, total_time_ms=1.0)
     assert row.bytes_scanned is None
+
+
+def test_fingerprints_is_derived_from_the_id_set():
+    """One source of truth. The two used to be separate fields kept in step by convention,
+    with nothing stopping a caller setting one and not the other."""
+    usage = ColumnUsage(
+        table="orders",
+        column="status",
+        role=ColumnRole.EQUALITY,
+        calls=5,
+        cost_ms=50.0,
+        cost_share=0.5,
+        fingerprint_ids=frozenset({"a", "b"}),
+    )
+    assert usage.fingerprints == 2
+
+    with pytest.raises(TypeError):
+        ColumnUsage(  # type: ignore[call-arg]
+            table="orders",
+            column="status",
+            role=ColumnRole.EQUALITY,
+            calls=5,
+            cost_ms=50.0,
+            cost_share=0.5,
+            fingerprints=2,
+        )
