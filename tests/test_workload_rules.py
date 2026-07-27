@@ -1224,25 +1224,41 @@ def test_adv001_and_adv007_prefix_collision_collapses_instead_of_shipping_a_pair
     assert "ADV007" in creates[0].rationale
 
 
+def _plain_index_proposal(code, columns, confidence=Confidence.HIGH, relation=_ORDERS):
+    """A minimal `CREATE INDEX` proposal eligible for `_collapse_index_prefixes` /
+    `_disclose_column_set_overlaps` — built by hand so prefix-collision tests can control
+    exactly which proposals collide, instead of tuning real rule inputs to get there."""
+    quoted = ", ".join(f'"{c}"' for c in columns)
+    return Proposal(
+        code=code,
+        title=f"{code} on {relation}({', '.join(columns)})",
+        rationale=f"{code} rationale for {columns}.",
+        evidence={"schema": relation.schema, "table": relation.table, "columns": columns},
+        confidence=confidence,
+        ddl=f'CREATE INDEX ON "{relation.schema}"."{relation.table}" ({quoted});',
+    )
+
+
 def test_prefix_collision_collapses_regardless_of_which_rule_appended_first():
     """Determinism: `propose()` hardcodes a call order today, but the collapse must not
-    depend on it — feed the same evidence through both orderings via the module-level
-    functions directly and require the same surviving proposal and the same folded text.
+    depend on it. Two proposals must be absorbed into the same wider one — with only one
+    absorbed proposal, `sorted(absorbed, ...)` inside `_collapse_index_prefixes` is a
+    no-op and this test cannot tell a real sort from none at all.
     """
-    wide_usage = [
-        _usage(_ORDERS, "customer_id", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
-        _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_share=0.5, cost_ms=50.0),
-    ]
-    narrow_usage = [_usage(_ORDERS, "customer_id", ColumnRole.JOIN, cost_share=0.55, cost_ms=55.0)]
-    facts = _facts_map(ndv={"customer_id": 9999.0})
-    wide = propose_indexes(wide_usage, facts, {}, min_cost_share=0.01)
-    narrow = propose_join_keys(narrow_usage, facts, {}, min_cost_share=0.01)
+    wide = _plain_index_proposal("ADV001", ("customer_id", "created_at", "region"))
+    narrow_one = _plain_index_proposal("ADV007", ("customer_id",))
+    narrow_two = _plain_index_proposal("ADV008", ("customer_id", "created_at"), Confidence.MEDIUM)
 
-    forward = PostgresWorkloadAdapter._collapse_index_prefixes([*wide, *narrow])
-    backward = PostgresWorkloadAdapter._collapse_index_prefixes([*narrow, *wide])
+    forward = PostgresWorkloadAdapter._collapse_index_prefixes([wide, narrow_one, narrow_two])
+    backward = PostgresWorkloadAdapter._collapse_index_prefixes([narrow_two, narrow_one, wide])
+    shuffled = PostgresWorkloadAdapter._collapse_index_prefixes([narrow_one, wide, narrow_two])
 
-    assert codes(forward) == codes(backward) == ["ADV001"]
-    assert forward[0].rationale == backward[0].rationale
+    assert codes(forward) == codes(backward) == codes(shuffled) == ["ADV001"]
+    assert forward[0].rationale == backward[0].rationale == shuffled[0].rationale
+    # Both absorbed proposals' rationale must actually be present — this is what makes the
+    # sort's job non-trivial: two notes, and their concatenation order must not vary.
+    assert "ADV007" in forward[0].rationale
+    assert "ADV008" in forward[0].rationale
 
 
 def test_adv001_and_adv008_same_column_set_different_order_are_disclosed_not_collapsed():
@@ -1294,6 +1310,154 @@ def test_a_partial_index_is_never_collapsed_against_a_plain_prefix():
     assert "ADV001" not in adv004.rationale
     adv001 = next(p for p in proposals if p.code == "ADV001")
     assert "ADV004" not in adv001.rationale
+
+
+def test_disclose_overlaps_orders_notes_deterministically_with_three_same_set_proposals():
+    """With only two proposals sharing a column set the note each gets is symmetric and
+    order cannot matter — the bug needs at least three, so a given proposal names more
+    than one partner and the join order of those names has something to get wrong.
+    """
+    p1 = _plain_index_proposal("ADV001", ("a", "b", "c"))
+    p2 = _plain_index_proposal("ADV007", ("b", "a", "c"))
+    p3 = _plain_index_proposal("ADV008", ("c", "b", "a"))
+
+    def rationale_by_code(order):
+        result = PostgresWorkloadAdapter._disclose_column_set_overlaps(list(order))
+        return {p.code: p.rationale for p in result}
+
+    forward = rationale_by_code([p1, p2, p3])
+    backward = rationale_by_code([p3, p2, p1])
+    shuffled = rationale_by_code([p2, p3, p1])
+
+    assert forward == backward == shuffled
+    # Sanity: each did get both partners named, not merely "no notes at all" everywhere.
+    assert "ADV007" in forward["ADV001"] and "ADV008" in forward["ADV001"]
+
+
+def test_collapse_index_prefixes_never_crosses_relations():
+    """A prefix relationship across two different tables is meaningless, even when the
+    columns are identical strings."""
+    shipments = Relation("public", "shipments")
+    wide = _plain_index_proposal("ADV001", ("a", "b"))
+    narrow = _plain_index_proposal("ADV007", ("a",), relation=shipments)
+
+    result = PostgresWorkloadAdapter._collapse_index_prefixes([wide, narrow])
+
+    assert codes(result) == ["ADV001", "ADV007"]
+    assert "ADV007" not in result[0].rationale
+    assert "ADV001" not in result[1].rationale
+
+
+def test_disclose_overlaps_never_crosses_relations():
+    """Same column set, different order, but on two different tables: not an overlap."""
+    shipments = Relation("public", "shipments")
+    p1 = _plain_index_proposal("ADV001", ("a", "b"))
+    p2 = _plain_index_proposal("ADV008", ("b", "a"), relation=shipments)
+
+    result = PostgresWorkloadAdapter._disclose_column_set_overlaps([p1, p2])
+
+    assert result[0].rationale == p1.rationale
+    assert result[1].rationale == p2.rationale
+
+
+def test_index_creation_columns_rejects_a_missing_or_empty_columns_tuple():
+    """A proposal whose evidence carries no columns, or an empty tuple of them, must never
+    be treated as eligible for prefix collapsing or overlap disclosure — there is nothing
+    to compare."""
+    missing = Proposal(
+        code="ADV001",
+        title="t",
+        rationale="r",
+        evidence={"schema": "public", "table": "orders"},
+        confidence=Confidence.HIGH,
+        ddl='CREATE INDEX ON "public"."orders" ("a");',
+    )
+    empty = Proposal(
+        code="ADV001",
+        title="t",
+        rationale="r",
+        evidence={"schema": "public", "table": "orders", "columns": ()},
+        confidence=Confidence.HIGH,
+        ddl='CREATE INDEX ON "public"."orders" ();',
+    )
+    assert PostgresWorkloadAdapter._index_creation_columns(missing) is None
+    assert PostgresWorkloadAdapter._index_creation_columns(empty) is None
+
+
+def test_adv001_states_the_same_low_ndv_caveat_as_adv007():
+    """Task 6 gave ADV007 a caveat for a low leading NDV; ADV001 emitted LOW for the exact
+    same reason with no explanation at all. Batch 2's other rules make that asymmetry
+    visible in one report, so the wording must now match — confidence is unaffected, only
+    the explanation changes.
+    """
+    low = propose_indexes(
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 3.0}),
+        {},
+        min_cost_share=0.01,
+    )
+    assert low[0].confidence is Confidence.LOW
+    assert "Only about 3 distinct values" in low[0].rationale
+    assert "selective enough to be worth its write cost" in low[0].rationale
+
+    # HIGH and MEDIUM must not gain the sentence — it is specifically the low-NDV caveat.
+    high = propose_indexes(
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 5000.0}),
+        {},
+        min_cost_share=0.01,
+    )
+    assert high[0].confidence is Confidence.HIGH
+    assert "distinct values" not in high[0].rationale
+
+    no_stats = propose_indexes(
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={}),
+        {},
+        min_cost_share=0.01,
+    )
+    assert no_stats[0].confidence is Confidence.MEDIUM
+    assert "distinct values" not in no_stats[0].rationale
+
+
+def test_fold_discarded_deduplicates_repeated_sentences_across_three_proposals():
+    """ADV001, ADV007 and ADV008 share verbatim wording for the partial/expression-index
+    disclosures, so a real three-way collision would otherwise repeat the same sentence up
+    to three times. A sentence must be dropped only when it exactly repeats one already
+    present; a sentence unique to one proposal must always survive.
+    """
+    shared = "This sentence is shared by all three."
+    survivor = Proposal(
+        code="ADV001",
+        title="wide",
+        rationale=f"{shared} Only ADV001 says this.",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.HIGH,
+        ddl="DDL",
+    )
+    loser_one = Proposal(
+        code="ADV007",
+        title="n1",
+        rationale=f"{shared} Only ADV007 says this.",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.HIGH,
+        ddl="DDL",
+    )
+    loser_two = Proposal(
+        code="ADV008",
+        title="n2",
+        rationale=f"{shared} Only ADV008 says this.",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.MEDIUM,
+        ddl="DDL",
+    )
+
+    merged = PostgresWorkloadAdapter._fold_discarded(survivor, [loser_one, loser_two])
+
+    assert merged.rationale.count(shared) == 1
+    assert "Only ADV001 says this." in merged.rationale
+    assert "Only ADV007 says this." in merged.rationale
+    assert "Only ADV008 says this." in merged.rationale
 
 
 def test_propose_collapses_an_index_flagged_both_unused_and_redundant():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -250,6 +251,22 @@ def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | N
     return None
 
 
+#: A period followed by whitespace, i.e. a sentence boundary in this module's own generated
+#: rationale prose — never an abbreviation, since none of the rationale text this module
+#: writes uses one.
+_SENTENCE_BOUNDARY = re.compile(r"(?<=\.)\s+")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split rationale prose into its component sentences.
+
+    Used to detect whole-sentence duplication when folding one proposal's rationale into
+    another's — not a general-purpose sentence splitter, just good enough for text this
+    same module generates and controls the wording of.
+    """
+    return [s for s in (chunk.strip() for chunk in _SENTENCE_BOUNDARY.split(text.strip())) if s]
+
+
 #: The schema `WorkloadAdapter.schemas` defaults to before the CLI resolves `--schema`.
 #: Each rule now derives its DDL's schema from the `Relation` it is proposing for, since a
 #: single run-wide schema stopped being meaningful once more than one schema is in play —
@@ -390,6 +407,15 @@ def propose_indexes(
             )
         if rows is None:
             rationale += _UNKNOWN_ROWS_NOTE
+        # Same caveat as ADV007's, word for word: a low leading NDV is why this proposal is
+        # LOW rather than HIGH, and until this line existed ADV001 downgraded silently while
+        # ADV007 explained itself for the identical reason — an asymmetry an operator should
+        # not have to notice depends on which rule happened to propose the index.
+        if leading_ndv is not None and leading_ndv < SELECTIVE_NDV:
+            rationale += (
+                f" Only about {leading_ndv:.0f} distinct values, so the index may not be "
+                "selective enough to be worth its write cost."
+            )
         if partial_skipped:
             rationale += (
                 f" A partial index ({', '.join(partial_skipped)}) leads with these columns "
@@ -1472,26 +1498,44 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
     @classmethod
     def _fold_discarded(cls, survivor: Proposal, discarded: Sequence[Proposal]) -> Proposal:
-        """Attach every discarded proposal's rationale, verbatim and attributed, to the
+        """Attach every discarded proposal's distinguishing rationale, attributed, to the
         survivor's.
 
         `_dedupe_by_ddl` and `_collapse_index_prefixes` each throw a whole `Proposal` away
         and keep only one rationale where two, or more, existed. Diffing the texts to keep
-        "only the part that's new" would need to guess which sentence is the caveat worth
-        keeping — fragile, and silently wrong the moment a rule's wording changes elsewhere.
-        Folding the *entire* discarded rationale in instead needs no such guess: nothing a
-        discarded proposal said can go missing from the report, for this pair or any future
-        one. The discarded proposal's confidence is stated too, since a reader comparing two
-        proposals for the same index needs to know they disagreed on how sure to be, not
-        just what each said.
+        "only the part that's new" at the paragraph level would need to guess which
+        sentence is the caveat worth keeping — fragile, and silently wrong the moment a
+        rule's wording changes elsewhere. Instead, every discarded rationale is split into
+        whole sentences and folded in verbatim, in order, *skipping a sentence only if that
+        exact sentence already appears* — in the survivor's rationale or in an
+        already-folded discarded one. ADV001, ADV007 and ADV008 share verbatim wording for
+        the partial-index and expression-index disclosures, so a real three-way collision
+        would otherwise repeat the same sentence up to three times in one paragraph — a
+        report an operator reads to decide whether to run the DDL should not look broken
+        that way. A sentence unique to one discarded proposal always survives: only exact
+        repeats are dropped, never trimmed or summarised. The discarded proposal's
+        confidence is stated regardless of whether any of its sentences are new, since a
+        reader comparing two proposals for the same index needs to know they disagreed on
+        how sure to be, not just what each said.
         """
         if not discarded:
             return survivor
-        notes = "".join(
-            f" {p.code} reached the same index at {p.confidence.value} confidence: {p.rationale}"
-            for p in discarded
-        )
-        return replace(survivor, rationale=survivor.rationale + notes)
+        seen = set(_sentences(survivor.rationale))
+        notes: list[str] = []
+        for p in discarded:
+            fresh = [s for s in _sentences(p.rationale) if s not in seen]
+            seen.update(fresh)
+            if fresh:
+                notes.append(
+                    f" {p.code} reached the same index at {p.confidence.value} confidence: "
+                    f"{' '.join(fresh)}"
+                )
+            else:
+                notes.append(
+                    f" {p.code} reached the same index at {p.confidence.value} confidence, "
+                    "stating nothing beyond what is already covered above."
+                )
+        return replace(survivor, rationale=survivor.rationale + "".join(notes))
 
     @classmethod
     def _dedupe_by_ddl(cls, proposals: list[Proposal]) -> list[Proposal]:
@@ -1669,6 +1713,14 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         prefix of the other. Silence here would recommend two overlapping indexes with no
         acknowledgement that they overlap, leaving the operator to notice on their own that
         creating both means indexing the same columns twice.
+
+        With only two proposals sharing a column set this is symmetric and order cannot
+        matter. With three or more (today latent: ADV001 and ADV008 each propose at most one
+        composite per relation and ADV007 is single-column only, so three same-set
+        proposals cannot occur yet), a given proposal names *every* other member sharing its
+        set, and those names are sorted by the same canonical key
+        `_collapse_index_prefixes` uses — rather than by the order pairs happened to be
+        discovered in — so which proposal appended first cannot change the resulting text.
         """
         pairs: list[tuple[int, tuple[Relation, tuple[str, ...]]]] = []
         for i, proposal in enumerate(proposals):
@@ -1676,7 +1728,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             if key is not None:
                 pairs.append((i, key))
 
-        notes: dict[int, list[str]] = {}
+        def sort_key(proposal: Proposal) -> tuple[str, str, str]:
+            return (proposal.code, proposal.title, proposal.ddl or "")
+
+        notes: dict[int, list[tuple[tuple[str, str, str], str]]] = {}
         for a in range(len(pairs)):
             i, (relation_i, columns_i) = pairs[a]
             for b in range(a + 1, len(pairs)):
@@ -1686,24 +1741,31 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 if set(columns_i) != set(columns_j):
                     continue
                 notes.setdefault(i, []).append(
-                    f"{proposals[j].code} proposes an index on the same columns in a "
-                    f"different order ({', '.join(columns_j)}) for the same table. Neither "
-                    "is redundant — different leading columns serve different probes — but "
-                    "creating both means two overlapping indexes; confirm the workload "
-                    "needs both orderings before applying both."
+                    (
+                        sort_key(proposals[j]),
+                        f"{proposals[j].code} proposes an index on the same columns in a "
+                        f"different order ({', '.join(columns_j)}) for the same table. "
+                        "Neither is redundant — different leading columns serve different "
+                        "probes — but creating both means two overlapping indexes; confirm "
+                        "the workload needs both orderings before applying both.",
+                    )
                 )
                 notes.setdefault(j, []).append(
-                    f"{proposals[i].code} proposes an index on the same columns in a "
-                    f"different order ({', '.join(columns_i)}) for the same table. Neither "
-                    "is redundant — different leading columns serve different probes — but "
-                    "creating both means two overlapping indexes; confirm the workload "
-                    "needs both orderings before applying both."
+                    (
+                        sort_key(proposals[i]),
+                        f"{proposals[i].code} proposes an index on the same columns in a "
+                        f"different order ({', '.join(columns_i)}) for the same table. "
+                        "Neither is redundant — different leading columns serve different "
+                        "probes — but creating both means two overlapping indexes; confirm "
+                        "the workload needs both orderings before applying both.",
+                    )
                 )
 
         if not notes:
             return proposals
         result = list(proposals)
-        for idx, messages in notes.items():
+        for idx, entries in notes.items():
+            messages = [message for _key, message in sorted(entries, key=lambda e: e[0])]
             result[idx] = replace(
                 result[idx], rationale=result[idx].rationale + " " + " ".join(messages)
             )
