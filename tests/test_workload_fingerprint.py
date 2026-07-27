@@ -230,6 +230,14 @@ def test_redaction_still_erases_a_real_literal_beside_a_placeholder():
             "SELECT id FROM orders WHERE status = 'x'",
         ),
         ("copy (select 1) to stdout", "select 1"),
+        # Not cosmetic: greedy `.*` under DOTALL lets the query group absorb the space
+        # before the closing paren, so without `.strip()` this would return
+        # "SELECT a FROM t " (trailing space) — a distinct fingerprint-grouping key from
+        # the space-free forms above, even though it is the same query.
+        (
+            "COPY ( SELECT a FROM t ) TO STDOUT",
+            "SELECT a FROM t",
+        ),
     ],
 )
 def test_unwrap_recovers_the_inner_query(sql, expected):
@@ -241,15 +249,30 @@ def test_unwrap_recovers_the_inner_query(sql, expected):
     [
         "SELECT id FROM orders",
         "COPY orders TO STDOUT",
-        "COPY orders (id, status) FROM STDIN",
-        "FETCH 100 FROM c",
-        "CLOSE c",
+        # A later `(` must not be enough: guards a loosened prefix anchor (e.g.
+        # `^\s*COPY\s*[^(]*\(`) that skips ahead to the first paren instead of requiring
+        # one immediately after `COPY`.
+        "COPY orders (id, status) TO STDOUT",
+        # Guards the `\bTO\b` anchor that excludes writes: a `COPY (...) FROM STDIN` wraps
+        # a query but is loading it, not reading it, and must stay noise.
+        "COPY (SELECT 1) FROM STDIN",
+        # Guards the capture group's `\S` requirement: a query after `FOR` is mandatory,
+        # not optional.
         "DECLARE c CURSOR FOR",
-        "DECLARE",
     ],
 )
 def test_unwrap_leaves_everything_else_alone(sql):
-    """Anything without a recoverable inner query is returned unchanged, not mangled."""
+    """Anything without a recoverable inner query is returned unchanged, not mangled.
+
+    `FETCH 100 FROM c`, `CLOSE c` and a bare `DECLARE` used to be members here too, but none
+    of them discriminated anything: none starts with a keyword either pattern's grammar
+    depends on past its first literal token, so no plausible single mutation of
+    `_DECLARE_CURSOR` or `_COPY_QUERY`'s internals would make any of them match — they
+    passed before the patterns existed and would pass against almost any broken version of
+    them just the same. `FETCH`/`CLOSE` staying noise is `is_noise`'s contract, not
+    `unwrap`'s, and is already exercised where it matters: at the `ingest` level, by the
+    ordering tests below.
+    """
     assert unwrap(sql) == sql
 
 

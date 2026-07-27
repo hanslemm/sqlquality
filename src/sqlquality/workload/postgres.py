@@ -50,9 +50,11 @@ CAP_INDEXES = "indexes"
 #: the ask would make a routine request look alarming.
 _HINTS = {
     CAP_WORKLOAD: (
-        "requires the pg_stat_statements extension (PostgreSQL 13+) and pg_read_all_stats "
+        "requires the pg_stat_statements extension (PostgreSQL 14+) and pg_read_all_stats "
         "or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On "
-        "PostgreSQL 12 and older the view lacks total_exec_time and this will fail."
+        "PostgreSQL 13 and older the view lacks the toplevel column this query filters on "
+        "(needed to avoid double-counting a COPY (...) TO execution under "
+        "pg_stat_statements.track = all) and this will fail."
     ),
     CAP_STATS_RESET: "reads pg_stat_database; world-readable unless explicitly revoked",
     CAP_SCHEMA: (
@@ -1152,13 +1154,29 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # call is the natural selectivity signal for a future confidence refinement
         # ("returns 3 rows from 8M — an excellent index candidate"), and fetching it costs
         # nothing. Task 8 unpacks it as `_rows`.
-        # `total_exec_time` requires PostgreSQL 13+; it was `total_time` on 12 and older,
-        # both long past end-of-life. The privilege hint states the floor.
+        #
+        # `AND s.toplevel` matters under `pg_stat_statements.track = all`: a `COPY (SELECT
+        # ...) TO ...` then produces *two* rows for one execution — the verbatim top-level
+        # utility statement (`toplevel = true`, carrying the real cost and row count) and
+        # its normalised nested query (`toplevel = false`, roughly the same cost again).
+        # `unwrap`/redaction give the pair *different* fingerprints (a literal in the first,
+        # `$1` in the second), so without this filter the same execution is counted as two
+        # query groups at ~2x its true cost, inflating both that group's cost_share and the
+        # whole-window denominator. Filtering to `toplevel` keeps the row `unwrap` already
+        # knows how to handle and drops the duplicate; it belongs in the WHERE clause (not
+        # a post-fetch Python filter) so `LIMIT` operates on the deduplicated set rather
+        # than spending slots on rows we would discard anyway.
+        #
+        # `toplevel` requires PostgreSQL 14+ (`total_exec_time` alone would only require
+        # 13+, itself long past end-of-life, but the double-count fix needs the newer
+        # column) — the privilege hint states the real floor, and on an older server this
+        # capability degrades with that server's own "column does not exist" message rather
+        # than failing silently.
         CAP_WORKLOAD: """
             SELECT s.query, s.calls, s.total_exec_time, s.rows
             FROM pg_stat_statements s
             JOIN pg_database d ON d.oid = s.dbid
-            WHERE d.datname = current_database()
+            WHERE d.datname = current_database() AND s.toplevel
             ORDER BY s.total_exec_time DESC
             LIMIT %s
         """,

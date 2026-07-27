@@ -114,6 +114,63 @@ def test_workload_statement_is_scoped_to_the_current_database():
     assert "order by" in sql and "limit" in sql
 
 
+def test_workload_statement_filters_to_toplevel_statements():
+    """Guards the double-count fix at the SQL level.
+
+    Under `pg_stat_statements.track = all`, one `COPY (SELECT ...) TO ...` execution
+    produces two rows: the verbatim top-level utility statement (`toplevel = true`,
+    carrying the real cost) and its normalised nested query (`toplevel = false`, roughly
+    the same cost again) — `unwrap`/redaction give the pair different fingerprints, so
+    without this filter the same execution is double-counted. The filter belongs in the
+    WHERE clause, before `LIMIT`, so `LIMIT` is not spent on rows that would be discarded
+    anyway.
+    """
+    sql = PostgresWorkloadAdapter().SQL[CAP_WORKLOAD].lower()
+    assert "toplevel" in sql
+    where, _, rest = sql.partition("order by")
+    assert "limit" not in where
+    assert "limit" in rest
+
+
+def test_workload_hint_states_the_true_version_floor():
+    """`toplevel` requires PostgreSQL 14+, one version later than `total_exec_time` alone
+    would need — the hint must say so, or a PG13 operator is told a grant is missing when
+    the real problem is the server version."""
+    hint = PostgresWorkloadAdapter().introspection_sql()
+    workload_hint = next(s.privilege_hint for s in hint if s.capability == CAP_WORKLOAD)
+    assert "14+" in workload_hint
+    assert "13" in workload_hint  # names the version that will fail, not just the floor
+
+
+def test_fetch_workload_rejects_a_response_shaped_by_the_bug_it_guards_against():
+    """Simulates what `fetch_workload` would see if the `toplevel` filter were ever
+    dropped: a real PostgreSQL server running `track = all` hands back both the verbatim
+    `COPY` row and its normalised nested duplicate for one execution. This queries a fake
+    server that implements the WHERE clause literally — it drops non-toplevel rows only
+    when the SQL text asks it to — so removing `AND s.toplevel` from CAP_WORKLOAD makes
+    this test start seeing (and failing on) the duplicate, not just silently pass.
+    """
+    all_rows = [
+        # toplevel=true: the verbatim COPY, correctly costed.
+        ("copy (select id from orders where status = 'x') to stdout", 1, 20.1, 40000),
+        # toplevel=false: the same execution's nested, normalised duplicate.
+        ("select id from orders where status = $1", 1, 19.8, 40000),
+    ]
+
+    def querier(sql, params):
+        if "pg_stat_statements" in sql:
+            if "s.toplevel" in sql:
+                return [all_rows[0]]  # a real WHERE s.toplevel would keep only this row
+            return list(all_rows)  # no filter: both rows for the one execution survive
+        if "pg_stat_database" in sql:
+            return [("2026-07-01",)]
+        return []
+
+    fetch = PostgresWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert len(fetch.rows) == 1, "the COPY execution must be counted once, not twice"
+    assert fetch.rows[0].total_time_ms == 20.1
+
+
 class FakeQuerier:
     """Returns canned rows per capability, keyed by a distinctive SQL substring."""
 
