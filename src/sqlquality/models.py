@@ -184,7 +184,10 @@ class Aggregation:
 class TableFacts:
     """Engine-neutral catalog facts. Engine-specific physical design stays in the adapter."""
 
-    name: str
+    #: The schema-qualified key this table is stored under — not a display name. Two
+    #: same-named tables in different schemas each get their own `TableFacts`, keyed by
+    #: their own `Relation`; a bare name here would alias them back together.
+    relation: Relation
     row_estimate: int | None
     size_bytes: int | None
     columns: tuple[str, ...]

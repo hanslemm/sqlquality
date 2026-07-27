@@ -11,6 +11,7 @@ from sqlquality.models import (
     Proposal,
     QueryStat,
     RawQueryRow,
+    Relation,
     TableFacts,
     Workload,
 )
@@ -68,7 +69,9 @@ def test_workload_cost_totals_only_its_own_stats():
 
 
 def test_table_facts_ndv_defaults_empty():
-    facts = TableFacts(name="orders", row_estimate=100, size_bytes=None, columns=("id",))
+    facts = TableFacts(
+        relation=Relation("public", "orders"), row_estimate=100, size_bytes=None, columns=("id",)
+    )
     assert facts.ndv == {}
 
 

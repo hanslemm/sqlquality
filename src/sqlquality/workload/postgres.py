@@ -16,6 +16,7 @@ from sqlquality.models import (
     Confidence,
     Proposal,
     RawQueryRow,
+    Relation,
     TableFacts,
     Workload,
     WorkloadFetch,
@@ -791,18 +792,18 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             WHERE datname = current_database()
         """,
         CAP_SCHEMA: """
-            SELECT c.table_name, c.column_name, c.data_type
+            SELECT c.table_schema, c.table_name, c.column_name, c.data_type
             FROM information_schema.columns c
             WHERE c.table_schema = ANY(%s)
         """,
         CAP_TABLE_FACTS: """
-            SELECT c.relname, c.reltuples::bigint, pg_total_relation_size(c.oid)
+            SELECT n.nspname, c.relname, c.reltuples::bigint, pg_total_relation_size(c.oid)
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relkind = 'r' AND n.nspname = ANY(%s) AND c.relname = ANY(%s)
         """,
         CAP_NDV: """
-            SELECT s.tablename, s.attname, s.n_distinct
+            SELECT s.schemaname, s.tablename, s.attname, s.n_distinct
             FROM pg_stats s
             WHERE s.schemaname = ANY(%s) AND s.tablename = ANY(%s)
         """,
@@ -816,7 +817,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # serve its bare column — both of which the coverage and redundancy rules previously
         # had to guess at.
         CAP_INDEXES: """
-            SELECT t.relname, i.relname, a.attname, k.ordinality,
+            SELECT n.nspname, t.relname, i.relname, a.attname, k.ordinality,
                    ix.indisunique, ix.indisprimary,
                    COALESCE(psui.idx_scan, 0), pg_relation_size(i.oid),
                    ix.indpred IS NOT NULL,
@@ -831,7 +832,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
             LEFT JOIN pg_stat_user_indexes psui ON psui.indexrelid = i.oid
             WHERE n.nspname = ANY(%s) AND t.relname = ANY(%s)
-            ORDER BY t.relname, i.relname, k.ordinality
+            ORDER BY n.nspname, t.relname, i.relname, k.ordinality
         """,
     }
 
@@ -955,32 +956,53 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         return self._schema_cache[schemas]
 
     def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
-        schema: dict[str, dict[str, str]] = {}
-        for table, column, data_type in self._schema_rows(schemas):
-            schema.setdefault(str(table), {})[str(column)] = str(data_type)
+        """Nested schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+
+        Nested rather than flat because `qualify()` needs to be able to *tell* two
+        same-named tables apart — a flat map resolves a column against the union of both
+        column sets, which is how a filter on a column that exists in only one of them was
+        silently accepted.
+        """
+        schema: dict[str, dict[str, dict[str, str]]] = {}
+        for schema_name, table, column, data_type in self._schema_rows(schemas):
+            schema.setdefault(str(schema_name), {}).setdefault(str(table), {})[str(column)] = str(
+                data_type
+            )
         return schema
 
     def fetch_table_facts(
-        self, schemas: tuple[str, ...], tables: frozenset[str]
-    ) -> dict[str, TableFacts]:
-        wanted = sorted(tables)
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, TableFacts]:
+        # The `= ANY(%s)` table parameter stays a list of bare names: Postgres filters on
+        # `relname`/`tablename`, and narrowing per-schema would need one statement per
+        # schema. Passing the union of bare names over-fetches slightly — a same-named
+        # table in a schema we did not ask about comes back too — but that row's relation
+        # key then simply has no consumer, since only the relations in `relations` are
+        # ever assembled into the result below.
+        wanted = sorted({relation.table for relation in relations})
         sizes = {
-            str(name): (
+            Relation(schema=str(schema_name), table=str(name)): (
                 _row_estimate(rows),
                 _as_int(size) if size is not None else None,
             )
-            for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
+            for schema_name, name, rows, size in self._run(
+                CAP_TABLE_FACTS, (list(schemas), wanted)
+            )
         }
-        columns: dict[str, list[str]] = {}
-        for table, column, _type in self._schema_rows(schemas):
-            if str(table) in tables:
-                columns.setdefault(str(table), []).append(str(column))
+        columns: dict[Relation, list[str]] = {}
+        for schema_name, table, column, _type in self._schema_rows(schemas):
+            relation = Relation(schema=str(schema_name), table=str(table))
+            if relation in relations:
+                columns.setdefault(relation, []).append(str(column))
 
-        ndv: dict[str, dict[str, float]] = {}
-        for table, column, n_distinct in self._run(CAP_NDV, (list(schemas), wanted)):
+        ndv: dict[Relation, dict[str, float]] = {}
+        for schema_name, table, column, n_distinct in self._run(
+            CAP_NDV, (list(schemas), wanted)
+        ):
             if n_distinct is None:
                 continue
             value = _as_float(n_distinct)
+            relation = Relation(schema=str(schema_name), table=str(table))
             if value < 0:
                 # Postgres encodes "distinct as a fraction of row count" as a negative
                 # value, which is meaningless without the row count. If the row-count query
@@ -988,33 +1010,38 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 # privileges can hide it — omit the column so it reads as *unknown*.
                 # Defaulting the row estimate to 0 would fabricate "zero distinct values"
                 # and hand every proposal on this table a false LOW-confidence rating.
-                row_estimate = sizes.get(str(table), (None, None))[0]
+                row_estimate = sizes.get(relation, (None, None))[0]
                 if row_estimate is None:
                     continue
                 resolved = -value * row_estimate
             else:
                 resolved = value
-            ndv.setdefault(str(table), {})[str(column)] = resolved
+            ndv.setdefault(relation, {})[str(column)] = resolved
 
-        facts: dict[str, TableFacts] = {}
-        for table in wanted:
-            rows, size = sizes.get(table, (None, None))
-            facts[table] = TableFacts(
-                name=table,
+        facts: dict[Relation, TableFacts] = {}
+        for relation in sorted(relations):
+            rows, size = sizes.get(relation, (None, None))
+            facts[relation] = TableFacts(
+                relation=relation,
                 row_estimate=rows,
                 size_bytes=size,
-                columns=tuple(columns.get(table, ())),
-                ndv=ndv.get(table, {}),
+                columns=tuple(columns.get(relation, ())),
+                ndv=ndv.get(relation, {}),
             )
         return facts
 
     def fetch_indexes(
-        self, schemas: tuple[str, ...], tables: frozenset[str]
-    ) -> dict[str, tuple[PgIndex, ...]]:
-        """Existing indexes per table, columns in ordinal order."""
-        grouped: dict[tuple[str, str], _IndexRows] = {}
-        for row in self._run(CAP_INDEXES, (list(schemas), sorted(tables))):
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, tuple[PgIndex, ...]]:
+        """Existing indexes per relation, columns in ordinal order."""
+        # See the identical note in fetch_table_facts: the table parameter is bare names,
+        # so a same-named table in an unrequested schema can come back too, and its
+        # relation key then simply has no consumer.
+        wanted = sorted({relation.table for relation in relations})
+        grouped: dict[tuple[Relation, str], _IndexRows] = {}
+        for row in self._run(CAP_INDEXES, (list(schemas), wanted)):
             (
+                schema_name,
                 table,
                 index,
                 column,
@@ -1028,8 +1055,9 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 has_expressions,
                 definition,
             ) = row
+            relation = Relation(schema=str(schema_name), table=str(table))
             entry = grouped.setdefault(
-                (str(table), str(index)),
+                (relation, str(index)),
                 _IndexRows(
                     is_unique=bool(unique),
                     is_primary=bool(primary),
@@ -1050,9 +1078,9 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             if column is not None:
                 entry.columns.append((_as_int(ordinality), str(column)))
 
-        result: dict[str, list[PgIndex]] = {}
-        for (table, index), entry in grouped.items():
-            result.setdefault(table, []).append(
+        result: dict[Relation, list[PgIndex]] = {}
+        for (relation, index), entry in grouped.items():
+            result.setdefault(relation, []).append(
                 PgIndex(
                     name=index,
                     columns=tuple(column for _ordinality, column in sorted(entry.columns)),
@@ -1066,7 +1094,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     definition=entry.definition,
                 )
             )
-        return {table: tuple(indexes) for table, indexes in result.items()}
+        return {relation: tuple(indexes) for relation, indexes in result.items()}
 
     #: Highest confidence first, then largest cost share — the reading order a human wants.
     _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
