@@ -514,7 +514,7 @@ def test_unused_index_rule_ignores_tables_outside_the_workload():
     assert propose_unused_indexes(existing, hot_tables=frozenset({"orders"})) == []
 
 
-def test_redundant_prefix_index_proposed_for_drop():
+def test_a_plain_redundant_pair_is_high_confidence():
     existing = {
         "orders": (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
@@ -523,28 +523,67 @@ def test_redundant_prefix_index_proposed_for_drop():
     }
     proposals = propose_redundant_indexes(existing)
     assert codes(proposals) == ["ADV003"]
+    assert proposals[0].confidence is Confidence.HIGH
     assert proposals[0].evidence["index"] == "idx_narrow"
-    # Capped at MEDIUM: PgIndex carries no predicate, so a partial index is
-    # indistinguishable from a full one here. See the test below.
-    assert proposals[0].confidence is Confidence.MEDIUM
 
 
-def test_redundant_index_rationale_admits_it_cannot_see_a_partial_predicate():
-    """HIGH is the strongest claim the tool makes, and "serves the same lookups" is false
-    for a partial or expression index. The README limitation does not travel inside the
-    .sql file the operator actually runs, so the caveat has to be in the rationale.
-    """
+def test_a_partial_narrow_index_is_never_called_redundant():
+    """The partial index exists to serve a subset; the wider full index serves it
+    differently. Dropping it is not less certain, it is probably wrong."""
     existing = {
         "orders": (
-            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex(
+                "idx_open",
+                ("status",),
+                False,
+                False,
+                5,
+                1,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(existing)
-    rationale = proposals[0].rationale.lower()
-    assert "column list" in rationale
-    assert "partial" in rationale
-    assert "expression" in rationale
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_a_partial_wider_index_does_not_supersede_a_plain_one():
+    existing = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex(
+                "idx_wide_open",
+                ("status", "created_at"),
+                False,
+                False,
+                5,
+                1,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_an_expression_bearing_pair_is_skipped():
+    existing = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex(
+                "idx_expr",
+                ("status",),
+                False,
+                False,
+                5,
+                1,
+                has_expressions=True,
+                definition="CREATE INDEX idx_expr ON orders (status, lower(note))",
+            ),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
 
 
 def test_a_unique_prefix_index_is_never_called_redundant():
