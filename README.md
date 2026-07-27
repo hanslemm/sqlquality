@@ -312,7 +312,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--profile` | — | dbt profile name, read from `profiles.yml`. |
 | `--target` | — | dbt target within the profile. |
 | `--profiles-dir` | `~/.dbt` | Directory holding `profiles.yml`. |
-| `--schema` | `public` | Schema to introspect. **One at a time** — passing two exits 2, see Limitations. |
+| `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
 | `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
@@ -465,7 +465,8 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
   "skipped": {
     "noise": 0,
     "unparseable": 0,
-    "unqualifiable": 0
+    "unqualifiable": 0,
+    "ambiguous": 0
   },
   "window": "since stats reset at 2026-07-19 03:00:00+00"
 }
@@ -475,11 +476,12 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
 JSON paths all print how many query groups were actually understood:
 
 ```console
-analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 filtered, 1 unresolvable
+analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 filtered, 1 unresolvable, 0 ambiguous
 low coverage: 33% of candidate statements could not be analyzed (0 unparseable, 1
-unresolvable against the schema). Cost shares are computed against the whole window, so
-they are diluted and --min-cost-share is effectively stricter — few or no proposals may
-reflect coverage rather than a healthy workload.
+unresolvable against the schema, 0 ambiguous across the introspected schemas). Cost shares
+are computed against the whole window, so they are diluted and --min-cost-share is
+effectively stricter — few or no proposals may reflect coverage rather than a healthy
+workload.
 ```
 
 This matters because `cost_share` is **not** a partition of the workload: a query
@@ -488,6 +490,16 @@ over their columns rather than the sum, since summing would double-count), and t
 denominator always includes queries that could not be parsed or resolved against the
 schema. Poor coverage silently dilutes every proposal's share rather than inflating it —
 read the skip counts alongside every proposal.
+
+Running with more than one `--schema`, a bare, unqualified table name held by two or more
+of the introspected schemas is genuinely ambiguous — attributing it to either would be a
+guess, so it is dropped and counted rather than guessed at:
+
+```console
+2 statement(s) named a table held by more than one of the introspected schemas without
+qualifying it, so they could not be attributed and were dropped. Qualify the table in the
+query, or run advise once per --schema.
+```
 
 A missing grant degrades one capability at a time rather than aborting the whole run:
 
@@ -795,13 +807,16 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
 - **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
   shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
   a candidate index — it is named in the evidence instead.
-- **One schema per run.** Every catalog fact is keyed on the bare relation name — table
-  sizes, NDV statistics, index lists and the `qualify()` schema all merge across schemas —
-  so `orders` in two schemas would alias into one another and the last catalog row read
-  would silently win the row estimate. Rather than report that quietly, `advise` rejects
-  more than one `--schema` with exit 2. Run it once per schema. Generated DDL is qualified
-  with the schema you passed, so it does not depend on the applying session's
-  `search_path`.
+- **Multiple `--schema` values are supported, with one honest caveat.** Every catalog fact
+  (table sizes, NDV statistics, index lists, the `qualify()` schema) is keyed by
+  `schema.table`, so `orders` in two introspected schemas no longer aliases into one
+  another. What remains is genuine ambiguity in the *query text* itself: a statement that
+  says `from orders` bare, when two of the introspected schemas both hold `orders`, cannot
+  be attributed to either without guessing — it is dropped and counted rather than guessed
+  at (see `ambiguous` in the skip counts, and the coverage warning that names the remedy).
+  Qualify the table in the query, or run `advise` once per `--schema`, to recover it.
+  Generated DDL is qualified with the schema it was read from, so it does not depend on the
+  applying session's `search_path`.
 - **Redshift, Snowflake and dbt enrichment are designed but not implemented.** `advise`
   supports Postgres only today; passing another `--engine` fails with a clear error
   rather than silently degrading.

@@ -146,12 +146,13 @@ def advise_payload(
         "analyzed": {
             "query_groups": len(workload.stats),
             "total_cost_ms": workload.total_cost_ms,
-            "tables": sorted(aggregation.tables),
+            "tables": sorted(str(relation) for relation in aggregation.tables),
         },
         "skipped": {
             "unparseable": workload.skipped_unparseable,
             "noise": workload.skipped_noise,
             "unqualifiable": aggregation.skipped_unqualifiable,
+            "ambiguous": aggregation.skipped_ambiguous,
         },
         "degraded": [{"capability": cap, "reason": reason} for cap, reason in degraded],
         "proposals": [
@@ -201,7 +202,8 @@ def render_advise_markdown(
             # COPY (SELECT ...) — ordinary reads. See cli._coverage_line.
             f"Skipped: {workload.skipped_unparseable} unparseable, "
             f"{workload.skipped_noise} filtered as non-workload by statement prefix, "
-            f"{aggregation.skipped_unqualifiable} unresolvable against the schema."
+            f"{aggregation.skipped_unqualifiable} unresolvable against the schema, "
+            f"{aggregation.skipped_ambiguous} ambiguous across the introspected schemas."
         ),
         "",
     ]

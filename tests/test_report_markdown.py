@@ -1,6 +1,6 @@
 from sqlquality.delta import ModelDelta
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Workload
+from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
 from sqlquality.report import advise_payload, render_advise_markdown, render_markdown
 
 PASS = GateReport(
@@ -103,7 +103,11 @@ WORKLOAD = Workload(
     skipped_noise=7,
 )
 AGGREGATION = Aggregation(
-    usage=(), total_cost_ms=500.0, skipped_unqualifiable=3, tables=frozenset({"orders"})
+    usage=(),
+    total_cost_ms=500.0,
+    skipped_unqualifiable=3,
+    tables=frozenset({Relation("public", "orders")}),
+    skipped_ambiguous=4,
 )
 
 
@@ -124,7 +128,12 @@ def test_payload_reports_proposals_window_and_skips():
     assert payload["redacted"] is True
     assert payload["window"] == "since stats reset at 2026-07-01"
     assert payload["proposals"][0]["code"] == "ADV001"
-    assert payload["skipped"] == {"unparseable": 2, "noise": 7, "unqualifiable": 3}
+    assert payload["skipped"] == {
+        "unparseable": 2,
+        "noise": 7,
+        "unqualifiable": 3,
+        "ambiguous": 4,
+    }
     assert payload["degraded"] == [{"capability": "ndv", "reason": "permission denied"}]
 
 
@@ -159,6 +168,7 @@ def test_markdown_discloses_the_window_and_the_skips():
     assert "7 filtered" in md
     assert "introspection/DDL" not in md
     assert "3 unresolvable" in md
+    assert "4 ambiguous" in md
 
 
 def test_markdown_escapes_an_evidence_key_as_well_as_its_value():

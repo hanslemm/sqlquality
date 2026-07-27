@@ -633,7 +633,8 @@ def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
         f"analyzed {_analyzed_count(workload, aggregation)} of {len(workload.stats)} "
         f"query group(s); skipped {workload.skipped_unparseable} unparseable, "
         f"{workload.skipped_noise} filtered, "
-        f"{aggregation.skipped_unqualifiable} unresolvable"
+        f"{aggregation.skipped_unqualifiable} unresolvable, "
+        f"{aggregation.skipped_ambiguous} ambiguous"
     )
 
 
@@ -642,10 +643,15 @@ def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | Non
 
     Noise (introspection, DDL, session control) is excluded from the denominator: those are
     deliberately filtered, not failures to understand. Only statements we tried and failed
-    to use count against coverage.
+    to use count against coverage — an ambiguous statement belongs in that sum exactly like
+    an unresolvable one: both are statements `aggregate()` tried and failed to attribute.
     """
     analyzed = _analyzed_count(workload, aggregation)
-    unexplained = workload.skipped_unparseable + aggregation.skipped_unqualifiable
+    unexplained = (
+        workload.skipped_unparseable
+        + aggregation.skipped_unqualifiable
+        + aggregation.skipped_ambiguous
+    )
     considered = analyzed + unexplained
     if not considered:
         return None
@@ -655,34 +661,42 @@ def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | Non
     return (
         f"low coverage: {share:.0%} of candidate statements could not be analyzed "
         f"({workload.skipped_unparseable} unparseable, "
-        f"{aggregation.skipped_unqualifiable} unresolvable against the schema). "
+        f"{aggregation.skipped_unqualifiable} unresolvable against the schema, "
+        f"{aggregation.skipped_ambiguous} ambiguous across the introspected schemas). "
         "Cost shares are computed against the whole window, so they are diluted and "
         "--min-cost-share is effectively stricter — few or no proposals may reflect "
         "coverage rather than a healthy workload."
     )
 
 
-def _validate_schemas(values: list[str]) -> tuple[str, ...]:
-    """Accept exactly one distinct schema, or exit 2 explaining why.
+def _ambiguity_warning(aggregation: Aggregation) -> str | None:
+    """A warning naming the remedy for schema-ambiguous statements, or None.
 
-    Every catalog fact `advise` collects is keyed on the bare relation name: table sizes,
-    NDV maps, index lists and the qualify() schema all merge across schemas, so two
-    schemas each holding an `orders` alias into one another silently — the last catalog
-    row wins the row estimate, and `qualify()` resolves columns against a union of the
-    two column sets. Rejecting is the honest minimum until the keys are schema-qualified.
+    Separate from `_coverage_warning`, which fires on a *fraction* and says "coverage is
+    low". This fires on any occurrence at all, because the remedy is specific and
+    actionable — and because a handful of ambiguous statements can be the hottest ones in
+    the workload without moving the coverage fraction enough to trip a threshold.
     """
-    distinct = tuple(dict.fromkeys(values))
-    if len(distinct) > 1:
-        typer.echo(
-            f"--schema accepts one schema at a time (got {', '.join(distinct)}). "
-            "Multi-schema introspection is not supported yet: table facts, index lists "
-            "and NDV statistics are keyed on the bare table name, not schema-qualified, "
-            "so same-named tables in two schemas would silently alias. Run advise once "
-            "per schema.",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-    return distinct
+    if not aggregation.skipped_ambiguous:
+        return None
+    return (
+        f"{aggregation.skipped_ambiguous} statement(s) named a table held by more than one "
+        "of the introspected schemas without qualifying it, so they could not be attributed "
+        "and were dropped. Qualify the table in the query, or run advise once per --schema."
+    )
+
+
+def _validate_schemas(values: list[str]) -> tuple[str, ...]:
+    """Deduplicate `--schema` values, preserving the order they were given in.
+
+    Multiple schemas used to be rejected because every catalog fact was keyed on the bare
+    relation name, so two schemas each holding an `orders` aliased into one another. Facts,
+    NDV maps, index lists and the `qualify()` schema are all keyed by `Relation` now, so the
+    rejection is gone. What survives is a narrower caveat, surfaced by
+    `_ambiguity_warning`: a query that says `from orders` when two introspected schemas both
+    hold `orders` is genuinely ambiguous, and is counted and reported rather than guessed at.
+    """
+    return tuple(dict.fromkeys(values))
 
 
 def _parse_since(value: str | None) -> timedelta | None:
@@ -713,7 +727,7 @@ def advise(
     schema: list[str] = typer.Option(
         ["public"],
         "--schema",
-        help="Schema to introspect. One at a time — passing two is rejected.",
+        help="Schema to introspect. Repeat for several: --schema public --schema sales.",
     ),
     since: str | None = typer.Option(
         None, "--since", help="Window, e.g. 7d. Not supported by pg_stat_statements."
@@ -885,6 +899,9 @@ def advise(
     coverage = _coverage_warning(workload, aggregation)
     if coverage is not None:
         typer.echo(coverage, err=True)
+    ambiguity = _ambiguity_warning(aggregation)
+    if ambiguity is not None:
+        typer.echo(ambiguity, err=True)
 
     table = Table(
         title=(

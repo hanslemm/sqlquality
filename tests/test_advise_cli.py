@@ -3,7 +3,14 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from sqlquality.cli import app
+from sqlquality.cli import (
+    _ambiguity_warning,
+    _coverage_line,
+    _validate_schemas,
+    app,
+)
+from sqlquality.models import Aggregation, QueryStat, Relation, Workload
+from sqlquality.report import advise_payload
 
 runner = CliRunner()
 
@@ -57,24 +64,92 @@ def test_out_of_range_timeout_exit_2_before_connecting(monkeypatch):
         assert "between 1 and 3600" in result.output
 
 
-def test_multiple_schemas_are_rejected_before_connecting(monkeypatch):
-    """Table facts are keyed on relname alone, so two schemas holding `orders` alias.
-
-    Rejecting is the honest minimum: the last row of whichever schema the catalog returned
-    last would otherwise decide the row estimate, silently.
-    """
-
-    def explode(*args, **kwargs):
-        raise AssertionError("must not connect with more than one --schema")
-
-    monkeypatch.setattr("sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode)
+def test_two_schemas_are_accepted(monkeypatch):
+    """Facts, NDV maps, index lists and qualify() are all keyed by `Relation` now, so a
+    second `--schema` no longer aliases same-named tables across schemas together."""
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
     result = runner.invoke(
         app,
-        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "public", "--schema", "app"],
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--schema",
+            "sales",
+            "--schema",
+            "staging",
+            "--json",
+        ],
     )
-    assert result.exit_code == 2
-    assert "schema-qualified" in result.output
-    assert "app" in result.output and "public" in result.output
+    assert result.exit_code == 0
+
+
+def test_duplicate_schemas_are_deduplicated():
+    assert _validate_schemas(["public", "public"]) == ("public",)
+
+
+def test_schema_order_is_preserved():
+    assert _validate_schemas(["b", "a"]) == ("b", "a")
+
+
+def test_coverage_line_reports_ambiguous_separately():
+    workload = _workload_with(stats=3, unparseable=1, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=1, skipped_ambiguous=2)
+    line = _coverage_line(workload, aggregation)
+    assert "2 ambiguous" in line
+
+
+def test_ambiguity_warning_names_the_remedy():
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=4)
+    warning = _ambiguity_warning(aggregation)
+    assert warning is not None
+    assert "--schema" in warning
+
+
+def test_no_ambiguity_means_no_warning():
+    """The warning must not fire on the single-schema path, which is every existing run."""
+    aggregation = _aggregation_with(skipped_unqualifiable=3, skipped_ambiguous=0)
+    assert _ambiguity_warning(aggregation) is None
+
+
+def test_payload_tables_are_qualified_strings():
+    payload = advise_payload(
+        [],
+        _workload_with(stats=0, unparseable=0, noise=0),
+        _aggregation_with(tables=frozenset({Relation("sales", "orders")})),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert payload["analyzed"]["tables"] == ["sales.orders"]
+    json.dumps(payload)  # must not raise
+
+
+def _workload_with(*, stats: int, unparseable: int, noise: int) -> Workload:
+    return Workload(
+        stats=tuple(
+            QueryStat(fingerprint=f"fp{i}", sql="select 1", calls=1, total_time_ms=1.0)
+            for i in range(stats)
+        ),
+        window_description="w",
+        skipped_unparseable=unparseable,
+        skipped_noise=noise,
+    )
+
+
+def _aggregation_with(
+    *,
+    skipped_unqualifiable: int = 0,
+    skipped_ambiguous: int = 0,
+    tables: frozenset[Relation] = frozenset(),
+) -> Aggregation:
+    return Aggregation(
+        usage=(),
+        total_cost_ms=0.0,
+        skipped_unqualifiable=skipped_unqualifiable,
+        tables=tables,
+        skipped_ambiguous=skipped_ambiguous,
+    )
 
 
 def test_a_single_schema_is_still_accepted(monkeypatch):
@@ -97,8 +172,8 @@ def test_low_coverage_warns_on_stderr(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -118,8 +193,8 @@ def test_good_coverage_does_not_warn(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -147,9 +222,9 @@ def _stub_adapter(monkeypatch, rows):
 
 
 WIDE_COLUMNS = [
-    ("orders", "id", "integer"),
-    ("orders", "status", "text"),
-    ("orders", "created_at", "timestamp"),
+    ("public", "orders", "id", "integer"),
+    ("public", "orders", "status", "text"),
+    ("public", "orders", "created_at", "timestamp"),
 ]
 
 
@@ -157,8 +232,8 @@ WIDE_COLUMNS = [
 STAR_ONLY_ROWS = {
     "pg_stat_statements": [("select * from wide_t", 100, 5000.0, 10)],
     "pg_stat_database": [("2026-07-01",)],
-    "information_schema.columns": [("wide_t", f"c{i}", "text") for i in range(20)],
-    "pg_total_relation_size": [("wide_t", 5_000_000, 10**8)],
+    "information_schema.columns": [("public", "wide_t", f"c{i}", "text") for i in range(20)],
+    "pg_total_relation_size": [("public", "wide_t", 5_000_000, 10**8)],
     "pg_stats": [],
     "pg_index": [],
 }
@@ -285,8 +360,8 @@ def test_successful_run_exits_0_and_emits_json(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -314,8 +389,8 @@ def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -390,8 +465,8 @@ def test_coverage_is_disclosed_even_on_a_clean_run(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
