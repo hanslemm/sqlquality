@@ -243,6 +243,53 @@ def test_ambiguous_bare_name_is_counted_not_crashed():
     assert result.usage == ()
 
 
+def test_bare_select_star_over_a_colliding_name_is_counted_ambiguous():
+    """A bare `select * from orders` has no predicate, so `qualify()` has no column
+    reference to validate and never raises for it — it just silently produces zero usage,
+    the same as it would for an *unambiguous* bare star. Left uncounted, that reads as
+    "nothing to see here" when what actually happened is the same unattributable-bare-name
+    fact `AmbiguousRelation` reports for a predicated statement (see
+    `test_ambiguous_bare_name_is_counted_not_crashed` above) — and the same fact ADV006's
+    `_wide_relations_touched` later declines to guess at for exactly this statement shape.
+    """
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from orders",
+                calls=1,
+                total_time_ms=100.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    result = aggregate(workload, COLLIDING, "postgres")
+    assert result.skipped_ambiguous == 1
+    assert result.usage == ()
+    assert result.tables == frozenset()
+
+
+def test_bare_select_star_over_an_unambiguous_name_is_not_counted():
+    """The new check must not fire just because a statement is a bare star — only when the
+    bare name it references is genuinely held by more than one introspected schema."""
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from items",
+                calls=1,
+                total_time_ms=100.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    result = aggregate(workload, TWO_SCHEMAS, "postgres")
+    assert result.skipped_ambiguous == 0
+    assert result.usage == ()
+
+
 def test_a_plain_parse_failure_is_not_counted_as_ambiguous():
     """The two counters must not both fire for the same statement."""
     result = aggregate(_mixed_workload("this is not sql at all"), ONE_SCHEMA, "postgres")

@@ -97,6 +97,25 @@ def star_tables(workload: Workload, schema: dict, dialect: str = "postgres") -> 
     return frozenset(found)
 
 
+def _references_an_ambiguous_bare_table(tree: exp.Expression, schema: dict) -> bool:
+    """True if `tree` names a bare table held by more than one introspected schema.
+
+    Mirrors `resolve_relation`'s own bare-name branch exactly: a table reference with no
+    `.db` qualifier is ambiguous precisely when more than one introspected schema defines a
+    table of that name. A schema-qualified reference is never ambiguous by this test — a
+    qualifier that names a schema we did not introspect is a *different* case
+    (`resolve_relation` returns `None` for it, not an ambiguity), and is deliberately not
+    reported here.
+    """
+    for table in tree.find_all(exp.Table):
+        if table.db:
+            continue
+        owners = [name for name, tables in schema.items() if table.name in tables]
+        if len(owners) > 1:
+            return True
+    return False
+
+
 def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
     """Weight every (relation, column, role) by the cost of the queries that use it."""
     calls: dict[_Key, int] = defaultdict(int)
@@ -120,6 +139,24 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
             continue
         except (SqlParseError, UnqualifiableQuery):
             skipped_unqualifiable += 1
+            continue
+        # A bare `select * from orders` (no predicate, no named column) contributes no
+        # usage either way — stars are never expanded — so `qualify()` above has nothing to
+        # validate and neither raises nor records anything for it, even when "orders" is a
+        # name two introspected schemas both hold. Left uncounted, that reads as "understood
+        # and irrelevant" when it is really the same unattributable-bare-name fact
+        # `AmbiguousRelation` reports elsewhere (and the reason ADV006's own
+        # `_wide_relations_touched` later declines to guess at it too); it just surfaces
+        # without an exception because there is no column reference for `qualify()` to
+        # trip over. Gated on `not triples`: a statement that already produced usage from
+        # some *other*, unambiguous table was not silently dropped, so it does not belong
+        # in this counter.
+        if (
+            not triples
+            and FLAG_SELECT_STAR in stat.flags
+            and _references_an_ambiguous_bare_table(tree, schema)
+        ):
+            skipped_ambiguous += 1
             continue
         for key in triples:
             calls[key] += stat.calls

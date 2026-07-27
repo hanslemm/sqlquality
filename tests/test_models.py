@@ -77,7 +77,7 @@ def test_table_facts_ndv_defaults_empty():
 
 def test_proposal_and_aggregation_construct():
     usage = ColumnUsage(
-        table="orders",
+        relation=Relation("public", "orders"),
         column="status",
         role=ColumnRole.EQUALITY,
         calls=5,
@@ -86,7 +86,10 @@ def test_proposal_and_aggregation_construct():
         fingerprint_ids=frozenset({"fp1", "fp2"}),
     )
     agg = Aggregation(
-        usage=(usage,), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
+        usage=(usage,),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({Relation("public", "orders")}),
     )
     assert agg.usage[0].role is ColumnRole.EQUALITY
     proposal = Proposal(
@@ -109,7 +112,7 @@ def test_fingerprints_is_derived_from_the_id_set():
     """One source of truth. The two used to be separate fields kept in step by convention,
     with nothing stopping a caller setting one and not the other."""
     usage = ColumnUsage(
-        table="orders",
+        relation=Relation("public", "orders"),
         column="status",
         role=ColumnRole.EQUALITY,
         calls=5,
@@ -121,7 +124,7 @@ def test_fingerprints_is_derived_from_the_id_set():
 
     with pytest.raises(TypeError):
         ColumnUsage(  # type: ignore[call-arg]
-            table="orders",
+            relation=Relation("public", "orders"),
             column="status",
             role=ColumnRole.EQUALITY,
             calls=5,

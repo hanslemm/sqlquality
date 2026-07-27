@@ -24,8 +24,8 @@ from sqlquality.models import (
     WorkloadFetch,
     cost_share_of,
 )
-from sqlquality.sqlast import SqlParseError, parse
-from sqlquality.workload.aggregate import mentions_identifier, mentions_table
+from sqlquality.sqlast import parse
+from sqlquality.workload.aggregate import mentions_identifier
 from sqlquality.workload.base import (
     MAX_TIMEOUT_S,
     MIN_TIMEOUT_S,
@@ -728,17 +728,21 @@ def _wide_relations_touched(
     here to the (usually much smaller) wide set, since that is all this rule can ever report
     on.
 
-    A statement that fails to parse falls back to the original bare-name text match rather
-    than reporting nothing — the same "keep the signal, note the limitation" trade-off the
-    rest of this rule makes for unparseable input elsewhere in the pipeline.
+    No parse-failure fallback: `sql` is always `stat.sql` from `workload.stats`, and
+    `ingest()` never adds a statement to `stats` unless `parse(row.sql, dialect)` already
+    succeeded there — an unparseable row is counted as `skipped_unparseable` and dropped
+    before a `QueryStat` is ever built. Re-parsing that same text with the same dialect here
+    cannot fail differently. A bare-name text-match fallback used to sit here for "just in
+    case", but it reintroduced the exact over-attribution this function exists to fix —
+    `select * from public.orders` matching both `public.orders` and `staging.orders` — for a
+    branch nothing can reach. Same reasoning as `_dedupe_by_ddl`'s deleted tie-break: a
+    fallback that cannot be reached is worse than none, since it reads as evidence the case
+    is handled when the real handling is "it cannot happen".
     """
     by_bare_name: dict[str, list[Relation]] = {}
     for relation in wide:
         by_bare_name.setdefault(relation.table, []).append(relation)
-    try:
-        tree = parse(sql, dialect)
-    except SqlParseError:
-        return tuple(sorted(relation for relation in wide if mentions_table(relation.table, sql)))
+    tree = parse(sql, dialect)
     touched: set[Relation] = set()
     for table in tree.find_all(exp.Table):
         if table.db:
