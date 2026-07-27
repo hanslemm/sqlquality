@@ -1,6 +1,6 @@
 from sqlquality.delta import ModelDelta
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Workload
+from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
 from sqlquality.report import advise_payload, render_advise_markdown, render_markdown
 
 PASS = GateReport(
@@ -103,7 +103,11 @@ WORKLOAD = Workload(
     skipped_noise=7,
 )
 AGGREGATION = Aggregation(
-    usage=(), total_cost_ms=500.0, skipped_unqualifiable=3, tables=frozenset({"orders"})
+    usage=(),
+    total_cost_ms=500.0,
+    skipped_unqualifiable=3,
+    tables=frozenset({Relation("public", "orders")}),
+    skipped_ambiguous=4,
 )
 
 
@@ -124,7 +128,12 @@ def test_payload_reports_proposals_window_and_skips():
     assert payload["redacted"] is True
     assert payload["window"] == "since stats reset at 2026-07-01"
     assert payload["proposals"][0]["code"] == "ADV001"
-    assert payload["skipped"] == {"unparseable": 2, "noise": 7, "unqualifiable": 3}
+    assert payload["skipped"] == {
+        "unparseable": 2,
+        "noise": 7,
+        "unqualifiable": 3,
+        "ambiguous": 4,
+    }
     assert payload["degraded"] == [{"capability": "ndv", "reason": "permission denied"}]
 
 
@@ -159,6 +168,54 @@ def test_markdown_discloses_the_window_and_the_skips():
     assert "7 filtered" in md
     assert "introspection/DDL" not in md
     assert "3 unresolvable" in md
+    assert "4 ambiguous" in md
+
+
+def _eight_groups_two_ambiguous():
+    """Eight query groups of which two were dropped as ambiguous — six were understood."""
+    workload = Workload(
+        stats=tuple(
+            QueryStat(fingerprint=f"fp{i}", sql="select 1", calls=1, total_time_ms=1.0)
+            for i in range(8)
+        ),
+        window_description="since stats reset at 2026-07-01",
+        skipped_unparseable=1,
+        skipped_noise=2,
+    )
+    aggregation = Aggregation(
+        usage=(),
+        total_cost_ms=8.0,
+        skipped_unqualifiable=0,
+        tables=frozenset(),
+        skipped_ambiguous=2,
+    )
+    return workload, aggregation
+
+
+def test_all_three_surfaces_report_the_same_analyzed_count():
+    """The terminal said "analyzed 6 of 8" while markdown said "analyzed: 8" and the JSON
+    payload carried 8 under a key named `analyzed` — directly above its own "2 ambiguous".
+
+    The README promises the terminal, markdown *and* JSON paths all print how many query
+    groups were actually understood, and nothing pinned the number on two of the three: it
+    was the sole mutation to survive a 47-mutation whole-branch sweep. All three are asserted
+    here together, so fixing one surface and leaving another cannot pass.
+    """
+    from sqlquality.cli import _coverage_line
+
+    workload, aggregation = _eight_groups_two_ambiguous()
+    terminal = _coverage_line(workload, aggregation)
+    md = render_advise_markdown(
+        PROPOSALS, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    payload = advise_payload(
+        PROPOSALS, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "analyzed 6 of 8 query group(s)" in terminal
+    assert "**Query groups analyzed:** 6 of 8" in md
+    assert payload["analyzed"]["query_groups"] == 6
+    # The window total is still available, just no longer labelled "analyzed".
+    assert payload["analyzed"]["query_groups_in_window"] == 8
 
 
 def test_markdown_escapes_an_evidence_key_as_well_as_its_value():

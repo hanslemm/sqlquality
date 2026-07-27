@@ -312,10 +312,10 @@ missing driver degrades with an install hint instead of a traceback.
 | `--profile` | — | dbt profile name, read from `profiles.yml`. |
 | `--target` | — | dbt target within the profile. |
 | `--profiles-dir` | `~/.dbt` | Directory holding `profiles.yml`. |
-| `--schema` | `public` | Schema to introspect. **One at a time** — passing two exits 2, see Limitations. |
+| `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -378,12 +378,14 @@ statement is not valid SQL to copy out and run.
 
 | Code | Proposal | Evidence |
 |---|---|---|
-| ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3 | cost share, NDV, row estimate, absence of a covering index |
+| ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3, and only columns some single query group filters on *together* | cost share, NDV, row estimate, joint co-occurring fingerprint count, absence of a covering index |
 | ADV002 | Drop an index with zero recorded scans (excludes unique/primary-key indexes) | scans since last stats reset, size |
 | ADV003 | Drop an index whose column list is a strict prefix of a wider index | both column lists |
 | ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
 | ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
+| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
+| ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -392,6 +394,11 @@ statement is not valid SQL to copy out and run.
 - **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 is
   capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last statistics
   reset, so zero scans can never prove an index is unused across a full business cycle.
+  ADV008 is also capped at MEDIUM unconditionally, for a different reason: whether Postgres
+  uses the index for grouping depends on its choice between `GroupAggregate` and
+  `HashAggregate`, a planner decision driven by `work_mem` and group cardinality that no
+  catalog view exposes — HIGH would claim to know the planner's choice, not the catalog's
+  state, so ADV008 never reaches it.
 - **LOW** — thin evidence, and specifically **any check that could not be run**: the row
   count is unknown so the small-table floor could not be applied, or the existing-index
   list was denied so "no index already covers this" could not be confirmed. Absent
@@ -399,6 +406,32 @@ statement is not valid SQL to copy out and run.
 
 Every proposal's evidence renders inline (cost share, calls, fingerprints, row estimate,
 NDV, existing index state) so it can be judged from the report alone.
+
+**How overlapping proposals are reconciled.** The rules above are evaluated independently,
+but their output is not shipped independently: two of them can reach the same index from
+different evidence, and following both would mean creating a redundant pair that ADV003 then
+advises dropping on the next run. So before anything is reported:
+
+- **Identical DDL collapses to one proposal.** The higher confidence wins; on a tie a fixed
+  rule preference decides, never list order.
+- **A narrower index collapses into a wider one.** If one proposal's columns are a leading
+  prefix of another's for the same table, only the wider survives — it serves every lookup
+  the narrower would. Partial (`WHERE`) proposals never participate: a partial index is a
+  different object even when its column list is a prefix.
+- **Same columns in a different order are both kept**, each disclosing the other. `(status,
+  region)` and `(region, status)` serve different probes, so neither is redundant — but
+  creating both means indexing the same columns twice, and the report says so.
+
+Two consequences worth knowing before you consume the output:
+
+- **A rule can fire and still contribute no proposal.** A `--json` consumer counting
+  `ADV007` entries can legitimately see zero on a run where ADV007 did propose something
+  that was absorbed. The absorbed proposal's rule code, confidence and rationale appear in
+  the surviving proposal's `rationale`, attributed — that is where to look for it.
+- **The absorbed proposal's `evidence` is discarded, not merged.** Its rationale (the
+  constraint an operator needs) is preserved verbatim; its numbers (`leading_ndv`,
+  `partial_indexes_skipped`, `co_occurring_fingerprints`) are not carried into the
+  survivor's evidence block.
 
 `--ddl` writes a standalone, commented script — never executed by sqlquality:
 
@@ -430,6 +463,7 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
 {
   "analyzed": {
     "query_groups": 3,
+    "query_groups_in_window": 3,
     "tables": [
       "orders"
     ],
@@ -444,11 +478,11 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
       "ddl": "CREATE INDEX ON \"orders\" (\"status\");",
       "evidence": {
         "calls": 15000,
+        "co_occurring_fingerprints": 1,
         "columns": [
           "status"
         ],
         "cost_share": 0.6702702702702703,
-        "fingerprints": 1,
         "leading_ndv": 500.0,
         "roles": [
           "equality"
@@ -465,7 +499,8 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
   "skipped": {
     "noise": 0,
     "unparseable": 0,
-    "unqualifiable": 0
+    "unqualifiable": 0,
+    "ambiguous": 0
   },
   "window": "since stats reset at 2026-07-19 03:00:00+00"
 }
@@ -475,11 +510,12 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
 JSON paths all print how many query groups were actually understood:
 
 ```console
-analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 filtered, 1 unresolvable
+analyzed 2 of 3 query group(s); skipped 0 unparseable, 0 filtered, 1 unresolvable, 0 ambiguous
 low coverage: 33% of candidate statements could not be analyzed (0 unparseable, 1
-unresolvable against the schema). Cost shares are computed against the whole window, so
-they are diluted and --min-cost-share is effectively stricter — few or no proposals may
-reflect coverage rather than a healthy workload.
+unresolvable against the schema, 0 ambiguous across the introspected schemas). Cost shares
+are computed against the whole window, so they are diluted and --min-cost-share is
+effectively stricter — few or no proposals may reflect coverage rather than a healthy
+workload.
 ```
 
 This matters because `cost_share` is **not** a partition of the workload: a query
@@ -488,6 +524,16 @@ over their columns rather than the sum, since summing would double-count), and t
 denominator always includes queries that could not be parsed or resolved against the
 schema. Poor coverage silently dilutes every proposal's share rather than inflating it —
 read the skip counts alongside every proposal.
+
+Running with more than one `--schema`, a bare, unqualified table name held by two or more
+of the introspected schemas is genuinely ambiguous — attributing it to either would be a
+guess, so it is dropped and counted rather than guessed at:
+
+```console
+2 statement(s) named a table held by more than one of the introspected schemas without
+qualifying it, so they could not be attributed and were dropped. Qualify the table in the
+query, or run advise once per --schema.
+```
 
 A missing grant degrades one capability at a time rather than aborting the whole run:
 
@@ -768,40 +814,89 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   statements that could not be parsed or resolved against the schema, so poor coverage
   dilutes every share and makes `--min-cost-share` effectively stricter; the CLI warns
   when coverage is poor, and the report always prints the skip counts.
-- **Join keys and grouping columns are measured and then ignored.** `advise` classifies
-  eight column roles and cost-weights all of them, but only five are read by the proposal
-  rules. A hot unindexed foreign-key join produces `orders.customer_id join cost_share
-  1.0` and **no proposal at all** — arguably the most valuable index recommendation in a
-  relational workload, measured and discarded. Same for `GROUP BY` columns. Compounding
-  it: any column under a `JOIN` is classified as a join key, so a predicate you placed in
-  an `ON` clause (as `LEFT JOIN` semantics require) is not treated as a filter and drops
-  out of ADV001's reach too. Proposing on join keys is a follow-up, not a bug fix.
-- **`DECLARE` and `COPY` statements are discarded whole.** The noise filter matches on the
-  leading keyword, so `DECLARE cur CURSOR FOR SELECT ... WHERE ...` and
-  `COPY (SELECT ... WHERE ...) TO STDOUT` are dropped along with the session-control and
-  DDL traffic the filter is for — predicates and all. Django's `QuerySet.iterator()` and
-  every psycopg2 server-side cursor emit the first form, so on a Django codebase this can
-  be most of your hot reads. They are counted, and the skip line calls them `filtered`
-  rather than pretending they were introspection or DDL, but they are not analyzed.
-  Unwrapping to the inner `SELECT` is a follow-up.
+- **Join keys and grouping columns are measured and read, not just cost-weighted.**
+  `advise` classifies eight column roles; join keys are read by ADV007 (a hot unindexed
+  foreign-key join produces a proposal, not just an `orders.customer_id join cost_share
+  1.0` line that goes nowhere) and `GROUP BY` columns are read by ADV008, as one composite
+  index rather than one per column — `GROUP BY a, b` needs input sorted by `(a, b)`, and
+  two single-column indexes cannot provide that. Any column under a `JOIN` is classified
+  as a join key, so a predicate you placed in an `ON` clause (as `LEFT JOIN` semantics
+  require) is not treated as a filter and drops out of ADV001's reach — it is ADV007's
+  candidate instead. ADV008's column order within the composite is inferred from cost,
+  not read from the query, because redaction does not preserve each column's position in
+  the `GROUP BY` clause — check it against the actual grouping before applying.
+- **A declared cursor's predicates are analyzed, but its cost usually reads as zero.**
+  `DECLARE cur CURSOR FOR SELECT ... WHERE ...` and `COPY (SELECT ... WHERE ...) TO STDOUT`
+  are unwrapped to their inner query before the noise filter runs, so both reach
+  `aggregate` — Django's `QuerySet.iterator()` and every psycopg2 server-side cursor emit
+  the first form, so on a Django codebase this can be most of your hot reads. `COPY (...)
+  TO` attributes correctly: Postgres charges the whole execution's time and rows to the
+  `COPY` statement. A `DECLARE`, measured on PostgreSQL 16, does not — opening a cursor
+  does no scanning, so while it is counted accurately by *call count* (one call per cursor
+  opened), its time and rows read as near-zero; the actual work is charged to the `FETCH`
+  statements that follow, which carry no query text and stay filtered as noise. So a
+  cursor read's columns can still join an index candidate, but the read cannot earn a
+  proposal on cost alone, and the default `--min-cost-share` can suppress it outright.
+- **A `COPY (...) TO` execution can be counted twice under `pg_stat_statements.track =
+  all`.** That setting (not the default `track = top`) makes Postgres record both the
+  verbatim top-level `COPY` statement and its normalised nested query as separate rows for
+  the same execution, and `unwrap`/redaction give the pair different fingerprints (a real
+  literal in one, `$1` in the other) — so it lands in `aggregate` as two query groups at
+  roughly twice the execution's true cost, inflating both that group's `cost_share` and the
+  whole-window denominator. This is accepted rather than fixed, **for a stated price rather
+  than for want of a way to fix it**. A blanket `AND s.toplevel` is not the answer:
+  `toplevel = false` is also the *only* way Postgres ever exposes the SQL executed inside a
+  PL/pgSQL function body, and tried live it made a genuinely hot, function-wrapped query
+  disappear from evidence entirely (no predicates, no cost, no disclosure that anything was
+  dropped) while a much colder query took its place as a `high`-confidence proposal —
+  confidently wrong, which is strictly worse than an inflated `cost_share`. A *narrow*
+  predicate does exist, though, and was measured to work: on PostgreSQL 16 the COPY's nested
+  row keeps its wrapper (`COPY (SELECT ... $1) TO STDOUT`) while a function body is recorded
+  bare, so `NOT (s.toplevel = false AND s.query ~* '^\s*COPY\s*\(')` removes exactly the
+  duplicate and leaves function bodies alone. It is declined because *naming* `s.toplevel`
+  at all requires PostgreSQL 14 — the column does not exist on 13 — so adding it would cost
+  every PostgreSQL 13 user the entire workload capability in exchange for removing a 2×
+  over-count of one statement form under a non-default setting. If the supported floor ever
+  rises to 14, that is the predicate to add.
+- **Every PL/pgSQL function call is counted twice under `pg_stat_statements.track = all`,
+  and no predicate can fix it.** That setting records both the calling statement and each
+  statement inside the function body: on one PostgreSQL 16 run, a single execution of
+  `SELECT lc.hot()` appeared as the call at 68.21 ms *and* its body at 67.67 ms — the two
+  durations track each other, so the absolute figures vary per machine. Both land in
+  the whole-window denominator, so on a function-heavy workload every `cost_share` is
+  roughly halved and `--min-cost-share` is correspondingly stricter than it looks. Unlike
+  the `COPY` case above there is no filter that helps: the call carries the cost while the
+  body carries the predicates a proposal is built from, so dropping either row loses
+  something real. On the default `track = top` neither this nor the `COPY` duplicate arises,
+  because Postgres records no nested statements at all — if you run `track = all`, read
+  `cost_share` as a lower bound.
 - **Expression indexes are read but not matched.** `advise` now sees that an index on
   `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
   that index already serves a lookup on `status` — so it proposes and says so, rather than
-  suppressing or ignoring. Confirm before applying.
+  suppressing or ignoring. Confirm before applying. True of all three index-creating rules,
+  ADV001, ADV007 and ADV008.
 - **ADV003 only compares plain indexes.** A pair where either index carries a `WHERE`
   predicate or an indexed expression is skipped entirely rather than proposed at lower
   confidence: a partial index exists to serve a subset, so recommending its removal is
   likely wrong rather than merely uncertain. Plain pairs are reported at HIGH.
+- **Both `DROP INDEX` rules only look at tables the workload actually used.** ADV002 and
+  ADV003 iterate the relations that appear in the analyzed query groups, so an index on a
+  table no observed statement touched is never proposed for removal — including when it sits
+  in a second `--schema` whose table happens to share a bare name with a hot one.
 - **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
   shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
-  a candidate index — it is named in the evidence instead.
-- **One schema per run.** Every catalog fact is keyed on the bare relation name — table
-  sizes, NDV statistics, index lists and the `qualify()` schema all merge across schemas —
-  so `orders` in two schemas would alias into one another and the last catalog row read
-  would silently win the row estimate. Rather than report that quietly, `advise` rejects
-  more than one `--schema` with exit 2. Run it once per schema. Generated DDL is qualified
-  with the schema you passed, so it does not depend on the applying session's
-  `search_path`.
+  a candidate index — it is named in the evidence instead. True of all three index-creating
+  rules, ADV001, ADV007 and ADV008.
+- **Multiple `--schema` values are supported, with one honest caveat.** Every catalog fact
+  (table sizes, NDV statistics, index lists, the `qualify()` schema) is keyed by
+  `schema.table`, so `orders` in two introspected schemas no longer aliases into one
+  another. What remains is genuine ambiguity in the *query text* itself: a statement that
+  says `from orders` bare, when two of the introspected schemas both hold `orders`, cannot
+  be attributed to either without guessing — it is dropped and counted rather than guessed
+  at (see `ambiguous` in the skip counts, and the coverage warning that names the remedy).
+  Qualify the table in the query, or run `advise` once per `--schema`, to recover it.
+  Generated DDL is qualified with the schema it was read from, so it does not depend on the
+  applying session's `search_path`.
 - **Redshift, Snowflake and dbt enrichment are designed but not implemented.** `advise`
   supports Postgres only today; passing another `--engine` fails with a clear error
   rather than silently degrading.

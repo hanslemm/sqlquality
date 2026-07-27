@@ -6,22 +6,30 @@ import re
 from collections import defaultdict
 from functools import lru_cache
 
-from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Workload
+from sqlglot import exp
+
+from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Relation, Workload
 from sqlquality.sqlast import SqlParseError, parse
-from sqlquality.workload.extract import UnqualifiableQuery, extract_usage
+from sqlquality.workload.extract import (
+    AmbiguousRelation,
+    UnqualifiableQuery,
+    extract_usage,
+    resolve_relation,
+)
 from sqlquality.workload.fingerprint import FLAG_SELECT_STAR
 
-_Key = tuple[str, str, ColumnRole]
+_Key = tuple[Relation, str, ColumnRole]
 
 
 @lru_cache(maxsize=4096)
 def _identifier_pattern(name: str) -> re.Pattern[str]:
     """Compiled whole-identifier matcher for one name, compiled once per name.
 
-    ``star_tables`` tests every (star-stat, table) pair, and a schema with many tables was
-    recompiling the same handful of table-name patterns over and over, thrashing `re`'s own
-    pattern cache. Caching by name here means each identifier is compiled once regardless of
-    how many stats or tables it is checked against.
+    Callers such as ADV006's wide-table detection and the expression-index disclosure in
+    `postgres.py` test one name against many statements (or vice versa), and a schema with
+    many tables was recompiling the same handful of name patterns over and over, thrashing
+    `re`'s own pattern cache. Caching by name here means each identifier is compiled once
+    regardless of how many times it is checked.
     """
     return re.compile(rf"\b{re.escape(name)}\b")
 
@@ -39,48 +47,111 @@ def mentions_identifier(name: str, text: str) -> bool:
     return _identifier_pattern(name).search(text) is not None
 
 
-def mentions_table(name: str, sql: str) -> bool:
-    """True if a query mentions this table. See :func:`mentions_identifier`."""
-    return mentions_identifier(name, sql)
-
-
-def star_tables(workload: Workload, schema: dict) -> frozenset[str]:
-    """Tables a `SELECT *` query group merely *mentions*, matched against ``schema``.
+def star_tables(workload: Workload, schema: dict, dialect: str = "postgres") -> frozenset[Relation]:
+    """Relations a `SELECT *` query group merely *mentions*, matched against ``schema``.
 
     A bare `select * from wide_t` filters nothing, so it contributes no column usage and
-    the table never appears in ``Aggregation.tables``. Introspecting only the tables that
-    produced usage therefore left the star rule with no column counts to test — inert for
-    precisely the workload it exists to catch. These names are unioned in before catalog
-    facts are fetched.
+    the relation never appears in ``Aggregation.tables``. Introspecting only the relations
+    that produced usage therefore left the star rule with no column counts to test — inert
+    for precisely the workload it exists to catch. These relations are unioned in before
+    catalog facts are fetched.
 
-    Deliberately *not* added to ``Aggregation.tables``: that set means "tables with
+    Resolved by parsing each starred statement and running its actual `exp.Table` nodes
+    through `resolve_relation` — not by text-matching the schema's table names against the
+    raw SQL. Text matching cannot see a schema qualifier at all, and that blindness cuts
+    both ways: `select * from nosuch.items` would resolve through a bare-name collision
+    with an unrelated schema (a phantom `resolve_relation`'s `table.db` guard exists
+    specifically to refuse), while `select * from sales.orders` naming one side of a
+    same-table-name collision would be dropped even though it is not actually ambiguous.
+    Resolving through the same function `extract_usage` uses makes the two agree by
+    construction; a second, hand-rolled ambiguity policy here previously did not.
+
+    A parse failure is not counted here: the same statement was already counted
+    unparseable at ingest (`Workload.skipped_unparseable`), so re-counting it under a
+    different name would make the two counters disagree about what "unparseable" means.
+
+    Deliberately *not* added to ``Aggregation.tables``: that set means "relations with
     recorded column usage" and feeds the unused-index rule's notion of a hot table.
+
+    ``dialect`` defaults to `"postgres"`, the only workload adapter registered today
+    (see `sqlquality.workload.get_workload_adapter`); a caller wiring in a second engine
+    must pass its dialect explicitly rather than rely on the default.
     """
-    return frozenset(
-        name
-        for stat in workload.stats
-        if FLAG_SELECT_STAR in stat.flags
-        for name in schema
-        if mentions_table(name, stat.sql)
-    )
+    found: set[Relation] = set()
+    for stat in workload.stats:
+        if FLAG_SELECT_STAR not in stat.flags:
+            continue
+        try:
+            tree = parse(stat.sql, dialect)
+        except SqlParseError:
+            continue
+        for table in tree.find_all(exp.Table):
+            relation = resolve_relation(table, schema)
+            if relation is not None:
+                found.add(relation)
+    return frozenset(found)
+
+
+def _references_an_ambiguous_bare_table(tree: exp.Expression, schema: dict) -> bool:
+    """True if `tree` names a bare table held by more than one introspected schema.
+
+    Mirrors `resolve_relation`'s own bare-name branch exactly: a table reference with no
+    `.db` qualifier is ambiguous precisely when more than one introspected schema defines a
+    table of that name. A schema-qualified reference is never ambiguous by this test — a
+    qualifier that names a schema we did not introspect is a *different* case
+    (`resolve_relation` returns `None` for it, not an ambiguity), and is deliberately not
+    reported here.
+    """
+    for table in tree.find_all(exp.Table):
+        if table.db:
+            continue
+        owners = [name for name, tables in schema.items() if table.name in tables]
+        if len(owners) > 1:
+            return True
+    return False
 
 
 def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
-    """Weight every (table, column, role) by the cost of the queries that use it."""
+    """Weight every (relation, column, role) by the cost of the queries that use it."""
     calls: dict[_Key, int] = defaultdict(int)
     cost: dict[_Key, float] = defaultdict(float)
     #: Which query groups contributed each usage, so downstream rules can ask whether two
     #: usages co-occur in a single query rather than merely both being hot on the table.
     contributors: dict[_Key, set[str]] = defaultdict(set)
-    tables: set[str] = set()
+    tables: set[Relation] = set()
     skipped_unqualifiable = 0
+    skipped_ambiguous = 0
 
     for stat in workload.stats:
         try:
             tree = parse(stat.sql, dialect)
             triples = extract_usage(tree, dialect, schema)
+        except AmbiguousRelation:
+            # Counted before the broader handler below, because AmbiguousRelation *is* an
+            # UnqualifiableQuery — ordering these the other way round makes the specific
+            # counter unreachable and the specific remedy unreportable.
+            skipped_ambiguous += 1
+            continue
         except (SqlParseError, UnqualifiableQuery):
             skipped_unqualifiable += 1
+            continue
+        # Any statement that names a table but references none of its columns by name
+        # (`select * from orders`, `select count(*) from orders`, `select 1 from orders`,
+        # `select now() from orders`) contributes no usage either way, so `qualify()` above
+        # has nothing to validate and neither raises nor records anything for it — even when
+        # "orders" is a name two introspected schemas both hold. Not gated on
+        # `FLAG_SELECT_STAR`: that flag only marks a literal `SELECT *`, so gating on it let
+        # `select count(*) from orders` and `select 1 from orders` over the same colliding
+        # schema escape *both* counters — parsed fine, zero usage, never raised, never
+        # counted, reported as if fully understood. Left uncounted, any of these reads as
+        # "understood and irrelevant" when it is really the same unattributable-bare-name
+        # fact `AmbiguousRelation` reports elsewhere (and the reason ADV006's own
+        # `_wide_relations_touched` later declines to guess at it too); it just surfaces
+        # without an exception because there is no column reference for `qualify()` to trip
+        # over. Gated on `not triples`: a statement that already produced usage from some
+        # *other*, unambiguous table was not silently dropped, so it does not belong here.
+        if not triples and _references_an_ambiguous_bare_table(tree, schema):
+            skipped_ambiguous += 1
             continue
         for key in triples:
             calls[key] += stat.calls
@@ -99,20 +170,21 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
         sorted(
             (
                 ColumnUsage(
-                    table=table,
+                    relation=relation,
                     column=column,
                     role=role,
-                    calls=calls[(table, column, role)],
-                    cost_ms=cost[(table, column, role)],
-                    cost_share=(cost[(table, column, role)] / total) if total else 0.0,
-                    fingerprint_ids=frozenset(contributors[(table, column, role)]),
+                    calls=calls[(relation, column, role)],
+                    cost_ms=cost[(relation, column, role)],
+                    cost_share=(cost[(relation, column, role)] / total) if total else 0.0,
+                    fingerprint_ids=frozenset(contributors[(relation, column, role)]),
                 )
-                for (table, column, role) in calls
+                for (relation, column, role) in calls
             ),
             # Descending cost with a canonical tiebreak. Without the trailing keys, two
             # logically identical workloads that happened to arrive in a different order
             # produce different output order, and downstream tasks' tests depend on it.
-            key=lambda u: (-u.cost_ms, u.table, u.column, u.role.value),
+            # `Relation` is `order=True`, so it sorts directly with no key function.
+            key=lambda u: (-u.cost_ms, u.relation, u.column, u.role.value),
         )
     )
     return Aggregation(
@@ -120,4 +192,5 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
         total_cost_ms=total,
         skipped_unqualifiable=skipped_unqualifiable,
         tables=frozenset(tables),
+        skipped_ambiguous=skipped_ambiguous,
     )

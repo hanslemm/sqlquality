@@ -5,7 +5,13 @@ from __future__ import annotations
 import html as _html
 
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Proposal, Workload, cost_share_of
+from sqlquality.models import (
+    Aggregation,
+    Proposal,
+    Workload,
+    analyzed_query_groups,
+    cost_share_of,
+)
 
 
 def _md_escape(value: object) -> str:
@@ -144,14 +150,21 @@ def advise_payload(
         "redacted": redacted,
         "window": workload.window_description,
         "analyzed": {
-            "query_groups": len(workload.stats),
+            # The count of groups whose usage was actually extracted — not `len(stats)`,
+            # which includes the unresolvable and ambiguous groups reported under "skipped"
+            # below and so contradicted them under a key named "analyzed". The window total
+            # is kept beside it rather than dropped, since a consumer computing "how much of
+            # the window did this run understand" needs both numbers.
+            "query_groups": analyzed_query_groups(workload, aggregation),
+            "query_groups_in_window": len(workload.stats),
             "total_cost_ms": workload.total_cost_ms,
-            "tables": sorted(aggregation.tables),
+            "tables": sorted(str(relation) for relation in aggregation.tables),
         },
         "skipped": {
             "unparseable": workload.skipped_unparseable,
             "noise": workload.skipped_noise,
             "unqualifiable": aggregation.skipped_unqualifiable,
+            "ambiguous": aggregation.skipped_ambiguous,
         },
         "degraded": [{"capability": cap, "reason": reason} for cap, reason in degraded],
         "proposals": [
@@ -192,16 +205,26 @@ def render_advise_markdown(
         f"# sqlquality advise — {_md_escape(engine)}",
         "",
         f"**Window:** {_md_escape(workload.window_description)}",
-        f"**Query groups analyzed:** {len(workload.stats)}  ",
+        # "N of M", the same form and the same numbers as the terminal's coverage line.
+        # Printing `len(workload.stats)` alone as *analyzed* contradicted the "Skipped:"
+        # line directly beneath it — "8 analyzed" above "2 ambiguous" out of 8 groups.
+        f"**Query groups analyzed:** {analyzed_query_groups(workload, aggregation)} of "
+        f"{len(workload.stats)}  ",
         f"**Literals:** {'redacted' if redacted else 'retained (--keep-literals)'}",
         "",
         (
-            # "filtered", not "introspection/DDL": the noise filter matches on the leading
-            # keyword, so it also discards DECLARE ... CURSOR FOR SELECT and
-            # COPY (SELECT ...) — ordinary reads. See cli._coverage_line.
+            # "filtered", not "introspection/DDL": it covers session control, DDL,
+            # maintenance, introspection, a whole-table COPY, and a cursor statement
+            # carrying no query (FETCH, CLOSE). DECLARE ... CURSOR FOR SELECT and
+            # COPY (SELECT ...) TO — ordinary reads — are unwrapped to their inner query
+            # before this count is taken, so they land in "analyzed" instead.
+            # See cli._coverage_line and workload.fingerprint.unwrap.
             f"Skipped: {workload.skipped_unparseable} unparseable, "
-            f"{workload.skipped_noise} filtered as non-workload by statement prefix, "
-            f"{aggregation.skipped_unqualifiable} unresolvable against the schema."
+            f"{workload.skipped_noise} filtered as non-workload (session control, DDL, "
+            f"maintenance, introspection, whole-table COPY, or a cursor statement "
+            f"carrying no query), "
+            f"{aggregation.skipped_unqualifiable} unresolvable against the schema, "
+            f"{aggregation.skipped_ambiguous} ambiguous across the introspected schemas."
         ),
         "",
     ]

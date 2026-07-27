@@ -61,16 +61,16 @@ LIKE_QUERY = "select note from orders where note like '%hans@betterdoc.de%'"
 STAR_QUERY = "select * from wide_events where actor_email = 'hans@betterdoc.de'"
 
 COLUMNS = [
-    ("orders", "id", "integer"),
-    ("orders", "note", "text"),
-    ("orders", "status", "text"),
-    ("orders", "customer_email", "text"),
-    ("orders", "reference", "text"),
-    ("orders", "iban", "text"),
-    ("orders", "created_at", "timestamp"),
-    ("wide_events", "actor_email", "text"),
+    ("public", "orders", "id", "integer"),
+    ("public", "orders", "note", "text"),
+    ("public", "orders", "status", "text"),
+    ("public", "orders", "customer_email", "text"),
+    ("public", "orders", "reference", "text"),
+    ("public", "orders", "iban", "text"),
+    ("public", "orders", "created_at", "timestamp"),
+    ("public", "wide_events", "actor_email", "text"),
     # Wide enough to trip ADV006's ≥15-column floor.
-    *[("wide_events", f"c{i}", "text") for i in range(20)],
+    *[("public", "wide_events", f"c{i}", "text") for i in range(20)],
 ]
 
 ROWS = {
@@ -82,10 +82,13 @@ ROWS = {
     "pg_stat_database": [("2026-07-01",)],
     "information_schema.columns": COLUMNS,
     "pg_total_relation_size": [
-        ("orders", 8_000_000, 10**9),
-        ("wide_events", 4_000_000, 10**9),
+        ("public", "orders", 8_000_000, 10**9),
+        ("public", "wide_events", 4_000_000, 10**9),
     ],
-    "pg_stats": [("orders", "status", 4.0), ("orders", "customer_email", 900_000.0)],
+    "pg_stats": [
+        ("public", "orders", "status", 4.0),
+        ("public", "orders", "customer_email", 900_000.0),
+    ],
     "pg_index": [],
 }
 

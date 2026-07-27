@@ -1,10 +1,13 @@
+import inspect
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
-from sqlquality.models import ConnectionParams
+from sqlquality.models import ConnectionParams, Relation
 from sqlquality.workload import get_workload_adapter
+from sqlquality.workload import postgres as postgres_module
 from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.postgres import (
     CAP_INDEXES,
@@ -114,6 +117,84 @@ def test_workload_statement_is_scoped_to_the_current_database():
     assert "order by" in sql and "limit" in sql
 
 
+def test_workload_statement_does_not_filter_on_toplevel():
+    """Deliberately not filtered — a documented trade-off, not an oversight.
+
+    A blanket `AND s.toplevel` would deduplicate a `COPY (...) TO` execution under
+    `pg_stat_statements.track = all` (see the README's "Prerequisites and limits"), but
+    `toplevel = false` is also the *only* way Postgres exposes the SQL executed inside a
+    PL/pgSQL function body. Tried and reverted: verified live that the filter made a
+    genuinely hot, function-wrapped query disappear from evidence entirely while a colder
+    query took its place as a `high`-confidence proposal — confidently wrong, which is worse
+    than the double-count it would have fixed. A *narrow* predicate does work — the two
+    nested forms are textually distinguishable, see
+    `test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility` — and is
+    declined only because naming `s.toplevel` at all raises the floor to PostgreSQL 14. This
+    test exists so a future attempt to reintroduce the blanket filter fails here first,
+    rather than silently reopening that regression.
+    """
+    sql = PostgresWorkloadAdapter().SQL[CAP_WORKLOAD].lower()
+    assert "toplevel" not in sql
+
+
+def _source_of(module) -> str:
+    return Path(inspect.getsourcefile(module)).read_text(encoding="utf-8")
+
+
+def test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility():
+    """The reason the filter is absent must be the reason it is actually absent.
+
+    Both the source comment and the README claimed no `s.query` text pattern could separate
+    a COPY's nested duplicate from a PL/pgSQL function's nested statement. Measured on
+    PostgreSQL 16 under `track = all` that is false: the COPY's nested row keeps its wrapper
+    while a function body is recorded bare, and
+    `NOT (s.toplevel = false AND s.query ~* '^\\s*COPY\\s*\\(')` removed exactly the
+    duplicate (4 rows -> 3). The filter is declined because *naming* `s.toplevel` requires
+    PostgreSQL 14 while the supported floor is 13 — a price, not an impossibility. A comment
+    that justifies an absence with a false premise is how the wrong decision gets made next
+    time, so the claim is pinned here.
+    """
+    # Scoped to the CAP_WORKLOAD comment block rather than the whole module: searching all of
+    # `postgres.py` for "postgresql 14" is satisfied by `_row_estimate`'s unrelated docstring
+    # about the `reltuples` sentinel, so the assertion passed with the real sentence deleted.
+    source = _source_of(postgres_module)
+    marker = "Deliberately NOT filtered on `s.toplevel`"
+    assert marker in source, "the CAP_WORKLOAD comment explaining the absence is gone"
+    start = source.index(marker)
+    comment_block = source[start : source.index('"""', start)]
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    for text, where in ((comment_block, "the CAP_WORKLOAD comment"), (readme, "the README")):
+        lowered = text.lower()
+        # One absence check, not an enumeration of every phrasing the false claim once had:
+        # whack-a-mole substrings go stale and give false confidence. The positive assertion
+        # below is what actually pins the reasoning.
+        assert "text pattern tells the two apart" not in lowered, (
+            f"{where} still claims no predicate can separate the two"
+        )
+        assert "postgresql 14" in lowered or "postgres 14" in lowered, (
+            f"{where} does not state the version cost that is the actual reason"
+        )
+
+
+def test_the_plpgsql_double_count_is_documented_as_a_limitation():
+    """The larger, unfixable half of the `track = all` inaccuracy.
+
+    Every PL/pgSQL call is counted twice under `track = all` — the call and its body are
+    recorded as separate rows with nearly identical durations — which roughly halves every
+    `cost_share`. Unlike the `COPY` duplicate no predicate can fix it (the call carries the
+    cost, the body carries the predicates), so disclosure is the only honest treatment, and
+    the README documented only the smaller `COPY` half.
+
+    Deliberately does *not* assert the specific milliseconds the README quotes. Two runs of
+    the same fixture measured 68.21/67.67 and 46.44/46.37 — the shape reproduces, the numbers
+    are that machine's. Pinning them would make an honest re-measurement look like a
+    regression and train the next person to edit the test rather than read it.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "PL/pgSQL function call is counted twice" in readme
+    assert "no predicate can fix it" in readme
+
+
 class FakeQuerier:
     """Returns canned rows per capability, keyed by a distinctive SQL substring."""
 
@@ -133,6 +214,21 @@ class FakeQuerier:
         return []
 
 
+def _canned(rows_by_capability):
+    """A FakeQuerier addressed by capability constant rather than a raw SQL substring.
+
+    Same dispatch as FakeQuerier — a capability's own statement text is already a unique
+    substring of itself — just keyed by the name a test actually cares about instead of a
+    fragile fragment of SQL.
+    """
+    return FakeQuerier(
+        {
+            PostgresWorkloadAdapter.SQL[capability]: rows
+            for capability, rows in rows_by_capability.items()
+        }
+    )
+
+
 def test_fetch_workload_maps_rows_and_reports_the_window():
     querier = FakeQuerier(
         {
@@ -145,6 +241,32 @@ def test_fetch_workload_maps_rows_and_reports_the_window():
     assert fetch.rows[0].calls == 10
     assert fetch.rows[0].total_time_ms == 250.0
     assert "2026-07-01" in fetch.window_description
+
+
+def test_a_copy_executions_two_rows_both_pass_through_under_track_all():
+    """Pins the accepted, documented limitation — not a filter that no longer exists.
+
+    Under `pg_stat_statements.track = all`, one `COPY (SELECT ...) TO ...` execution
+    produces two rows: the verbatim top-level statement and its normalised nested query.
+    `fetch_workload` deliberately does not filter either out (see
+    `test_workload_statement_does_not_filter_on_toplevel`), so both reach `ingest`, which
+    fingerprints them differently (a real literal survives redaction in one, `$1` sits in
+    the other) and counts the one execution as two query groups at roughly twice its true
+    cost. If this assertion ever fails, either the double-count was fixed some other way
+    (update the README's "Prerequisites and limits") or the row pass-through broke by
+    accident.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_stat_statements": [
+                ("copy (select id from orders where status = 'x') to stdout", 1, 20.1, 40000),
+                ("select id from orders where status = $1", 1, 19.8, 40000),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+        }
+    )
+    fetch = PostgresWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert len(fetch.rows) == 2
 
 
 def test_fetch_workload_window_is_honest_that_since_is_not_supported():
@@ -198,34 +320,147 @@ def test_fetch_schema_builds_a_sqlglot_schema_mapping():
     querier = FakeQuerier(
         {
             "information_schema.columns": [
-                ("orders", "id", "integer"),
-                ("orders", "status", "text"),
-                ("customers", "id", "integer"),
+                ("public", "orders", "id", "integer"),
+                ("public", "orders", "status", "text"),
+                ("public", "customers", "id", "integer"),
             ]
         }
     )
     schema = PostgresWorkloadAdapter(querier=querier).fetch_schema(("public",))
     assert schema == {
-        "orders": {"id": "integer", "status": "text"},
-        "customers": {"id": "integer"},
+        "public": {
+            "orders": {"id": "integer", "status": "text"},
+            "customers": {"id": "integer"},
+        },
     }
+
+
+def test_fetch_schema_is_nested_by_schema():
+    rows = {
+        CAP_SCHEMA: [
+            ("sales", "orders", "id", "integer"),
+            ("sales", "orders", "status", "text"),
+            ("staging", "orders", "id", "integer"),
+        ]
+    }
+    adapter = PostgresWorkloadAdapter(querier=_canned(rows))
+    assert adapter.fetch_schema(("sales", "staging")) == {
+        "sales": {"orders": {"id": "integer", "status": "text"}},
+        "staging": {"orders": {"id": "integer"}},
+    }
+
+
+def test_table_facts_do_not_alias_across_schemas():
+    """Two same-named tables must keep their own row estimates."""
+    rows = {
+        CAP_SCHEMA: [("sales", "orders", "id", "integer"), ("staging", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("sales", "orders", 50_000, 1024), ("staging", "orders", 7, 64)],
+        CAP_NDV: [],
+    }
+    adapter = PostgresWorkloadAdapter(querier=_canned(rows))
+    facts = adapter.fetch_table_facts(
+        ("sales", "staging"),
+        frozenset({Relation("sales", "orders"), Relation("staging", "orders")}),
+    )
+    assert facts[Relation("sales", "orders")].row_estimate == 50_000
+    assert facts[Relation("staging", "orders")].row_estimate == 7
+
+
+def test_ndv_does_not_leak_between_same_named_tables():
+    rows = {
+        CAP_SCHEMA: [("sales", "orders", "id", "integer"), ("staging", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("sales", "orders", 50_000, 1024), ("staging", "orders", 50_000, 1024)],
+        CAP_NDV: [("sales", "orders", "id", 5000.0), ("staging", "orders", "id", 3.0)],
+    }
+    adapter = PostgresWorkloadAdapter(querier=_canned(rows))
+    facts = adapter.fetch_table_facts(
+        ("sales", "staging"),
+        frozenset({Relation("sales", "orders"), Relation("staging", "orders")}),
+    )
+    assert facts[Relation("sales", "orders")].ndv["id"] == 5000.0
+    assert facts[Relation("staging", "orders")].ndv["id"] == 3.0
+
+
+def test_indexes_do_not_alias_across_schemas():
+    rows = {
+        CAP_INDEXES: [
+            ("sales", "orders", "idx_a", "id", 1, False, False, 0, 100, False, None, False, "..."),
+            (
+                "staging",
+                "orders",
+                "idx_b",
+                "id",
+                1,
+                False,
+                False,
+                9,
+                200,
+                False,
+                None,
+                False,
+                "...",
+            ),
+        ]
+    }
+    adapter = PostgresWorkloadAdapter(querier=_canned(rows))
+    indexes = adapter.fetch_indexes(
+        ("sales", "staging"),
+        frozenset({Relation("sales", "orders"), Relation("staging", "orders")}),
+    )
+    assert [i.name for i in indexes[Relation("sales", "orders")]] == ["idx_a"]
+    assert [i.name for i in indexes[Relation("staging", "orders")]] == ["idx_b"]
+    assert indexes[Relation("staging", "orders")][0].scans == 9
+
+
+def _select_list(sql: str) -> str:
+    """The text between `SELECT` and the first `FROM` — the columns actually returned.
+
+    Grepping the whole statement cannot tell a `SELECT` list from a `WHERE` clause, and
+    every one of these statements already filtered on the schema before this task — the
+    substring the naive version of this check looked for was there from the start, in the
+    WHERE clause, regardless of what the SELECT list returned.
+    """
+    match = re.search(r"select\s+(.*?)\s+from\b", sql, re.IGNORECASE | re.DOTALL)
+    assert match, f"no SELECT ... FROM found in statement: {sql!r}"
+    return match.group(1)
+
+
+def test_every_relation_returning_statement_selects_its_schema():
+    """A statement that filters on schema but does not return it cannot be keyed by it.
+
+    This is the whole defect class of this task: the rows come back indistinguishable and
+    the last one silently wins. An earlier version of this test grepped the *entire*
+    statement for `nspname`/`schemaname`/`table_schema` and passed even with the schema
+    column stripped from the SELECT list — those substrings were already present in every
+    WHERE clause at d0421d0, since each statement already filtered on schema without
+    returning it. Restricting the search to the select list (see `_select_list`) is what
+    actually pins the defect this task exists to close.
+    """
+    for capability in (CAP_SCHEMA, CAP_TABLE_FACTS, CAP_NDV, CAP_INDEXES):
+        select_list = _select_list(PostgresWorkloadAdapter.SQL[capability])
+        assert (
+            "nspname" in select_list or "schemaname" in select_list or "table_schema" in select_list
+        ), capability
 
 
 def test_fetch_table_facts_resolves_negative_n_distinct_as_a_row_fraction():
     querier = FakeQuerier(
         {
-            "pg_total_relation_size": [("orders", 1000, 8192)],
-            "information_schema.columns": [("orders", "id", "integer"), ("orders", "s", "text")],
-            "pg_stats": [("orders", "id", 500.0), ("orders", "s", -0.25)],
+            "pg_total_relation_size": [("public", "orders", 1000, 8192)],
+            "information_schema.columns": [
+                ("public", "orders", "id", "integer"),
+                ("public", "orders", "s", "text"),
+            ],
+            "pg_stats": [("public", "orders", "id", 500.0), ("public", "orders", "s", -0.25)],
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].row_estimate == 1000
-    assert facts["orders"].ndv["id"] == 500.0
+    assert facts[Relation("public", "orders")].row_estimate == 1000
+    assert facts[Relation("public", "orders")].ndv["id"] == 500.0
     # -0.25 means "a quarter of the rows are distinct"
-    assert facts["orders"].ndv["s"] == 250.0
+    assert facts[Relation("public", "orders")].ndv["s"] == 250.0
 
 
 def test_negative_n_distinct_without_a_row_count_is_omitted_not_zeroed():
@@ -237,30 +472,30 @@ def test_negative_n_distinct_without_a_row_count_is_omitted_not_zeroed():
     """
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_stats": [("orders", "id", -0.25)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_stats": [("public", "orders", "id", -0.25)],
             # No pg_total_relation_size rows: the row count is unknown.
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].row_estimate is None
-    assert "id" not in facts["orders"].ndv
+    assert facts[Relation("public", "orders")].row_estimate is None
+    assert "id" not in facts[Relation("public", "orders")].ndv
 
 
 def test_absolute_n_distinct_survives_a_missing_row_count():
     """A positive n_distinct is an absolute count and needs no row estimate."""
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_stats": [("orders", "id", 500.0)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_stats": [("public", "orders", "id", 500.0)],
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].ndv["id"] == 500.0
+    assert facts[Relation("public", "orders")].ndv["id"] == 500.0
 
 
 def test_a_never_analyzed_table_reports_an_unknown_row_count():
@@ -272,28 +507,28 @@ def test_a_never_analyzed_table_reports_an_unknown_row_count():
     """
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_total_relation_size": [("orders", -1, 10**9)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_total_relation_size": [("public", "orders", -1, 10**9)],
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].row_estimate is None
+    assert facts[Relation("public", "orders")].row_estimate is None
 
 
 def test_an_analyzed_empty_table_still_reports_zero():
     """0 is a real answer — analyzed and empty — and must not be conflated with unknown."""
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_total_relation_size": [("orders", 0, 8192)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_total_relation_size": [("public", "orders", 0, 8192)],
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].row_estimate == 0
+    assert facts[Relation("public", "orders")].row_estimate == 0
 
 
 def test_fetch_indexes_restores_column_order_from_ordinality():
@@ -307,6 +542,7 @@ def test_fetch_indexes_restores_column_order_from_ordinality():
         {
             "pg_index": [
                 (
+                    "public",
                     "orders",
                     "idx_status_created",
                     "created_at",
@@ -321,6 +557,7 @@ def test_fetch_indexes_restores_column_order_from_ordinality():
                     "CREATE INDEX idx_status_created ON orders (status, created_at)",
                 ),
                 (
+                    "public",
                     "orders",
                     "idx_status_created",
                     "status",
@@ -338,9 +575,9 @@ def test_fetch_indexes_restores_column_order_from_ordinality():
         }
     )
     indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert indexes["orders"][0].columns == ("status", "created_at")
+    assert indexes[Relation("public", "orders")][0].columns == ("status", "created_at")
 
 
 def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
@@ -383,6 +620,7 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
         {
             "pg_index": [
                 (
+                    "public",
                     "orders",
                     "orders_pkey",
                     "id",
@@ -397,6 +635,7 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
                     "CREATE UNIQUE INDEX orders_pkey ON orders (id)",
                 ),
                 (
+                    "public",
                     "orders",
                     "idx_status_created",
                     "status",
@@ -411,6 +650,7 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
                     "CREATE INDEX idx_status_created ON orders (status, created_at)",
                 ),
                 (
+                    "public",
                     "orders",
                     "idx_status_created",
                     "created_at",
@@ -428,9 +668,9 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
         }
     )
     indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    by_name = {i.name: i for i in indexes["orders"]}
+    by_name = {i.name: i for i in indexes[Relation("public", "orders")]}
     assert by_name["idx_status_created"].columns == ("status", "created_at")
     assert by_name["orders_pkey"].is_primary is True
     assert by_name["idx_status_created"].scans == 0
@@ -447,14 +687,14 @@ def test_a_denied_statement_degrades_and_names_the_privilege():
     """
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_stats": [("orders", "id", 500.0)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_stats": [("public", "orders", "id", 500.0)],
         },
         fail_markers=("pg_stats",),
     )
     adapter = PostgresWorkloadAdapter(querier=querier)
-    facts = adapter.fetch_table_facts(("public",), frozenset({"orders"}))
-    assert facts["orders"].ndv == {}
+    facts = adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    assert facts[Relation("public", "orders")].ndv == {}
     assert any(cap == CAP_NDV for cap, _ in adapter.degraded)
     assert any("pg_stats" in reason for _, reason in adapter.degraded)
 
@@ -464,14 +704,14 @@ def test_the_denial_fixture_would_otherwise_have_returned_statistics():
     so the emptiness there is attributable to the denial rather than to an empty fixture."""
     querier = FakeQuerier(
         {
-            "information_schema.columns": [("orders", "id", "integer")],
-            "pg_stats": [("orders", "id", 500.0)],
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_stats": [("public", "orders", "id", 500.0)],
         }
     )
     facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts["orders"].ndv == {"id": 500.0}
+    assert facts[Relation("public", "orders")].ndv == {"id": 500.0}
 
 
 class _FakeCursor:
@@ -738,19 +978,53 @@ def test_the_schema_statement_runs_once_per_run():
     Twice the catalog work, and — worse — two identical `degraded` entries when it is
     denied, so the user is told the same thing twice.
     """
-    querier = FakeQuerier({"information_schema.columns": [("orders", "id", "integer")]})
+    querier = FakeQuerier({"information_schema.columns": [("public", "orders", "id", "integer")]})
     adapter = PostgresWorkloadAdapter(querier=querier)
     adapter.fetch_schema(("public",))
-    adapter.fetch_table_facts(("public",), frozenset({"orders"}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
     schema_calls = [sql for sql, _ in querier.calls if "information_schema.columns" in sql]
     assert len(schema_calls) == 1
+
+
+def test_the_catalog_statements_are_given_the_relations_they_filter_on():
+    """Each `= ANY(%s)` gets the schema list *and* the table list, not just the schema list.
+
+    `FakeQuerier` keys its canned rows on a SQL substring and ignores the bind parameters, so
+    nothing read `params[1]` anywhere in the suite: replacing the table list with a bogus value
+    in all three relation-scoped statements left every test green. A real server would then be
+    asked about the wrong relations — returning nothing, which reads exactly like a table with
+    no statistics and no indexes, and suppresses proposals with no message.
+
+    Asserted per statement rather than in aggregate: one shared assertion would pass while two
+    of the three passed nothing, which is the shape of six separate findings on this branch.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_total_relation_size": [("public", "orders", 50_000, 1024)],
+            "pg_stats": [],
+            "pg_get_indexdef": [],
+        }
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    relations = frozenset({Relation("public", "orders"), Relation("public", "order_items")})
+    adapter.fetch_table_facts(("public",), relations)
+    adapter.fetch_indexes(("public",), relations)
+
+    expected_tables = ["order_items", "orders"]
+    for marker in ("pg_total_relation_size", "pg_stats", "pg_get_indexdef"):
+        binds = [params for sql, params in querier.calls if marker in sql]
+        assert binds, f"{marker} statement never ran"
+        for params in binds:
+            assert params[0] == ["public"], f"{marker} lost its schema list"
+            assert params[1] == expected_tables, f"{marker} lost its table list: {params[1]!r}"
 
 
 def test_a_denied_schema_statement_is_reported_once_not_twice():
     querier = FakeQuerier({}, fail_markers=("information_schema.columns",))
     adapter = PostgresWorkloadAdapter(querier=querier)
     adapter.fetch_schema(("public",))
-    adapter.fetch_table_facts(("public",), frozenset({"orders"}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
     assert [cap for cap, _ in adapter.degraded].count(CAP_SCHEMA) == 1
 
 
@@ -787,6 +1061,7 @@ def test_fetch_indexes_records_an_expression_index_rather_than_dropping_it():
             "pg_index": [
                 # attname is NULL for the expression column, as a LEFT JOIN yields.
                 (
+                    "public",
                     "orders",
                     "idx_lower_status",
                     None,
@@ -804,9 +1079,9 @@ def test_fetch_indexes_records_an_expression_index_rather_than_dropping_it():
         }
     )
     indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
-        ("public",), frozenset({"orders"})
+        ("public",), frozenset({Relation("public", "orders")})
     )
-    index = indexes["orders"][0]
+    index = indexes[Relation("public", "orders")][0]
     assert index.has_expressions is True
     assert index.columns == ()
     assert "lower(status)" in (index.definition or "")
@@ -817,6 +1092,7 @@ def test_fetch_indexes_records_a_partial_index_predicate():
         {
             "pg_index": [
                 (
+                    "public",
                     "orders",
                     "idx_open",
                     "status",
@@ -834,8 +1110,8 @@ def test_fetch_indexes_records_a_partial_index_predicate():
         }
     )
     index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
-        ("public",), frozenset({"orders"})
-    )["orders"][0]
+        ("public",), frozenset({Relation("public", "orders")})
+    )[Relation("public", "orders")][0]
     assert index.is_partial is True
     assert index.predicate == "(shipped_at IS NULL)"
     assert index.columns == ("status",)
@@ -846,6 +1122,7 @@ def test_fetch_indexes_leaves_a_plain_index_unmarked():
         {
             "pg_index": [
                 (
+                    "public",
                     "orders",
                     "idx_status",
                     "status",
@@ -863,8 +1140,8 @@ def test_fetch_indexes_leaves_a_plain_index_unmarked():
         }
     )
     index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
-        ("public",), frozenset({"orders"})
-    )["orders"][0]
+        ("public",), frozenset({Relation("public", "orders")})
+    )[Relation("public", "orders")][0]
     assert (index.is_partial, index.predicate, index.has_expressions) == (False, None, False)
 
 

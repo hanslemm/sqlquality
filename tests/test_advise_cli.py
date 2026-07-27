@@ -3,7 +3,15 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from sqlquality.cli import app
+from sqlquality.cli import (
+    _ambiguity_warning,
+    _coverage_line,
+    _coverage_warning,
+    _validate_schemas,
+    app,
+)
+from sqlquality.models import Aggregation, QueryStat, Relation, Workload
+from sqlquality.report import advise_payload
 
 runner = CliRunner()
 
@@ -57,24 +65,204 @@ def test_out_of_range_timeout_exit_2_before_connecting(monkeypatch):
         assert "between 1 and 3600" in result.output
 
 
-def test_multiple_schemas_are_rejected_before_connecting(monkeypatch):
-    """Table facts are keyed on relname alone, so two schemas holding `orders` alias.
+def test_two_schemas_are_accepted_and_both_reach_every_catalog_query(monkeypatch):
+    """A second `--schema` is accepted *and* forwarded to every schema-scoped statement.
 
-    Rejecting is the honest minimum: the last row of whichever schema the catalog returned
-    last would otherwise decide the row estimate, silently.
+    The docstring used to claim this test proved `Relation` keying prevented cross-schema
+    aliasing; all it actually asserted was `exit_code == 0`, and `_stub_adapter` overwrote
+    `adapter.schemas` with `("public",)` so it could not have proved anything about
+    `--schema` at all. It now asserts the bind parameter of each schema-scoped query, and
+    names both members rather than checking that the list is non-empty.
     """
-
-    def explode(*args, **kwargs):
-        raise AssertionError("must not connect with more than one --schema")
-
-    monkeypatch.setattr("sqlquality.workload.postgres.PostgresWorkloadAdapter.connect", explode)
+    recorded = _stub_adapter(
+        monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]}
+    )
     result = runner.invoke(
         app,
-        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "public", "--schema", "app"],
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--schema",
+            "sales",
+            "--schema",
+            "staging",
+            "--json",
+        ],
     )
-    assert result.exit_code == 2
-    assert "schema-qualified" in result.output
-    assert "app" in result.output and "public" in result.output
+    assert result.exit_code == 0
+    # Every statement that takes a schema list: the qualify() schema map, table facts, NDV
+    # and the existing-index catalog. Each is checked separately — one of the four carrying
+    # both schemas while another silently narrowed to one is the failure being excluded.
+    # One marker per statement, each unique to it: `pg_class` would have matched both the
+    # table-facts and the index statement and so could not tell which one narrowed.
+    for marker in ("information_schema.columns", "pg_total_relation_size", "pg_stats", "pg_index"):
+        binds = [bind for sql, bind in recorded if marker in sql]
+        assert binds, f"no query ran against {marker}"
+        for bind in binds:
+            assert bind[0] == ["sales", "staging"], f"{marker} received {bind[0]!r}"
+
+
+def test_the_resolved_schemas_reach_the_existing_index_query(monkeypatch):
+    """`adapter.schemas` is the *only* route `--schema` takes into `fetch_indexes`.
+
+    `fetch_schema`, `fetch_table_facts` and `fetch_ndv` are handed the resolved tuple
+    directly by the CLI; `propose()` reads `self.schemas` instead. Drop the CLI's
+    `adapter.schemas = schemas` assignment and `fetch_indexes` silently queries `("public",)`
+    — which returns zero rows *without raising*, so nothing lands in `degraded`,
+    `have_index_data` stays True, and ADV001/ADV007 then claim "no existing index leads with
+    them" at HIGH for tables that are fully indexed while ADV002/ADV003 go silent. That is a
+    check that could not run, reported as a check that ran and passed.
+    """
+    recorded = _stub_adapter(
+        monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]}
+    )
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "sales", "--schema", "staging"],
+    )
+    assert result.exit_code == 0
+    index_binds = [bind for sql, bind in recorded if "pg_index" in sql]
+    assert index_binds, "the existing-index catalog query never ran"
+    assert all(bind[0] == ["sales", "staging"] for bind in index_binds), (
+        f"fetch_indexes was called with {[bind[0] for bind in index_binds]!r} — the CLI's "
+        "resolved --schema tuple never reached the adapter"
+    )
+
+
+def test_duplicate_schemas_are_deduplicated():
+    assert _validate_schemas(["public", "public"]) == ("public",)
+
+
+def test_schema_order_is_preserved():
+    assert _validate_schemas(["b", "a"]) == ("b", "a")
+
+
+def test_coverage_line_reports_ambiguous_separately():
+    workload = _workload_with(stats=3, unparseable=1, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=1, skipped_ambiguous=2)
+    line = _coverage_line(workload, aggregation)
+    assert "2 ambiguous" in line
+
+
+def test_analyzed_count_excludes_ambiguous_statements():
+    """`analyzed N of M` must not double-book an ambiguous statement as both analysed here
+    and unexplained in `_coverage_warning`'s share — it cannot honestly be both. Of 4 query
+    groups, 2 were dropped as ambiguous and 0 as otherwise unresolvable, so only 2 were
+    actually analyzed."""
+    workload = _workload_with(stats=4, unparseable=0, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=2)
+    line = _coverage_line(workload, aggregation)
+    assert "analyzed 2 of 4" in line
+
+
+def test_coverage_warning_fires_when_ambiguity_alone_crosses_the_threshold():
+    """100 stats, 25 ambiguous, nothing else unexplained: the true unexplained share is
+    25/100 = 25%, above the 20% low-coverage threshold. Before `analyzed_query_groups` subtracted
+    `skipped_ambiguous`, the 25 ambiguous statements were counted as both analyzed (inflating
+    `considered`) and unexplained, diluting the share to exactly 20% — at the threshold, not
+    above it — so the warning never fired precisely when ambiguity was the whole reason
+    coverage was bad."""
+    workload = _workload_with(stats=100, unparseable=0, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=25)
+    assert _coverage_warning(workload, aggregation) is not None
+
+
+def test_ambiguity_warning_names_the_remedy():
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=4)
+    warning = _ambiguity_warning(aggregation)
+    assert warning is not None
+    assert "--schema" in warning
+
+
+def test_no_ambiguity_means_no_warning():
+    """The warning must not fire on the single-schema path, which is every existing run."""
+    aggregation = _aggregation_with(skipped_unqualifiable=3, skipped_ambiguous=0)
+    assert _ambiguity_warning(aggregation) is None
+
+
+def test_ambiguity_warning_reaches_the_user_on_a_real_run(monkeypatch):
+    """`_ambiguity_warning` is unit-tested above in isolation, but nothing else in the
+    suite exercises the wiring that actually echoes it from the `advise` command body —
+    deleting that echo leaves every other test green. Two introspected schemas both hold
+    `orders`; the query names it bare, so it cannot be attributed and must surface here."""
+    from sqlquality.workload.postgres import PostgresWorkloadAdapter
+
+    rows = {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1", 5, 100.0, 5),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": [
+            ("sales", "orders", "id", "integer"),
+            ("sales", "orders", "status", "text"),
+            ("staging", "orders", "id", "integer"),
+            ("staging", "orders", "status", "text"),
+        ],
+        "pg_total_relation_size": [],
+        "pg_stats": [],
+        "pg_index": [],
+    }
+
+    def fake_connect(self, params, timeout_s):
+        # Unlike `_stub_adapter`, this does not overwrite `self.schemas`: the CLI already
+        # set it from `--schema` before calling `connect()`, and this scenario needs both.
+        def query(sql, bind):
+            for marker, result in rows.items():
+                if marker in sql:
+                    return result
+            return []
+
+        self._query = query
+
+    monkeypatch.setattr(PostgresWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "sales", "--schema", "staging"],
+    )
+    assert result.exit_code == 0
+    assert "could not be attributed" in result.output
+    assert "--schema" in result.output
+
+
+def test_payload_tables_are_qualified_strings():
+    payload = advise_payload(
+        [],
+        _workload_with(stats=0, unparseable=0, noise=0),
+        _aggregation_with(tables=frozenset({Relation("sales", "orders")})),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert payload["analyzed"]["tables"] == ["sales.orders"]
+    json.dumps(payload)  # must not raise
+
+
+def _workload_with(*, stats: int, unparseable: int, noise: int) -> Workload:
+    return Workload(
+        stats=tuple(
+            QueryStat(fingerprint=f"fp{i}", sql="select 1", calls=1, total_time_ms=1.0)
+            for i in range(stats)
+        ),
+        window_description="w",
+        skipped_unparseable=unparseable,
+        skipped_noise=noise,
+    )
+
+
+def _aggregation_with(
+    *,
+    skipped_unqualifiable: int = 0,
+    skipped_ambiguous: int = 0,
+    tables: frozenset[Relation] = frozenset(),
+) -> Aggregation:
+    return Aggregation(
+        usage=(),
+        total_cost_ms=0.0,
+        skipped_unqualifiable=skipped_unqualifiable,
+        tables=tables,
+        skipped_ambiguous=skipped_ambiguous,
+    )
 
 
 def test_a_single_schema_is_still_accepted(monkeypatch):
@@ -97,8 +285,8 @@ def test_low_coverage_warns_on_stderr(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -118,8 +306,8 @@ def test_good_coverage_does_not_warn(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -129,13 +317,22 @@ def test_good_coverage_does_not_warn(monkeypatch):
 
 
 def _stub_adapter(monkeypatch, rows):
-    """Replace connect() with an injected fake querier."""
+    """Replace connect() with an injected fake querier. Returns the recorded `(sql, bind)`.
+
+    Deliberately does **not** assign `self.schemas`. It used to hard-code `("public",)`,
+    *after* the CLI had already resolved `--schema` onto the adapter — so every test in this
+    module ran `fetch_indexes(("public",), ...)` no matter what schemas it passed, and
+    deleting the CLI's `adapter.schemas = schemas` line left the whole default suite green.
+    The adapter's own `__init__` default is `("public",)` already, so single-schema tests are
+    unaffected; multi-schema ones now exercise the real wiring.
+    """
     from sqlquality.workload.postgres import PostgresWorkloadAdapter
 
-    def fake_connect(self, params, timeout_s):
-        self.schemas = ("public",)
+    recorded: list[tuple[str, object]] = []
 
+    def fake_connect(self, params, timeout_s):
         def query(sql, bind):
+            recorded.append((sql, bind))
             for marker, result in rows.items():
                 if marker in sql:
                     return result
@@ -144,12 +341,13 @@ def _stub_adapter(monkeypatch, rows):
         self._query = query
 
     monkeypatch.setattr(PostgresWorkloadAdapter, "connect", fake_connect)
+    return recorded
 
 
 WIDE_COLUMNS = [
-    ("orders", "id", "integer"),
-    ("orders", "status", "text"),
-    ("orders", "created_at", "timestamp"),
+    ("public", "orders", "id", "integer"),
+    ("public", "orders", "status", "text"),
+    ("public", "orders", "created_at", "timestamp"),
 ]
 
 
@@ -157,34 +355,42 @@ WIDE_COLUMNS = [
 STAR_ONLY_ROWS = {
     "pg_stat_statements": [("select * from wide_t", 100, 5000.0, 10)],
     "pg_stat_database": [("2026-07-01",)],
-    "information_schema.columns": [("wide_t", f"c{i}", "text") for i in range(20)],
-    "pg_total_relation_size": [("wide_t", 5_000_000, 10**8)],
+    "information_schema.columns": [("public", "wide_t", f"c{i}", "text") for i in range(20)],
+    "pg_total_relation_size": [("public", "wide_t", 5_000_000, 10**8)],
     "pg_stats": [],
     "pg_index": [],
 }
 
 
-def test_the_filtered_counter_does_not_claim_introspection_or_ddl(monkeypatch):
+def test_declared_cursors_and_copy_subqueries_are_analyzed_not_filtered(monkeypatch):
     """`DECLARE cur CURSOR FOR SELECT ...` and `COPY (SELECT ...) TO STDOUT` are reads.
 
     Django's `QuerySet.iterator()` and every psycopg2 server-side cursor emit exactly the
-    first form, so a Django shop's hot reads land in this counter — and were then reported
-    as "introspection/DDL", i.e. as maintenance traffic nobody needed to care about, on the
-    one line that exists to disclose what was lost.
+    first form, so a Django shop's hot reads used to land in the "filtered" counter and be
+    thrown away entirely — and reported as "introspection/DDL" on the one line that exists
+    to disclose what was lost. `unwrap()` (`sqlquality.workload.fingerprint`) now recovers
+    the inner query from both statements before the noise test runs, so each is analyzed
+    as its own query group instead.
     """
     _stub_adapter(
         monkeypatch,
         {
             "pg_stat_statements": [
                 ("declare cur cursor for select id from orders where status = $1", 9, 900.0, 9),
-                ("copy (select id from orders where status = $1) to stdout", 5, 500.0, 5),
+                (
+                    "copy (select id, status from orders where status = $1) to stdout",
+                    5,
+                    500.0,
+                    5,
+                ),
             ],
             "pg_stat_database": [("2026-07-01",)],
         },
     )
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 0
-    assert "2 filtered" in result.output
+    assert "analyzed 2 of 2" in result.output
+    assert "0 filtered" in result.output
     assert "introspection/DDL" not in result.output
 
 
@@ -285,8 +491,8 @@ def test_successful_run_exits_0_and_emits_json(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -314,8 +520,8 @@ def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )
@@ -390,8 +596,8 @@ def test_coverage_is_disclosed_even_on_a_clean_run(monkeypatch):
             ],
             "pg_stat_database": [("2026-07-01",)],
             "information_schema.columns": WIDE_COLUMNS,
-            "pg_total_relation_size": [("orders", 5_000_000, 10**8)],
-            "pg_stats": [("orders", "status", 5000.0)],
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
             "pg_index": [],
         },
     )

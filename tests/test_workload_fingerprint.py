@@ -1,3 +1,4 @@
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -10,6 +11,7 @@ from sqlquality.workload.fingerprint import (
     is_noise,
     literal_flags,
     redact_tree,
+    unwrap,
 )
 
 
@@ -50,14 +52,14 @@ def test_is_noise_filters_our_own_introspection_and_ddl():
     assert not is_noise("select id from orders where status = $1")
 
 
-def test_is_noise_also_discards_predicate_bearing_declare_and_copy():
-    """A documented loss, pinned so it cannot become an undocumented one.
+def test_is_noise_still_discards_the_raw_wrapper_text():
+    """`is_noise` itself is a statement-prefix filter and stays that way.
 
-    `_LEADING_NOISE` is a statement-prefix filter, so a cursor declaration or a COPY that
-    wraps a real SELECT — with real predicates — is discarded whole. Django's
-    `QuerySet.iterator()` emits the first form. Unwrapping to the inner SELECT is a
-    follow-up; until then this is a README limitation and the skip counter says only
-    "filtered", never "introspection/DDL".
+    A cursor declaration or a `COPY (...) TO` still starts with a keyword `_LEADING_NOISE`
+    matches, so calling `is_noise` on the *raw* row still discards it whole. That is no
+    longer a loss: `ingest` calls `unwrap()` first and tests `is_noise` on the inner query,
+    so the real read survives — see `test_a_declared_cursor_is_analyzed_not_filtered` and
+    `test_a_copy_subquery_is_analyzed_not_filtered` below.
     """
     assert is_noise("DECLARE cur CURSOR FOR SELECT id FROM orders WHERE status = $1")
     assert is_noise("COPY (SELECT id FROM orders WHERE status = $1) TO STDOUT")
@@ -98,6 +100,30 @@ def test_ingest_groups_by_fingerprint_and_sums_cost():
     assert "999" not in workload.stats[0].sql
 
 
+def test_query_stat_sql_is_the_reserialised_redacted_tree_not_the_row_text():
+    """Pins the premise `_wide_relations_touched` relies on, which its docstring once got
+    backwards.
+
+    That function re-parses `stat.sql` with no fallback, and justified the missing fallback
+    with "it is the same text `ingest()` already parsed". It is not: `stat.sql` is sqlglot's
+    re-serialisation of the *redacted* tree, so the real guarantee is that sqlglot re-parses
+    its own generated SQL — measured, not inherited from the row having parsed. A comment
+    that justifies deleting code with the wrong reason is how the code comes back, so the
+    two properties it actually depends on are asserted here: the text is not the row's, and
+    it round-trips.
+    """
+    raw = "select id from t where email = 'a@b.de' and n > 42"
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql=raw, calls=1, total_time_ms=1.0),), window_description="w"
+    )
+    stat = ingest(fetch, "postgres").stats[0]
+    assert stat.sql != raw, "stat.sql is the row's own text — the false premise, made true"
+    assert "a@b.de" not in stat.sql
+    # Round-trip: parsing sqlglot's own output under the same dialect must succeed, since
+    # ADV006 does exactly this and has no fallback if it raises.
+    assert parse(stat.sql, "postgres") is not None
+
+
 def test_ingest_counts_unparseable_and_noise_without_raising():
     fetch = WorkloadFetch(
         rows=(
@@ -111,6 +137,35 @@ def test_ingest_counts_unparseable_and_noise_without_raising():
     assert workload.skipped_unparseable == 1
     assert workload.skipped_noise == 1
     assert len(workload.stats) == 1
+
+
+def test_ingest_filters_fetch_as_noise():
+    """`FETCH` carries no query text, so it must stay filtered rather than analysed.
+
+    Left unfiltered, sqlglot parses `FETCH 100 FROM c` as `exp.Command` — it would become
+    an analysed query group with zero column usage but the cursor's full cost attached
+    (see `unwrap`'s docstring on where a cursor's cost actually lands), which is worse than
+    the noise it should have been.
+    """
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="FETCH 100 FROM c", calls=2, total_time_ms=72.9),),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
+
+
+def test_ingest_filters_close_as_noise():
+    """`CLOSE` carries no query text either; left unfiltered, sqlglot parses `CLOSE bigcur`
+    as `exp.Alias`, which would also become an analysed, zero-column-usage query group."""
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="CLOSE bigcur", calls=1, total_time_ms=0.1),),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
 
 
 def test_ingest_captures_literal_flags_before_redaction():
@@ -198,3 +253,154 @@ def test_redaction_still_erases_a_real_literal_beside_a_placeholder():
     redacted = redact_tree(parse(sql, "postgres")).sql("postgres")
     assert "secret-value" not in redacted
     assert "$1" in redacted
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        (
+            "DECLARE c CURSOR FOR SELECT id FROM orders WHERE status = 'x'",
+            "SELECT id FROM orders WHERE status = 'x'",
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT id FROM orders",
+            "SELECT id FROM orders",
+        ),
+        (
+            "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM orders",
+            "SELECT id FROM orders",
+        ),
+        (
+            "DECLARE c BINARY INSENSITIVE SCROLL CURSOR WITH HOLD FOR SELECT a FROM t",
+            "SELECT a FROM t",
+        ),
+        (
+            'DECLARE "my cursor" CURSOR FOR SELECT a FROM t',
+            "SELECT a FROM t",
+        ),
+        (
+            "COPY (SELECT id FROM orders WHERE status = 'x') TO STDOUT",
+            "SELECT id FROM orders WHERE status = 'x'",
+        ),
+        ("copy (select 1) to stdout", "select 1"),
+        # Not cosmetic: greedy `.*` under DOTALL lets the query group absorb the space
+        # before the closing paren, so without `.strip()` this would return
+        # "SELECT a FROM t " (trailing space) — a distinct fingerprint-grouping key from
+        # the space-free forms above, even though it is the same query.
+        (
+            "COPY ( SELECT a FROM t ) TO STDOUT",
+            "SELECT a FROM t",
+        ),
+    ],
+)
+def test_unwrap_recovers_the_inner_query(sql, expected):
+    assert unwrap(sql) == expected
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM orders",
+        "COPY orders TO STDOUT",
+        # A later `(` must not be enough: guards a loosened prefix anchor (e.g.
+        # `^\s*COPY\s*[^(]*\(`) that skips ahead to the first paren instead of requiring
+        # one immediately after `COPY`.
+        "COPY orders (id, status) TO STDOUT",
+        # Guards the `\bTO\b` anchor that excludes writes: a `COPY (...) FROM STDIN` wraps
+        # a query but is loading it, not reading it, and must stay noise.
+        "COPY (SELECT 1) FROM STDIN",
+        # Guards the capture group's `\S` requirement: a query after `FOR` is mandatory,
+        # not optional.
+        "DECLARE c CURSOR FOR",
+    ],
+)
+def test_unwrap_leaves_everything_else_alone(sql):
+    """Anything without a recoverable inner query is returned unchanged, not mangled.
+
+    `FETCH 100 FROM c`, `CLOSE c` and a bare `DECLARE` used to be members here too, but none
+    of them discriminated anything: none starts with a keyword either pattern's grammar
+    depends on past its first literal token, so no plausible single mutation of
+    `_DECLARE_CURSOR` or `_COPY_QUERY`'s internals would make any of them match — they
+    passed before the patterns existed and would pass against almost any broken version of
+    them just the same. `FETCH`/`CLOSE` staying noise is `is_noise`'s contract, not
+    `unwrap`'s — see `test_ingest_filters_fetch_as_noise` and
+    `test_ingest_filters_close_as_noise`, which pin that contract directly and go red if
+    either keyword is removed from `_LEADING_NOISE`.
+    """
+    assert unwrap(sql) == sql
+
+
+def test_a_declared_cursor_is_analyzed_not_filtered():
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT id FROM orders WHERE status = 'x'",
+                calls=3,
+                total_time_ms=300.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 0
+    assert len(workload.stats) == 1
+    assert "DECLARE" not in workload.stats[0].sql.upper()
+    assert workload.stats[0].calls == 3
+
+
+def test_a_copy_subquery_is_analyzed_not_filtered():
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="COPY (SELECT id FROM orders WHERE status = 'x') TO STDOUT",
+                calls=1,
+                total_time_ms=10.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 0
+    assert len(workload.stats) == 1
+
+
+def test_a_declared_cursor_over_introspection_is_still_filtered():
+    """Unwrapping must not become a way to smuggle our own catalog reads into the workload."""
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT * FROM pg_stat_statements",
+                calls=1,
+                total_time_ms=1.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
+
+
+def test_a_whole_table_copy_is_still_filtered():
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="COPY orders TO STDOUT", calls=1, total_time_ms=1.0),),
+        window_description="w",
+    )
+    assert ingest(fetch, "postgres").skipped_noise == 1
+
+
+def test_the_unwrapped_query_is_still_redacted():
+    """Redaction runs after unwrapping, so the inner literal must not survive."""
+    fetch = WorkloadFetch(
+        rows=(
+            RawQueryRow(
+                sql="DECLARE c CURSOR FOR SELECT id FROM orders WHERE email = 'a@b.test'",
+                calls=1,
+                total_time_ms=1.0,
+            ),
+        ),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert "a@b.test" not in workload.stats[0].sql
+    assert "a@b.test" not in workload.stats[0].fingerprint
