@@ -556,6 +556,136 @@ def propose_join_keys(
     return proposals
 
 
+def propose_grouping_indexes(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[Relation, TableFacts],
+    existing: Mapping[Relation, Sequence[PgIndex]],
+    *,
+    min_cost_share: float,
+    min_rows: int = MIN_ROWS_FOR_INDEX,
+    max_arity: int = MAX_INDEX_ARITY,
+    have_index_data: bool = True,
+) -> list[Proposal]:
+    """ADV008 — an index that can feed a hot GROUP BY already sorted.
+
+    Confidence is capped at MEDIUM and there is deliberately no HIGH branch. Whether
+    Postgres uses such an index depends on its choice between `GroupAggregate` (which wants
+    sorted input, and is what the index provides) and `HashAggregate` (which does not) — a
+    decision driven by `work_mem`, the number of groups and the aggregates involved, none of
+    which this tool can see. Claiming HIGH would be asserting something about the planner
+    rather than about the catalog. Do not add a HIGH branch here for symmetry with ADV001.
+
+    One composite rather than several single-column indexes, unlike ADV007: `GROUP BY a, b`
+    wants input ordered by `(a, b)`, which two separate indexes cannot provide. The column
+    *order* is inferred from cost, not read from the query — redaction and fingerprinting do
+    not preserve each column's position in the GROUP BY clause — and the rationale says so,
+    because getting the order wrong makes the index serve only its leading column.
+    """
+    proposals: list[Proposal] = []
+    for relation, items in sorted(_by_relation(usage).items()):
+        table_facts = facts.get(relation)
+        rows = table_facts.row_estimate if table_facts else None
+        if rows is not None and rows < min_rows:
+            continue
+        grouping = sorted(
+            (i for i in items if i.role is ColumnRole.GROUP),
+            key=lambda i: (-i.cost_ms, i.column),
+        )
+        if not grouping:
+            continue
+        seed = grouping[0]
+        # Extend the composite only with columns some single query groups by *alongside* the
+        # seed. Without this, two unrelated GROUP BYs on the same table are welded into one
+        # composite index that serves neither beyond its leading column.
+        chosen = [seed]
+        for candidate in grouping[1:]:
+            if len(chosen) >= max_arity:
+                break
+            if candidate.fingerprint_ids & seed.fingerprint_ids:
+                chosen.append(candidate)
+
+        cost_share = max(i.cost_share for i in chosen)
+        if cost_share < min_cost_share:
+            continue
+        columns = tuple(i.column for i in chosen)
+        if _covered(columns, existing.get(relation, ())) is not None:
+            continue
+
+        # Same guards as ADV001 and ADV007, same reasons: a partial index leading with
+        # these columns does not serve an unfiltered GROUP BY, and an expression index's
+        # `columns` tuple understates it, so `_covered` already treats neither as coverage.
+        # But silence on both would let this rule say nothing next to an index that, in
+        # plain English, does lead with these columns — just partially, or under an
+        # expression. Naming them is what ADV001 and ADV007 do for the same gap.
+        table_indexes = existing.get(relation, ())
+        partial_skipped = tuple(
+            index.name
+            for index in table_indexes
+            if index.is_partial and _is_prefix(columns, index.columns)
+        )
+        expression_indexes = tuple(
+            index.name
+            for index in table_indexes
+            if index.has_expressions and mentions_identifier(columns[0], index.definition or "")
+        )
+
+        rationale = (
+            "This grouping carries a hot share of workload cost. An index on these columns "
+            "lets the planner read the rows already ordered and group them without a sort. "
+            "The column order here is inferred from cost, not read from the query — "
+            "redaction does not preserve each column's position in the GROUP BY — so check "
+            "it against the actual grouping before applying, since a composite index only "
+            "serves the grouping it leads with."
+        )
+        if not have_index_data:
+            rationale += (
+                " The existing-index list could not be read, so whether an index already "
+                "leads with these columns is unknown."
+            )
+        if rows is None:
+            rationale += _UNKNOWN_ROWS_NOTE
+        if partial_skipped:
+            rationale += (
+                f" A partial index ({', '.join(partial_skipped)}) leads with these columns "
+                "but carries a WHERE predicate, so it does not serve an unfiltered lookup — "
+                "it is not treated as covering this proposal."
+            )
+        if expression_indexes:
+            rationale += (
+                f" An expression index ({', '.join(expression_indexes)}) mentions "
+                f"{columns[0]}; sqlquality cannot tell whether it already serves this "
+                "lookup, so confirm before applying."
+            )
+
+        proposals.append(
+            Proposal(
+                code="ADV008",
+                title=f"Add index for GROUP BY on {relation}({', '.join(columns)})",
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "columns": columns,
+                    "roles": tuple(i.role.value for i in chosen),
+                    "cost_share": cost_share,
+                    "calls": max(i.calls for i in chosen),
+                    "fingerprints": max(i.fingerprints for i in chosen),
+                    "row_estimate": rows,
+                    "partial_indexes_skipped": partial_skipped,
+                    "expression_indexes": expression_indexes,
+                },
+                confidence=(
+                    Confidence.LOW if rows is None or not have_index_data else Confidence.MEDIUM
+                ),
+                ddl=(
+                    f"CREATE INDEX ON {_qualified(relation.schema, relation.table)} "
+                    f"({', '.join(_quote_ident(c) for c in columns)});"
+                ),
+            )
+        )
+    return proposals
+
+
 def propose_unused_indexes(
     existing: Mapping[Relation, Sequence[PgIndex]],
     *,
@@ -1347,6 +1477,13 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 have_index_data=have_index_data,
             ),
             *propose_join_keys(
+                aggregation.usage,
+                facts,
+                existing,
+                min_cost_share=min_cost_share,
+                have_index_data=have_index_data,
+            ),
+            *propose_grouping_indexes(
                 aggregation.usage,
                 facts,
                 existing,

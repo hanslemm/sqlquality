@@ -315,7 +315,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -385,6 +385,7 @@ statement is not valid SQL to copy out and run.
 | ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
 | ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
+| ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -393,6 +394,11 @@ statement is not valid SQL to copy out and run.
 - **MEDIUM** — cost evidence is solid but a catalog input is missing or stale. ADV002 is
   capped at MEDIUM unconditionally: `idx_scan` only accumulates since the last statistics
   reset, so zero scans can never prove an index is unused across a full business cycle.
+  ADV008 is also capped at MEDIUM unconditionally, for a different reason: whether Postgres
+  uses the index for grouping depends on its choice between `GroupAggregate` and
+  `HashAggregate`, a planner decision driven by `work_mem` and group cardinality that no
+  catalog view exposes — HIGH would claim to know the planner's choice, not the catalog's
+  state, so ADV008 never reaches it.
 - **LOW** — thin evidence, and specifically **any check that could not be run**: the row
   count is unknown so the small-table floor could not be applied, or the existing-index
   list was denied so "no index already covers this" could not be confirmed. Absent
@@ -781,14 +787,17 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   statements that could not be parsed or resolved against the schema, so poor coverage
   dilutes every share and makes `--min-cost-share` effectively stricter; the CLI warns
   when coverage is poor, and the report always prints the skip counts.
-- **Grouping columns are measured and then ignored.** `advise` classifies eight column
-  roles and cost-weights all of them; join keys are now read by ADV007 (a hot unindexed
+- **Join keys and grouping columns are measured and read, not just cost-weighted.**
+  `advise` classifies eight column roles; join keys are read by ADV007 (a hot unindexed
   foreign-key join produces a proposal, not just an `orders.customer_id join cost_share
-  1.0` line that goes nowhere), but `GROUP BY` columns still are not. Any column under a
-  `JOIN` is classified as a join key, so a predicate you placed in an `ON` clause (as
-  `LEFT JOIN` semantics require) is not treated as a filter and drops out of ADV001's
-  reach — it is ADV007's candidate instead, one index per join column rather than folded
-  into a composite. Proposing on `GROUP BY` columns is a follow-up, not a bug fix.
+  1.0` line that goes nowhere) and `GROUP BY` columns are read by ADV008, as one composite
+  index rather than one per column — `GROUP BY a, b` needs input sorted by `(a, b)`, and
+  two single-column indexes cannot provide that. Any column under a `JOIN` is classified
+  as a join key, so a predicate you placed in an `ON` clause (as `LEFT JOIN` semantics
+  require) is not treated as a filter and drops out of ADV001's reach — it is ADV007's
+  candidate instead. ADV008's column order within the composite is inferred from cost,
+  not read from the query, because redaction does not preserve each column's position in
+  the `GROUP BY` clause — check it against the actual grouping before applying.
 - **`DECLARE` and `COPY` statements are discarded whole.** The noise filter matches on the
   leading keyword, so `DECLARE cur CURSOR FOR SELECT ... WHERE ...` and
   `COPY (SELECT ... WHERE ...) TO STDOUT` are dropped along with the session-control and
@@ -800,16 +809,16 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
 - **Expression indexes are read but not matched.** `advise` now sees that an index on
   `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
   that index already serves a lookup on `status` — so it proposes and says so, rather than
-  suppressing or ignoring. Confirm before applying. True of both index-creating rules,
-  ADV001 and ADV007.
+  suppressing or ignoring. Confirm before applying. True of all three index-creating rules,
+  ADV001, ADV007 and ADV008.
 - **ADV003 only compares plain indexes.** A pair where either index carries a `WHERE`
   predicate or an indexed expression is skipped entirely rather than proposed at lower
   confidence: a partial index exists to serve a subset, so recommending its removal is
   likely wrong rather than merely uncertain. Plain pairs are reported at HIGH.
 - **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
   shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
-  a candidate index — it is named in the evidence instead. True of both index-creating
-  rules, ADV001 and ADV007.
+  a candidate index — it is named in the evidence instead. True of all three index-creating
+  rules, ADV001, ADV007 and ADV008.
 - **Multiple `--schema` values are supported, with one honest caveat.** Every catalog fact
   (table sizes, NDV statistics, index lists, the `qualify()` schema) is keyed by
   `schema.table`, so `orders` in two introspected schemas no longer aliases into one
