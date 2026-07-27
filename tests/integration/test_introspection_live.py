@@ -85,6 +85,30 @@ def test_the_session_really_is_read_only(adapter, seeded):
         adapter._query(f"CREATE TABLE {schema}.should_not_exist (x int)", ())
 
 
+def test_fetch_schema_nests_columns_under_schema_then_table(seeded):
+    """`fetch_schema`'s nested shape, asserted directly rather than called for side effect.
+
+    A flat `{table: {column: type}}` map cannot tell `public.orders` and `staging.orders`
+    apart — a column lookup for one resolves against the union of both column sets. This
+    is the specific shape guarantee `qualify()` depends on to keep them separate, and
+    nothing in this suite checked it directly before now.
+    """
+    dsn, _schema = seeded
+    adapter = PostgresWorkloadAdapter()
+    adapter.schemas = ("public", "staging")
+    adapter.connect(ConnectionParams(engine="postgres", dsn=dsn, fields={}, source="--dsn"), 30)
+    db_schema = adapter.fetch_schema(("public", "staging"))
+
+    assert "public" in db_schema and "staging" in db_schema, db_schema.keys()
+    assert "orders" in db_schema["public"], db_schema["public"].keys()
+    assert "orders" in db_schema["staging"], db_schema["staging"].keys()
+    assert db_schema["public"]["orders"] is not db_schema["staging"]["orders"], (
+        "both schemas' orders table resolved to the same column dict — flat, aliased shape"
+    )
+    assert "status" in db_schema["public"]["orders"]
+    assert "status" in db_schema["staging"]["orders"]
+
+
 def test_two_same_named_tables_keep_their_own_row_estimates(seeded):
     """The aliasing bug, against real catalog rows rather than canned ones.
 
