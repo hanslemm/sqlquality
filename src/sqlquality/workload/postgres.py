@@ -431,6 +431,99 @@ def propose_indexes(
     return proposals
 
 
+def propose_join_keys(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[Relation, TableFacts],
+    existing: Mapping[Relation, Sequence[PgIndex]],
+    *,
+    min_cost_share: float,
+    min_rows: int = MIN_ROWS_FOR_INDEX,
+    have_index_data: bool = True,
+) -> list[Proposal]:
+    """ADV007 — a hot join key with no index leading with it.
+
+    Deliberately one proposal per join column rather than a composite: two joins against the
+    same table want two indexes, and a composite `(a, b)` serves only probes on `a`.
+
+    Not folded into ADV001. That rule's rationale is the B-tree ordering argument —
+    "equality columns first so the range column can be scanned last" — and a join key is not
+    a filter predicate: it is probed once per outer row. Adding JOIN to ADV001's candidate
+    list would have left that sentence in the report while making it false of the index it
+    describes. Postgres does not index the referencing side of a foreign key either, so this
+    gap is both common and expensive.
+    """
+    proposals: list[Proposal] = []
+    for relation, items in sorted(_by_relation(usage).items()):
+        table_facts = facts.get(relation)
+        rows = table_facts.row_estimate if table_facts else None
+        if rows is not None and rows < min_rows:
+            continue
+        ndv = table_facts.ndv if table_facts else {}
+        joins = sorted(
+            (i for i in items if i.role is ColumnRole.JOIN),
+            key=lambda i: (-i.cost_ms, i.column),
+        )
+        for item in joins:
+            if item.cost_share < min_cost_share:
+                continue
+            if _covered((item.column,), existing.get(relation, ())) is not None:
+                continue
+            column_ndv = ndv.get(item.column)
+            if rows is None or not have_index_data:
+                confidence = Confidence.LOW
+            elif column_ndv is None:
+                confidence = Confidence.MEDIUM
+            elif column_ndv >= SELECTIVE_NDV:
+                confidence = Confidence.HIGH
+            else:
+                confidence = Confidence.LOW
+
+            rationale = (
+                "This column carries the table's hottest join predicate. A join key is "
+                "probed once per outer row, so without an index leading with it every probe "
+                "is a scan."
+            )
+            if have_index_data:
+                rationale += " No existing index leads with it."
+            else:
+                rationale += (
+                    " The existing-index list could not be read, so whether an index "
+                    "already leads with it is unknown — check before applying."
+                )
+            if rows is None:
+                rationale += _UNKNOWN_ROWS_NOTE
+            if column_ndv is not None and column_ndv < SELECTIVE_NDV:
+                rationale += (
+                    f" Only about {column_ndv:.0f} distinct values, so the index may not be "
+                    "selective enough to be worth its write cost."
+                )
+
+            proposals.append(
+                Proposal(
+                    code="ADV007",
+                    title=f"Add index on join key {relation}({item.column})",
+                    rationale=rationale,
+                    evidence={
+                        "schema": relation.schema,
+                        "table": relation.table,
+                        "columns": (item.column,),
+                        "roles": (item.role.value,),
+                        "cost_share": item.cost_share,
+                        "calls": item.calls,
+                        "fingerprints": item.fingerprints,
+                        "row_estimate": rows,
+                        "leading_ndv": column_ndv,
+                    },
+                    confidence=confidence,
+                    ddl=(
+                        f"CREATE INDEX ON {_qualified(relation.schema, relation.table)} "
+                        f"({_quote_ident(item.column)});"
+                    ),
+                )
+            )
+    return proposals
+
+
 def propose_unused_indexes(
     existing: Mapping[Relation, Sequence[PgIndex]],
     *,
@@ -1215,6 +1308,13 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         have_index_data = not any(cap == CAP_INDEXES for cap, _ in self.degraded)
         proposals = [
             *propose_indexes(
+                aggregation.usage,
+                facts,
+                existing,
+                min_cost_share=min_cost_share,
+                have_index_data=have_index_data,
+            ),
+            *propose_join_keys(
                 aggregation.usage,
                 facts,
                 existing,

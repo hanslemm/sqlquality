@@ -315,7 +315,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -384,6 +384,7 @@ statement is not valid SQL to copy out and run.
 | ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
 | ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
+| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate |
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -780,14 +781,14 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   statements that could not be parsed or resolved against the schema, so poor coverage
   dilutes every share and makes `--min-cost-share` effectively stricter; the CLI warns
   when coverage is poor, and the report always prints the skip counts.
-- **Join keys and grouping columns are measured and then ignored.** `advise` classifies
-  eight column roles and cost-weights all of them, but only five are read by the proposal
-  rules. A hot unindexed foreign-key join produces `orders.customer_id join cost_share
-  1.0` and **no proposal at all** — arguably the most valuable index recommendation in a
-  relational workload, measured and discarded. Same for `GROUP BY` columns. Compounding
-  it: any column under a `JOIN` is classified as a join key, so a predicate you placed in
-  an `ON` clause (as `LEFT JOIN` semantics require) is not treated as a filter and drops
-  out of ADV001's reach too. Proposing on join keys is a follow-up, not a bug fix.
+- **Grouping columns are measured and then ignored.** `advise` classifies eight column
+  roles and cost-weights all of them; join keys are now read by ADV007 (a hot unindexed
+  foreign-key join produces a proposal, not just an `orders.customer_id join cost_share
+  1.0` line that goes nowhere), but `GROUP BY` columns still are not. Any column under a
+  `JOIN` is classified as a join key, so a predicate you placed in an `ON` clause (as
+  `LEFT JOIN` semantics require) is not treated as a filter and drops out of ADV001's
+  reach — it is ADV007's candidate instead, one index per join column rather than folded
+  into a composite. Proposing on `GROUP BY` columns is a follow-up, not a bug fix.
 - **`DECLARE` and `COPY` statements are discarded whole.** The noise filter matches on the
   leading keyword, so `DECLARE cur CURSOR FOR SELECT ... WHERE ...` and
   `COPY (SELECT ... WHERE ...) TO STDOUT` are dropped along with the session-control and
