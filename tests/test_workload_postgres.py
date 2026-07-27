@@ -226,6 +226,39 @@ def test_absolute_n_distinct_survives_a_missing_row_count():
     assert facts["orders"].ndv["id"] == 500.0
 
 
+def test_a_never_analyzed_table_reports_an_unknown_row_count():
+    """Postgres 14+ stores -1 in reltuples for a table that has never been analyzed.
+
+    Passed through, the small-table gate reads it as a tiny table and suppresses every
+    proposal — silently, and precisely in the window after a load or migration when someone
+    would run advise. -1 means unknown, and unknown already has a correct path.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_total_relation_size": [("orders", -1, 10**9)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate is None
+
+
+def test_an_analyzed_empty_table_still_reports_zero():
+    """0 is a real answer — analyzed and empty — and must not be conflated with unknown."""
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_total_relation_size": [("orders", 0, 8192)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate == 0
+
+
 def test_fetch_indexes_restores_column_order_from_ordinality():
     """Rows arriving out of order must still yield the right composite order.
 
