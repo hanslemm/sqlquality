@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 from sqlquality.cli import (
     _ambiguity_warning,
     _coverage_line,
+    _coverage_warning,
     _validate_schemas,
     app,
 )
@@ -99,6 +100,29 @@ def test_coverage_line_reports_ambiguous_separately():
     assert "2 ambiguous" in line
 
 
+def test_analyzed_count_excludes_ambiguous_statements():
+    """`analyzed N of M` must not double-book an ambiguous statement as both analysed here
+    and unexplained in `_coverage_warning`'s share — it cannot honestly be both. Of 4 query
+    groups, 2 were dropped as ambiguous and 0 as otherwise unresolvable, so only 2 were
+    actually analyzed."""
+    workload = _workload_with(stats=4, unparseable=0, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=2)
+    line = _coverage_line(workload, aggregation)
+    assert "analyzed 2 of 4" in line
+
+
+def test_coverage_warning_fires_when_ambiguity_alone_crosses_the_threshold():
+    """100 stats, 25 ambiguous, nothing else unexplained: the true unexplained share is
+    25/100 = 25%, above the 20% low-coverage threshold. Before `_analyzed_count` subtracted
+    `skipped_ambiguous`, the 25 ambiguous statements were counted as both analyzed (inflating
+    `considered`) and unexplained, diluting the share to exactly 20% — at the threshold, not
+    above it — so the warning never fired precisely when ambiguity was the whole reason
+    coverage was bad."""
+    workload = _workload_with(stats=100, unparseable=0, noise=0)
+    aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=25)
+    assert _coverage_warning(workload, aggregation) is not None
+
+
 def test_ambiguity_warning_names_the_remedy():
     aggregation = _aggregation_with(skipped_unqualifiable=0, skipped_ambiguous=4)
     warning = _ambiguity_warning(aggregation)
@@ -110,6 +134,50 @@ def test_no_ambiguity_means_no_warning():
     """The warning must not fire on the single-schema path, which is every existing run."""
     aggregation = _aggregation_with(skipped_unqualifiable=3, skipped_ambiguous=0)
     assert _ambiguity_warning(aggregation) is None
+
+
+def test_ambiguity_warning_reaches_the_user_on_a_real_run(monkeypatch):
+    """`_ambiguity_warning` is unit-tested above in isolation, but nothing else in the
+    suite exercises the wiring that actually echoes it from the `advise` command body —
+    deleting that echo leaves every other test green. Two introspected schemas both hold
+    `orders`; the query names it bare, so it cannot be attributed and must surface here."""
+    from sqlquality.workload.postgres import PostgresWorkloadAdapter
+
+    rows = {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1", 5, 100.0, 5),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": [
+            ("sales", "orders", "id", "integer"),
+            ("sales", "orders", "status", "text"),
+            ("staging", "orders", "id", "integer"),
+            ("staging", "orders", "status", "text"),
+        ],
+        "pg_total_relation_size": [],
+        "pg_stats": [],
+        "pg_index": [],
+    }
+
+    def fake_connect(self, params, timeout_s):
+        # Unlike `_stub_adapter`, this does not overwrite `self.schemas`: the CLI already
+        # set it from `--schema` before calling `connect()`, and this scenario needs both.
+        def query(sql, bind):
+            for marker, result in rows.items():
+                if marker in sql:
+                    return result
+            return []
+
+        self._query = query
+
+    monkeypatch.setattr(PostgresWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "sales", "--schema", "staging"],
+    )
+    assert result.exit_code == 0
+    assert "could not be attributed" in result.output
+    assert "--schema" in result.output
 
 
 def test_payload_tables_are_qualified_strings():

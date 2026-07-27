@@ -290,6 +290,22 @@ def test_bare_select_star_over_an_unambiguous_name_is_not_counted():
     assert result.usage == ()
 
 
+def test_ambiguous_bare_reference_is_counted_even_without_a_literal_star():
+    """`select count(*) from orders` and `select 1 from orders` are not flagged
+    `FLAG_SELECT_STAR` — that flag only marks a literal `SELECT *` — but neither references
+    any column by name either, so `qualify()` never raises for either of them, exactly like
+    the bare-star case above. Gating the check on the star flag let these two escape *both*
+    counters: parsed fine, zero usage, never raised, never counted.
+    """
+    result = aggregate(
+        _mixed_workload("select count(*) from orders", "select 1 from orders"),
+        COLLIDING,
+        "postgres",
+    )
+    assert result.skipped_ambiguous == 2
+    assert result.usage == ()
+
+
 def test_a_plain_parse_failure_is_not_counted_as_ambiguous():
     """The two counters must not both fire for the same statement."""
     result = aggregate(_mixed_workload("this is not sql at all"), ONE_SCHEMA, "postgres")

@@ -177,6 +177,15 @@ class Aggregation:
     #: Statements dropped because a bare table name is held by two introspected schemas.
     #: Separate from `skipped_unqualifiable` because the remedy differs: qualify the query
     #: or run once per schema, rather than widen the schema.
+    #:
+    #: Counts two distinct discovery situations, both the same underlying fact. Most
+    #: statements reference a column by name, so `qualify()` (or the DML sole-target check)
+    #: raises trying to resolve it and `aggregate()` counts the exception directly. A
+    #: statement that names the ambiguous table but references none of its columns by name
+    #: — `select * from orders`, `select count(*) from orders`, `select 1 from orders` —
+    #: gives `qualify()` nothing to validate, so it raises nothing either; `aggregate()`
+    #: instead recognizes this case directly (zero usage extracted, plus a bare table name
+    #: two introspected schemas both hold) and counts it the same way.
     skipped_ambiguous: int = 0
 
 

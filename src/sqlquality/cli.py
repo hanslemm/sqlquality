@@ -610,10 +610,18 @@ def _validate_timeout(value: int) -> int:
 def _analyzed_count(workload: Workload, aggregation: Aggregation) -> int:
     """Query groups whose usage was actually extracted.
 
-    Unresolvable groups are a *subset* of ``workload.stats``, not a separate pool, so
-    ``len(stats)`` overstates what was understood.
+    Unresolvable *and* ambiguous groups are both a *subset* of ``workload.stats``, not a
+    separate pool, so ``len(stats)`` overstates what was understood unless both are
+    subtracted. Omitting `skipped_ambiguous` here used to let an ambiguous statement count
+    as "analyzed" in this line while the *same* statement counted as "unexplained" in
+    `_coverage_warning`'s share — a statement cannot honestly be both, and the share was the
+    one that mattered: it silently deflated toward "coverage is fine", suppressing the
+    low-coverage warning exactly when ambiguity was the reason coverage was bad.
     """
-    return max(0, len(workload.stats) - aggregation.skipped_unqualifiable)
+    return max(
+        0,
+        len(workload.stats) - aggregation.skipped_unqualifiable - aggregation.skipped_ambiguous,
+    )
 
 
 def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:

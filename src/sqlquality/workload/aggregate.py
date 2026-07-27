@@ -140,22 +140,22 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
         except (SqlParseError, UnqualifiableQuery):
             skipped_unqualifiable += 1
             continue
-        # A bare `select * from orders` (no predicate, no named column) contributes no
-        # usage either way — stars are never expanded — so `qualify()` above has nothing to
-        # validate and neither raises nor records anything for it, even when "orders" is a
-        # name two introspected schemas both hold. Left uncounted, that reads as "understood
-        # and irrelevant" when it is really the same unattributable-bare-name fact
-        # `AmbiguousRelation` reports elsewhere (and the reason ADV006's own
+        # Any statement that names a table but references none of its columns by name
+        # (`select * from orders`, `select count(*) from orders`, `select 1 from orders`,
+        # `select now() from orders`) contributes no usage either way, so `qualify()` above
+        # has nothing to validate and neither raises nor records anything for it — even when
+        # "orders" is a name two introspected schemas both hold. Not gated on
+        # `FLAG_SELECT_STAR`: that flag only marks a literal `SELECT *`, so gating on it let
+        # `select count(*) from orders` and `select 1 from orders` over the same colliding
+        # schema escape *both* counters — parsed fine, zero usage, never raised, never
+        # counted, reported as if fully understood. Left uncounted, any of these reads as
+        # "understood and irrelevant" when it is really the same unattributable-bare-name
+        # fact `AmbiguousRelation` reports elsewhere (and the reason ADV006's own
         # `_wide_relations_touched` later declines to guess at it too); it just surfaces
-        # without an exception because there is no column reference for `qualify()` to
-        # trip over. Gated on `not triples`: a statement that already produced usage from
-        # some *other*, unambiguous table was not silently dropped, so it does not belong
-        # in this counter.
-        if (
-            not triples
-            and FLAG_SELECT_STAR in stat.flags
-            and _references_an_ambiguous_bare_table(tree, schema)
-        ):
+        # without an exception because there is no column reference for `qualify()` to trip
+        # over. Gated on `not triples`: a statement that already produced usage from some
+        # *other*, unambiguous table was not silently dropped, so it does not belong here.
+        if not triples and _references_an_ambiguous_bare_table(tree, schema):
             skipped_ambiguous += 1
             continue
         for key in triples:
