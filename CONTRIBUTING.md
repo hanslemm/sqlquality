@@ -48,3 +48,18 @@ uv run mypy src/sqlquality
 - Any user-visible change (new flag, changed exit code, changed output, new config key)
   needs a `CHANGELOG.md` entry under the current unreleased version, in the appropriate
   `Added` / `Changed` / `Fixed` / `BREAKING` section.
+
+## Integration tests (optional)
+
+`advise`'s introspection SQL is only checked for drift by the default suite. To run it
+against a real Postgres:
+
+```bash
+docker compose -f tests/integration/docker-compose.yml up -d
+uv run pytest -m integration
+docker compose -f tests/integration/docker-compose.yml down
+```
+
+These are deselected by default, so `uv run pytest` stays green without Docker. Point them
+at your own server with `SQLQUALITY_TEST_DSN`. They need the `postgres` extra
+(`uv sync --extra postgres`).

@@ -67,6 +67,10 @@ only-include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a live Postgres (opt in with SQLQUALITY_TEST_DSN or `-m integration`)",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 line-length = 100
