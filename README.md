@@ -315,7 +315,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--schema` | `public` | Schema to introspect. **One at a time** — passing two exits 2, see Limitations. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -354,6 +354,13 @@ aggregation, before any file is written, before any log line. `--keep-literals` 
 only way to retain them, and the report states which mode produced it. `advise` never
 writes to your database — proposed DDL only ever goes to a file (`--ddl`) for you to
 review and apply by hand.
+
+One rendering quirk worth knowing before you read a report: `pg_stat_statements` replaces
+an interval literal with its own parameter marker (`interval $2`), and sqlglot renders that
+back as `INTERVAL '2'`. So `created_at > CURRENT_TIMESTAMP - INTERVAL '2'` in a report
+stamped `"redacted": true` means **the interval was parameterised**, not that someone wrote
+a two-something interval — the `2` is Postgres's parameter index. Nothing leaked, but the
+statement is not valid SQL to copy out and run.
 
 **Prerequisites and limits:**
 
