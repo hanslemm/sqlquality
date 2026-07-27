@@ -15,6 +15,7 @@ from sqlquality.workload.postgres import (
     PostgresWorkloadAdapter,
     _quote_ident,
     propose_indexes,
+    propose_join_keys,
     propose_partial_indexes,
     propose_redundant_indexes,
     propose_sargability,
@@ -1539,3 +1540,93 @@ def test_adv006_also_reports_the_short_id_without_losing_the_query():
     proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
     assert proposals[0].evidence["fingerprint"] != canonical
     assert proposals[0].evidence["sql"] == stat.sql
+
+
+def test_adv007_proposes_an_index_on_an_unindexed_hot_join_key():
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4, cost_ms=400.0),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert [p.code for p in proposals] == ["ADV007"]
+    assert proposals[0].ddl == 'CREATE INDEX ON "public"."order_items" ("order_id");'
+    assert proposals[0].confidence is Confidence.HIGH
+
+
+def test_adv007_is_silent_when_an_index_already_leads_with_the_join_key():
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    existing = {
+        relation: (
+            PgIndex(
+                name="idx_oi_order",
+                columns=("order_id", "sku"),
+                is_unique=False,
+                is_primary=False,
+                scans=5,
+                size_bytes=1,
+            ),
+        )
+    }
+    assert propose_join_keys(usage, facts, existing, min_cost_share=0.01) == []
+
+
+def test_adv007_respects_the_small_table_floor():
+    relation = Relation("public", "tiny")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.9),)
+    facts = {relation: _facts(relation, rows=10, ndv={"order_id": 5.0})}
+    assert propose_join_keys(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv007_caps_at_low_when_the_index_list_could_not_be_read():
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01, have_index_data=False)
+    assert proposals[0].confidence is Confidence.LOW
+    assert "could not be read" in proposals[0].rationale
+
+
+def test_adv007_caps_at_low_and_discloses_an_unknown_row_count():
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=None, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.LOW
+    assert "small-table floor" in proposals[0].rationale
+
+
+def test_adv007_is_low_for_a_low_cardinality_join_key():
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "kind", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"kind": 3.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.LOW
+
+
+def test_adv007_ignores_non_join_roles():
+    """The rule must not re-propose what ADV001 already covers."""
+    relation = Relation("public", "orders")
+    usage = (_usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.9),)
+    facts = {relation: _facts(relation, rows=100_000)}
+    assert propose_join_keys(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv007_reports_the_hottest_join_key_per_relation():
+    relation = Relation("public", "order_items")
+    usage = (
+        _usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4, cost_ms=400.0),
+        _usage(relation, "sku", ColumnRole.JOIN, cost_share=0.1, cost_ms=100.0),
+    )
+    facts = {relation: _facts(relation, rows=100_000)}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert [p.evidence["columns"] for p in proposals] == [("order_id",), ("sku",)]
+
+
+def test_adv007_evidence_reports_the_bare_table_name_and_its_own_schema():
+    relation = Relation("staging", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["schema"] == "staging"
+    assert proposals[0].evidence["table"] == "order_items"
