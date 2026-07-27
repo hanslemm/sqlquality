@@ -240,6 +240,58 @@ def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
         [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
     )
     assert proposals[0].evidence["expression_indexes"] == ()
+    assert "expression index" not in proposals[0].rationale.lower()
+
+
+def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
+    """`id` is a substring of `guid`, and a substring test said so out loud.
+
+    The rationale would have told the operator an index "mentions id" when it indexes
+    `lower(guid)` — a false claim in the text someone reads before running DDL.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_guid",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_guid ON orders (lower(guid))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("id", ColumnRole.EQUALITY)],
+        facts(columns=("id", "guid")),
+        existing,
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["expression_indexes"] == ()
+
+
+def test_an_expression_index_on_a_cast_of_the_column_is_still_disclosed():
+    """The control for the fix: word boundaries must not cost a true positive."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_status_cast",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_status_cast ON orders ((status::text))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals[0].evidence["expression_indexes"] == ("idx_status_cast",)
 
 
 def test_arity_cap_keeps_the_range_column_last_when_it_bites():

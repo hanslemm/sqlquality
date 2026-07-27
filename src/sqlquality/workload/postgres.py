@@ -21,7 +21,7 @@ from sqlquality.models import (
     WorkloadFetch,
     cost_share_of,
 )
-from sqlquality.workload.aggregate import mentions_table
+from sqlquality.workload.aggregate import mentions_identifier, mentions_table
 from sqlquality.workload.base import (
     MAX_TIMEOUT_S,
     MIN_TIMEOUT_S,
@@ -324,10 +324,18 @@ def propose_indexes(
         # Only expression indexes whose definition mentions the leading column are worth
         # naming. Proving `lower(status)` equivalent to `status` would need the expression
         # parsed and matched; naming it lets the operator make that call in one glance.
+        #
+        # Whole-identifier matching, not a substring test. `columns[0] in definition` reports
+        # a candidate on `id` against an index on `lower(guid)`, and the rationale then tells
+        # the operator an index "mentions id" when it does not — a claim the tool cannot
+        # support, in the string someone reads while deciding whether to run DDL. Verified
+        # that `\b` keeps the true positives: `lower(status)`, `lower(customer_id::text)`
+        # and `(id::text)` all still match, because Postgres separates identifiers with
+        # parens, commas, dots and `::`, none of which are word characters.
         expression_indexes = tuple(
             index.name
             for index in table_indexes
-            if index.has_expressions and columns[0] in (index.definition or "")
+            if index.has_expressions and mentions_identifier(columns[0], index.definition or "")
         )
 
         ndv = table_facts.ndv if table_facts else {}

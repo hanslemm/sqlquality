@@ -13,15 +13,22 @@ from sqlquality.workload.fingerprint import FLAG_SELECT_STAR
 _Key = tuple[str, str, ColumnRole]
 
 
-def mentions_table(name: str, sql: str) -> bool:
-    """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
+def mentions_identifier(name: str, text: str) -> bool:
+    """True if ``name`` appears in ``text`` as a whole identifier, not merely a substring.
 
-    A plain `name in sql` test would false-positive three ways: a table `order` inside a
+    A plain `name in text` test would false-positive three ways: a table `order` inside a
     query on `orders`, a table `cart` inside `shopping_cart`, and a table `orders` that only
     appears as part of a column alias like `orders_total`. `\\b` already treats `_` as a word
-    character in Python's `re`, so it rejects all three without a custom boundary class.
+    character in Python's `re`, so it rejects all three without a custom boundary class,
+    while still matching across the punctuation SQL puts around identifiers: parens, commas,
+    dots and `::` are all non-word characters.
     """
-    return re.search(rf"\b{re.escape(name)}\b", sql) is not None
+    return re.search(rf"\b{re.escape(name)}\b", text) is not None
+
+
+def mentions_table(name: str, sql: str) -> bool:
+    """True if a query mentions this table. See :func:`mentions_identifier`."""
+    return mentions_identifier(name, sql)
 
 
 def star_tables(workload: Workload, schema: dict) -> frozenset[str]:
