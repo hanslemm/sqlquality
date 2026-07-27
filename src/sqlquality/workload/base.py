@@ -19,6 +19,7 @@ from sqlquality.models import (
     Aggregation,
     ConnectionParams,
     Proposal,
+    Relation,
     TableFacts,
     Workload,
     WorkloadFetch,
@@ -78,9 +79,9 @@ class WorkloadAdapter(ABC):
 
     @abstractmethod
     def fetch_table_facts(
-        self, schemas: tuple[str, ...], tables: frozenset[str]
-    ) -> dict[str, TableFacts]:
-        """Row estimates, sizes, columns and per-column NDV for the given tables."""
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, TableFacts]:
+        """Row estimates, sizes, columns and per-column NDV for the given relations."""
 
     @abstractmethod
     def propose(
