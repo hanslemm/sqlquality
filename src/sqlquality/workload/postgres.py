@@ -588,6 +588,14 @@ def propose_grouping_indexes(
     groups by, even though `a` alone passes both pairwise checks. That composite would still
     report cost and fingerprint evidence that reads as support, which is worse than proposing
     nothing.
+
+    Evidence carries `co_occurring_fingerprints` (the joint overlap size) rather than a plain
+    `fingerprints` count — deliberately unlike ADV001 and ADV007, which each propose an index
+    for one candidate, so a per-column count is the whole truth about it. This rule and ADV004
+    propose an index justified by columns appearing *together*, where the joint overlap is the
+    only number that actually supports the proposal; a per-column count sitting beside it in a
+    report that renders evidence as bare `k=v` pairs would read as corroborating support that
+    is not there. The split is by what the rule claims, not by which rule came first.
     """
     proposals: list[Proposal] = []
     for relation, items in sorted(_by_relation(usage).items()):
@@ -685,14 +693,15 @@ def propose_grouping_indexes(
                     "roles": tuple(i.role.value for i in chosen),
                     "cost_share": cost_share,
                     "calls": max(i.calls for i in chosen),
-                    "fingerprints": max(i.fingerprints for i in chosen),
                     #: How many query groups actually group by *every* chosen column
                     #: together — the running intersection, not a per-column count. Same
-                    #: name and same meaning as ADV004's identical field: the overlap is
-                    #: what makes this composite supported rather than a guess. Deliberately
-                    #: separate from `fingerprints` above, which is the ordinary per-column
-                    #: max shared with every other index-creating rule and does not, on its
-                    #: own, claim the columns are ever grouped by jointly.
+                    #: name and same meaning as ADV004's identical field. Deliberately no
+                    #: plain `fingerprints` key here (unlike ADV001/ADV007, which propose an
+                    #: index for one candidate and so have only a per-column count to give):
+                    #: this proposal is justified by columns appearing *together*, so a
+                    #: per-column count sitting beside the joint one in a report that
+                    #: renders evidence as bare `k=v` pairs, with no per-rule text, would
+                    #: read as more support than actually exists.
                     "co_occurring_fingerprints": len(shared),
                     "row_estimate": rows,
                     "partial_indexes_skipped": partial_skipped,
