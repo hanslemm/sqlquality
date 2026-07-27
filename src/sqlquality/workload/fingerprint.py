@@ -92,7 +92,8 @@ def unwrap(sql: str) -> str:
     rows to the `FETCH` statements that follow, which `is_noise` still filters (a `FETCH`
     carries no query text, so it has no predicates to attribute and unfiltering it would
     only inflate the denominator with uncounted cost). The `DECLARE` itself is recorded
-    with near-zero calls, time and rows — opening a cursor does no scanning. So a cursor
+    accurately by *call count* — one call per cursor opened — but with near-zero time and
+    rows, since opening a cursor does no scanning. So a cursor
     read recovered here contributes its predicate columns to `aggregate` and can still join
     an index candidate, but it cannot earn a proposal on cost alone: the default
     `--min-cost-share` can suppress it outright, and `WITH HOLD` does not change this.
