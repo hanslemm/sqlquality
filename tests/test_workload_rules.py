@@ -1113,6 +1113,189 @@ def test_select_star_attributes_an_ambiguous_bare_reference_to_neither_wide_rela
     assert propose_select_star(_workload(stat), wide, min_cost_share=0.01) == []
 
 
+def test_identical_ddl_at_equal_confidence_resolves_by_code_preference():
+    """ADV001 and ADV008 can emit byte-identical DDL at the same confidence."""
+    ddl = 'CREATE INDEX ON "public"."events" ("tenant_id");'
+    adv008 = Proposal(
+        code="ADV008",
+        title="group",
+        rationale="g",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.MEDIUM,
+        ddl=ddl,
+    )
+    adv001 = Proposal(
+        code="ADV001",
+        title="filter",
+        rationale="f",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.MEDIUM,
+        ddl=ddl,
+    )
+    # Both orderings must pick the same winner, or list order is deciding.
+    assert [p.code for p in PostgresWorkloadAdapter._dedupe_by_ddl([adv008, adv001])] == ["ADV001"]
+    assert [p.code for p in PostgresWorkloadAdapter._dedupe_by_ddl([adv001, adv008])] == ["ADV001"]
+
+
+def test_confidence_still_beats_code_preference():
+    ddl = 'CREATE INDEX ON "public"."events" ("tenant_id");'
+    adv001_low = Proposal(
+        code="ADV001",
+        title="filter",
+        rationale="f",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.LOW,
+        ddl=ddl,
+    )
+    adv008_med = Proposal(
+        code="ADV008",
+        title="group",
+        rationale="g",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.MEDIUM,
+        ddl=ddl,
+    )
+    assert [p.code for p in PostgresWorkloadAdapter._dedupe_by_ddl([adv001_low, adv008_med])] == [
+        "ADV008"
+    ]
+
+
+def test_every_ddl_emitting_code_has_a_preference_rank():
+    """A code missing from the map would raise KeyError mid-run, after all the analysis."""
+    ddl_codes = {"ADV001", "ADV002", "ADV003", "ADV004", "ADV007", "ADV008"}
+    assert ddl_codes <= set(PostgresWorkloadAdapter._CODE_PREFERENCE)
+
+
+def test_dedupe_folds_the_discarded_proposals_rationale_into_the_survivor():
+    """Collapsing on identical DDL must not silently drop the loser's rationale.
+
+    ADV008 does not read NDV at all, so it has no selectivity caveat to lose — but ADV007
+    does, and simply keeping "the more confident" text on identical DDL would drop it.
+    """
+    aggregation = Aggregation(
+        usage=(
+            _usage(_ORDERS, "tenant_id", ColumnRole.JOIN, cost_share=0.6, cost_ms=60.0),
+            _usage(_ORDERS, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=50.0),
+        ),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({_ORDERS}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(
+        aggregation, _facts_map(ndv={"tenant_id": 3.0}), _workload(), min_cost_share=0.01
+    )
+    ddl = 'CREATE INDEX ON "public"."orders" ("tenant_id");'
+    creates = [p for p in proposals if p.ddl == ddl]
+    assert len(creates) == 1
+    survivor = creates[0]
+    # ADV008 has no NDV to read, so it wins on confidence (MEDIUM beats LOW) — but ADV007's
+    # rationale, including the caveat ADV008 could never have stated, must survive with it.
+    assert survivor.code == "ADV008"
+    assert survivor.confidence is Confidence.MEDIUM
+    assert "ADV007" in survivor.rationale
+    assert "distinct values" in survivor.rationale
+
+
+def test_adv001_and_adv007_prefix_collision_collapses_instead_of_shipping_a_pair_adv003_would_flag():
+    """ADV001 proposing (customer_id, created_at) and ADV007 proposing (customer_id), both
+    HIGH, in the same report would advise creating a pair where the second is a strict
+    prefix of the first — exactly what ADV003 flags as redundant on the next run. The
+    narrower proposal must collapse into the wider one, not ship alongside it.
+    """
+    aggregation = Aggregation(
+        usage=(
+            _usage(_ORDERS, "customer_id", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_share=0.5, cost_ms=50.0),
+            _usage(_ORDERS, "customer_id", ColumnRole.JOIN, cost_share=0.55, cost_ms=55.0),
+        ),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({_ORDERS}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(
+        aggregation, _facts_map(ndv={"customer_id": 9999.0}), _workload(), min_cost_share=0.01
+    )
+    creates = [p for p in proposals if p.ddl and p.ddl.startswith("CREATE INDEX")]
+    assert codes(creates) == ["ADV001"]
+    assert creates[0].evidence["columns"] == ("customer_id", "created_at")
+    assert creates[0].confidence is Confidence.HIGH
+    assert "ADV007" in creates[0].rationale
+
+
+def test_prefix_collision_collapses_regardless_of_which_rule_appended_first():
+    """Determinism: `propose()` hardcodes a call order today, but the collapse must not
+    depend on it — feed the same evidence through both orderings via the module-level
+    functions directly and require the same surviving proposal and the same folded text.
+    """
+    wide_usage = [
+        _usage(_ORDERS, "customer_id", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
+        _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_share=0.5, cost_ms=50.0),
+    ]
+    narrow_usage = [_usage(_ORDERS, "customer_id", ColumnRole.JOIN, cost_share=0.55, cost_ms=55.0)]
+    facts = _facts_map(ndv={"customer_id": 9999.0})
+    wide = propose_indexes(wide_usage, facts, {}, min_cost_share=0.01)
+    narrow = propose_join_keys(narrow_usage, facts, {}, min_cost_share=0.01)
+
+    forward = PostgresWorkloadAdapter._collapse_index_prefixes([*wide, *narrow])
+    backward = PostgresWorkloadAdapter._collapse_index_prefixes([*narrow, *wide])
+
+    assert codes(forward) == codes(backward) == ["ADV001"]
+    assert forward[0].rationale == backward[0].rationale
+
+
+def test_adv001_and_adv008_same_column_set_different_order_are_disclosed_not_collapsed():
+    """(status, region) and (region, status) are not redundant — different leading columns
+    serve different probes — so neither `_collapse_index_prefixes` nor a future ADV003 pass
+    can reconcile them. Both must survive, and each must name the other.
+    """
+    aggregation = Aggregation(
+        usage=(
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=90.0),
+            _usage(_ORDERS, "region", ColumnRole.EQUALITY, cost_share=0.55, cost_ms=50.0),
+            _usage(_ORDERS, "region", ColumnRole.GROUP, cost_share=0.5, cost_ms=90.0),
+            _usage(_ORDERS, "status", ColumnRole.GROUP, cost_share=0.45, cost_ms=50.0),
+        ),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({_ORDERS}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(aggregation, _facts_map(), _workload(), min_cost_share=0.01)
+    creates = {p.code: p for p in proposals if p.ddl and p.ddl.startswith("CREATE INDEX")}
+    assert set(creates) == {"ADV001", "ADV008"}
+    assert creates["ADV001"].evidence["columns"] == ("status", "region")
+    assert creates["ADV008"].evidence["columns"] == ("region", "status")
+    assert "ADV008" in creates["ADV001"].rationale
+    assert "ADV001" in creates["ADV008"].rationale
+
+
+def test_a_partial_index_is_never_collapsed_against_a_plain_prefix():
+    """ADV004's WHERE predicate makes it a different object than a plain index over the
+    same leading column, even when its single column is a textual prefix of a plain
+    composite's — the same reasoning `_covered` applies to catalog indexes must hold here
+    for proposals that do not exist as catalog rows yet.
+    """
+    aggregation = Aggregation(
+        usage=(
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_share=0.5, cost_ms=50.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({_ORDERS}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(aggregation, _facts_map(), _workload(), min_cost_share=0.01)
+    assert "ADV004" in codes(proposals)
+    adv004 = next(p for p in proposals if p.code == "ADV004")
+    assert "ADV001" not in adv004.rationale
+    adv001 = next(p for p in proposals if p.code == "ADV001")
+    assert "ADV004" not in adv001.rationale
+
+
 def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     """ADV002 and ADV003 can both fire on one index, emitting the same DROP twice.
 
