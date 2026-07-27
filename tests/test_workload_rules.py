@@ -158,6 +158,90 @@ def test_a_narrower_existing_index_does_not_cover_a_wider_candidate():
     assert proposals[0].evidence["columns"] == ("status", "created_at")
 
 
+def test_a_partial_index_does_not_suppress_a_candidate():
+    """`idx ON orders(status) WHERE shipped_at IS NULL` does not serve `WHERE status = $1`.
+
+    Treating it as coverage silently withheld a good proposal — the inverse of the
+    confidently-wrong failures, and just as invisible.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_open",
+                ("status",),
+                False,
+                False,
+                5,
+                4096,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].evidence["partial_indexes_skipped"] == ("idx_open",)
+    assert "partial" in proposals[0].rationale.lower()
+
+
+def test_a_plain_index_still_suppresses_a_candidate():
+    """The control. Task 2's new fields default to False, so this must not have changed."""
+    existing = {"orders": (PgIndex("idx_status", ("status",), False, False, 5, 4096),)}
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals == []
+
+
+def test_an_expression_index_is_disclosed_not_silently_ignored():
+    """We cannot prove `lower(status)` makes an index on `status` redundant — or that it
+    doesn't. Saying so beats both suppressing and pretending it isn't there."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_status",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_status ON orders (lower(status))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].evidence["expression_indexes"] == ("idx_lower_status",)
+    assert "expression" in proposals[0].rationale.lower()
+
+
+def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
+    """Only expression indexes that plausibly relate to the candidate are worth naming."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_note",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_note ON orders (lower(note))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals[0].evidence["expression_indexes"] == ()
+
+
 def test_arity_cap_keeps_the_range_column_last_when_it_bites():
     """The interaction of the two most important ordering rules, previously untested.
 
