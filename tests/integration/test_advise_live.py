@@ -47,11 +47,22 @@ def test_advise_end_to_end(seeded, tmp_path):
     assert "REVIEW BEFORE RUNNING" in ddl.read_text(encoding="utf-8")
 
 
-def test_advise_does_not_leak_a_literal_from_a_real_server(seeded, tmp_path):
-    """The redaction guarantee, against real pg_stat_statements rather than a fixture.
+def test_advise_output_carries_no_query_literal_from_a_real_server(seeded, tmp_path):
+    """A regression guard on the pipeline, NOT a test of `redact_tree`. Read on.
 
-    The seeded workload filters on the literal 'paid'. pg_stat_statements normalises it to
-    $1, but a run with --keep-literals proves the surfaces would carry it if we let them.
+    Postgres normalises constants to `$N` inside `pg_stat_statements` before sqlquality ever
+    sees the query text, so `'paid'` is already gone on arrival. Measured: running this
+    scenario with `--keep-literals`, which bypasses our redaction entirely, still shows no
+    `'paid'` anywhere. **This test therefore cannot fail if `redact_tree` breaks**, and it
+    would be dishonest to call it redaction coverage.
+
+    What it does pin, which is worth pinning: that nothing downstream of ingest — evidence
+    dicts, rationales, DDL, the renderers — reintroduces raw query text into an artifact.
+    That is a real regression risk, since ADV005 and ADV006 both copy SQL into evidence.
+
+    The actual guard on `redact_tree` is `tests/test_workload_redaction.py`, which feeds
+    un-normalised literals through a fake querier and *does* fail when redaction is
+    disabled — verified there by mutation.
     """
     dsn, schema = seeded
     md = tmp_path / "report.md"
@@ -61,6 +72,16 @@ def test_advise_does_not_leak_a_literal_from_a_real_server(seeded, tmp_path):
     assert result.exit_code == 0, result.output
     assert "'paid'" not in result.stdout
     assert "'paid'" not in md.read_text(encoding="utf-8")
+    # Pin the reason this test is weak, so nobody later mistakes it for redaction coverage:
+    # the literal is already absent from what Postgres hands us. `sql` lives inside each
+    # proposal's `evidence` dict (only ADV005's leading-wildcard-LIKE and ADV006 carry it),
+    # not as a top-level proposal key — see `advise_payload` in report.py.
+    fetch_sql = " ".join(
+        p["evidence"]["sql"]
+        for p in json.loads(result.stdout).get("proposals", [])
+        if "sql" in p.get("evidence", {})
+    )
+    assert "'paid'" not in fetch_sql
 
 
 def test_advise_dry_run_needs_no_server(tmp_path):
