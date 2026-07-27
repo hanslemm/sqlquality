@@ -110,6 +110,27 @@ def read_sql_file(path: Path) -> str:
         raise typer.Exit(code=2)
 
 
+def _write_report_or_exit(path: Path, text: str, flag: str) -> None:
+    """Write a rendered report, or exit 2 naming the flag that pointed at the bad path.
+
+    Two failures are folded together here because both used to escape as exit **1**, and
+    exit 1 is how `check` and `lint` report real findings — so an unwritable path was
+    indistinguishable from a failed gate, and CI would block on a healthy run.
+
+    * ``encoding="utf-8"`` because the default is platform-dependent and these reports
+      carry non-ASCII (the gate verdict is an emoji), so an ASCII locale made every
+      ``--markdown`` write a guaranteed crash.
+    * ``UnicodeError`` alongside ``OSError`` because ``UnicodeEncodeError`` is a
+      ``ValueError``: pinning the encoding makes it unlikely, not unreachable, since a lone
+      surrogate in an identifier is unencodable in any codec.
+    """
+    try:
+        path.write_text(text, encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        typer.echo(f"Could not write {flag} to {path}: {exc}", err=True)
+        raise typer.Exit(code=2)
+
+
 def _validate_dialect_or_exit(name: str) -> str:
     """Normalize a dialect name or print the friendly error and exit 2."""
     try:
@@ -300,11 +321,12 @@ def check(
     deltas, skipped = compute_deltas(baseline, candidate, changeset.changed, resolved_dialect)
     report = evaluate_gate(deltas, cfg)
 
+    # Rendered first, then written, so a renderer bug cannot be reported as a write failure.
     if html is not None:
-        Path(html).write_text(render_html(report, skipped))
+        _write_report_or_exit(Path(html), render_html(report, skipped), "--html")
 
     if markdown is not None:
-        Path(markdown).write_text(render_markdown(report, skipped))
+        _write_report_or_exit(Path(markdown), render_markdown(report, skipped), "--markdown")
 
     if json_out:
         typer.echo(
@@ -377,7 +399,11 @@ def lint(
         if fix:
             fixed_sql = fix_sql(sql, dialect, excl, config_path)
             if fixed_sql != sql:
-                path.write_text(fixed_sql)
+                # `--fix` rewrites the user's own source. read_sql_file already reads as
+                # UTF-8, so writing without an encoding could round-trip a non-ASCII
+                # comment into mojibake, or raise and exit 1 — which `lint` also uses for
+                # findings.
+                _write_report_or_exit(path, fixed_sql, "--fix")
                 changed = True
         # INFO (unresolved-Jinja) findings are advisory and never gate the commit.
         gating = gating or any(f.severity in (Severity.WARNING, Severity.ERROR) for f in findings)
