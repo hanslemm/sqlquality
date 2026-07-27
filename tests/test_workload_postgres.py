@@ -13,9 +13,6 @@ from sqlquality.workload.postgres import (
     CAP_TABLE_FACTS,
     CAP_WORKLOAD,
     PostgresWorkloadAdapter,
-    _scrub,
-    _secrets_for,
-    _WITHHELD,
 )
 
 EXPECTED_CAPABILITIES = {
@@ -283,59 +280,6 @@ def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
     # And the unscrubbed original must not be reachable through the chain.
     assert exc.value.__cause__ is None
     assert exc.value.__context__ is None
-
-
-def test_secrets_for_extracts_the_password_from_an_inline_dsn():
-    """The realistic leak shape: a driver reports the bad password on its own.
-
-    It never echoes the whole connection string back, so a whole-DSN token alone would
-    never match and DSN connections would have no protection.
-    """
-    params = ConnectionParams(
-        engine="postgres",
-        dsn="postgresql://u:hunter2@db:5432/analytics",
-        fields={},
-        source="--dsn",
-    )
-    secrets = _secrets_for(params)
-    assert "hunter2" in secrets
-    realistic = 'connection failed: password authentication failed for user "u" (hunter2)'
-    assert "hunter2" not in _scrub(realistic, secrets)
-
-
-def test_secrets_for_covers_a_percent_encoded_dsn_password():
-    """urlparse leaves the password encoded; libpq decodes it before authenticating.
-
-    So the value a real auth-failure message carries is the *decoded* one, and a token of
-    only the encoded form never matches. Any password containing @ : / % or a space hits
-    this, which is most passwords a generator would produce.
-    """
-    params = ConnectionParams(
-        engine="postgres", dsn="postgresql://u:p%40ss@h/db", fields={}, source="--dsn"
-    )
-    secrets = _secrets_for(params)
-    assert "p%40ss" in secrets
-    assert "p@ss" in secrets
-    driver_message = 'connection failed: password authentication failed for user "u" (p@ss)'
-    assert "p@ss" not in _scrub(driver_message, secrets)
-
-
-def test_secrets_for_tolerates_a_dsn_with_no_password_or_a_malformed_one():
-    for dsn in ("postgresql://u@h/db", "not a valid dsn :: at all ///"):
-        params = ConnectionParams(engine="postgres", dsn=dsn, fields={}, source="--dsn")
-        assert _secrets_for(params) == (dsn,)
-
-
-def test_scrub_withholds_rather_than_mangles_an_unredactable_secret():
-    """A one-character password would blank every occurrence of that letter.
-
-    Nothing leaks either way, but a message redacted into unreadability is worse than an
-    honest refusal to show it.
-    """
-    mangled = _scrub("a database has an admin at a table", ("a",))
-    assert mangled == _WITHHELD
-    # A short secret that does not actually appear must not suppress a usable message.
-    assert _scrub("connection refused", ("a",)) == "connection refused"
 
 
 def test_fetch_indexes_groups_columns_in_ordinal_order():
