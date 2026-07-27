@@ -512,12 +512,75 @@ def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
         [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01,
     )
     assert proposals[0].evidence["expression_indexes"] == ()
+    assert "expression index" not in proposals[0].rationale.lower()
+
+
+def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
+    """`id` is a substring of `guid`, and a substring test said so out loud.
+
+    The rationale would have told the operator an index "mentions id" when it indexes
+    `lower(guid)` — a false claim in the text someone reads before running DDL.
+    """
+    existing = {"orders": (
+        PgIndex("idx_lower_guid", (), False, False, 5, 4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_guid ON orders (lower(guid))"),
+    )}
+    proposals = propose_indexes(
+        [usage("id", ColumnRole.EQUALITY)],
+        facts(columns=("id", "guid")), existing, min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["expression_indexes"] == ()
+
+
+def test_an_expression_index_on_a_cast_of_the_column_is_still_disclosed():
+    """The control for the fix: word boundaries must not cost a true positive."""
+    existing = {"orders": (
+        PgIndex("idx_status_cast", (), False, False, 5, 4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_status_cast ON orders ((status::text))"),
+    )}
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["expression_indexes"] == ("idx_status_cast",)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_workload_rules.py -k "partial_index_does_not_suppress or expression_index" -v`
 Expected: FAIL — the partial index currently suppresses (so `codes(proposals) == []`), and `evidence["expression_indexes"]` raises `KeyError`.
+
+- [ ] **Step 2b: Generalise the existing word-boundary helper instead of writing a third**
+
+`src/sqlquality/workload/aggregate.py` already has `mentions_table(name, sql)`, whose whole
+purpose is whole-identifier matching, and the test suite has `_write_verbs_in` doing the same
+for a different vocabulary. Adding a third copy in `postgres.py` would be the duplication the
+final review of the previous plan specifically called out. Rename the mechanism and keep the
+caller:
+
+```python
+def mentions_identifier(name: str, text: str) -> bool:
+    """True if ``name`` appears in ``text`` as a whole identifier, not merely a substring.
+
+    A plain `name in text` test false-positives on any name that is a substring of a longer
+    identifier — `order` inside `orders`, `cart` inside `shopping_cart`, `id` inside `guid` —
+    and on a name appearing only in an alias like `orders_total`. `\b` already treats `_` as
+    a word character in Python's `re`, so it rejects all of those without a custom class,
+    while still matching across the punctuation Postgres puts around identifiers: parens,
+    commas, dots and `::` are all non-word characters.
+    """
+    return re.search(rf"\b{re.escape(name)}\b", text) is not None
+
+
+def mentions_table(name: str, sql: str) -> bool:
+    """True if a query mentions this table. See :func:`mentions_identifier`."""
+    return mentions_identifier(name, sql)
+```
+
+`postgres.py` then imports `mentions_identifier` from `sqlquality.workload.aggregate`
+alongside whatever it already imports from there. This widens the task's file scope to
+`aggregate.py` by two functions, deliberately: a third hand-rolled `\b` regex is worse.
 
 - [ ] **Step 3: Make coverage refuse to guess**
 
@@ -556,10 +619,18 @@ In `propose_indexes`, after `covered_by = _covered(columns, existing.get(table, 
         # Only expression indexes whose definition mentions the leading column are worth
         # naming. Proving `lower(status)` equivalent to `status` would need the expression
         # parsed and matched; naming it lets the operator make that call in one glance.
+        #
+        # Whole-identifier matching, not a substring test. `columns[0] in definition` reports
+        # a candidate on `id` against an index on `lower(guid)`, and the rationale then tells
+        # the operator an index "mentions id" when it does not — a claim the tool cannot
+        # support, in the string someone reads while deciding whether to run DDL. Verified
+        # that `\b` keeps the true positives: `lower(status)`, `lower(customer_id::text)`
+        # and `(id::text)` all still match, because Postgres separates identifiers with
+        # parens, commas, dots and `::`, none of which are word characters.
         expression_indexes = tuple(
             index.name
             for index in table_indexes
-            if index.has_expressions and columns[0] in (index.definition or "")
+            if index.has_expressions and mentions_identifier(columns[0], index.definition or "")
         )
 ```
 
