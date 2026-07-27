@@ -78,9 +78,13 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      # Deliberately not `uv sync`: that would read the lockfile, which is the thing being
-      # bypassed. Extras included, so the psycopg-dependent paths are exercised too.
-      - run: uv pip install --system --resolution highest -e '.[postgres]' pytest
+      # An explicit venv rather than `--system`: the runner's Python is Debian-managed and
+      # refuses `pip install` (PEP 668), and `uv run` is no good either because it would sync
+      # from the lockfile — the very thing this job exists to bypass. So the venv is built and
+      # invoked directly.
+      - run: uv venv .venv-highest
+      # Extras included, so the psycopg-dependent paths are exercised too.
+      - run: uv pip install --python .venv-highest --resolution highest -e '.[postgres]' pytest
       - name: Record what was resolved
-        run: uv pip list --system
-      - run: python -m pytest -q
+        run: uv pip list --python .venv-highest
+      - run: .venv-highest/bin/python -m pytest -q
