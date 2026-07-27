@@ -84,19 +84,31 @@ def _role(column: exp.Column) -> ColumnRole | None:
 def resolve_relation(table: exp.Table, schema: dict) -> Relation | None:
     """The schema-qualified relation for one `exp.Table`, or None if it is not attributable.
 
-    `table.db` is authoritative when present, but `qualify()` leaves it EMPTY for a bare
-    table reference even when the nested schema resolves the name unambiguously — and bare
-    references are the normal case, because production SQL relies on `search_path`. So the
-    fallback is a lookup in the schema map we actually introspected:
+    `table.db` is authoritative when present, but only once it is checked against the
+    introspected schema map. `qualify()` leaves it EMPTY for a bare table reference even when
+    the nested schema resolves the name unambiguously — and bare references are the normal
+    case, because production SQL relies on `search_path`. So the fallback is a lookup in the
+    schema map we actually introspected:
 
     * exactly one introspected schema holds the name -> that is the schema, no guess involved
     * more than one -> ambiguous, and attributing it would be a coin flip. `qualify()` will
       normally have raised `SchemaError` before we get here, but a table whose columns are
       never referenced by name reaches this line, so the guard is real.
     * none -> the table lives outside the introspected schemas; the caller drops the column.
+
+    The `table.db` branch is guarded the same way, and not just defensively: probing sqlglot
+    30.12 confirms `qualify()` validates SELECT-scope column references against the schema
+    (an explicitly-qualified table `qualify()` never introspected raises `OptimizeError`
+    before this function runs), but it does **not** validate UPDATE/DELETE targets or their
+    bare columns — `UPDATE other.orders SET status = 'x' WHERE id = 1` against a schema
+    without an `other` key passes `qualify()` untouched. Trusting `table.db` unconditionally
+    there would manufacture `Relation("other", "orders")`, a phantom that matches no catalog
+    fact, from a schema-qualified DML statement we never introspected.
     """
     if table.db:
-        return Relation(schema=table.db, table=table.name)
+        if table.name in schema.get(table.db, {}):
+            return Relation(schema=table.db, table=table.name)
+        return None
     owners = [name for name, tables in schema.items() if table.name in tables]
     if len(owners) == 1:
         return Relation(schema=owners[0], table=table.name)

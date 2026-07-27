@@ -114,6 +114,18 @@ def test_update_where_predicate_is_attributed_to_the_target_table():
     )
 
 
+def test_update_from_second_table_bare_column_is_dropped_not_guessed():
+    """`UPDATE ... FROM` puts two tables in scope; a bare column has no unambiguous target.
+
+    ``customer_id`` is unqualified here (qualify() leaves DML columns bare), so without the
+    ``len(tables) == 1`` guard in ``_collect_dml`` it would be attributed to ``tables[0]``
+    (``orders``) purely because that table happened to be found first — a guess dressed up
+    as a fact, not something the query actually told us.
+    """
+    usage = _usage("update orders set status = 'x' from customers where customer_id = customers.id")
+    assert not any(column == "customer_id" for _relation, column, _role in usage)
+
+
 def test_update_set_clause_column_is_not_a_predicate():
     """`SET status = $1` parses to EQ(status, $1) with no WHERE ancestor.
 
@@ -214,9 +226,14 @@ def test_bare_table_resolves_to_its_only_owning_schema():
 
 
 def test_explicitly_qualified_table_uses_the_schema_it_names():
-    tree = parse("select sku from staging.items where qty > 1", "postgres")
-    usage = extract_usage(tree, "postgres", TWO_SCHEMAS)
-    assert {relation for relation, _c, _r in usage} == {Relation("staging", "items")}
+    """`orders` exists in both schemas of COLLIDING, so the schema-map fallback alone would
+    find two owners and refuse to guess. Only the explicit `staging.` qualifier can produce
+    the expected answer — deleting `resolve_relation`'s `if table.db:` branch collapses this
+    to `set()` because the fallback returns None for an ambiguous bare name.
+    """
+    tree = parse("select status from staging.orders where id > 1", "postgres")
+    usage = extract_usage(tree, "postgres", COLLIDING)
+    assert {relation for relation, _c, _r in usage} == {Relation("staging", "orders")}
 
 
 def test_two_schemas_distinct_names_attribute_to_the_right_one():
@@ -252,7 +269,34 @@ def test_resolve_relation_returns_none_for_a_table_outside_the_map():
     assert resolve_relation(table, ONE_SCHEMA) is None
 
 
+def test_resolve_relation_returns_none_for_an_explicit_schema_never_introspected():
+    """An explicit qualifier naming a schema we never introspected must not be trusted
+    blindly. `qualify()` does not validate this for UPDATE/DELETE targets (see
+    resolve_relation's docstring) — an ungated `table.db` branch would manufacture
+    `Relation("other", "orders")`, a phantom that matches no catalog fact.
+    """
+    table = exp.Table(this=exp.to_identifier("orders"), db=exp.to_identifier("other"))
+    assert resolve_relation(table, ONE_SCHEMA) is None
+
+
 def test_dml_columns_attribute_to_the_qualified_target():
     tree = parse("update orders set status = 'y' where id = 1", "postgres")
     usage = extract_usage(tree, "postgres", ONE_SCHEMA)
     assert (Relation("public", "orders"), "id", ColumnRole.EQUALITY) in usage
+
+
+def test_dml_with_an_unintrospected_explicit_schema_does_not_leak_a_phantom_relation():
+    """The reachable case: `qualify()` leaves UPDATE/DELETE columns and their target table
+    unvalidated against the schema, so an explicitly-qualified schema qualify() never saw
+    sails through untouched. Confirmed by probing sqlglot 30.12 directly — this statement
+    raises nothing. Without the guard in resolve_relation, this attributes `id` to a
+    phantom `Relation("other", "orders")` instead of dropping it.
+    """
+    tree = parse("update other.orders set status = 'x' where id = 1", "postgres")
+    usage = extract_usage(tree, "postgres", ONE_SCHEMA)
+    assert usage == ()
+
+
+def test_relation_str_is_schema_dot_table():
+    """Proposal titles and JSON keys render a Relation through this — pin the contract."""
+    assert str(Relation("public", "orders")) == "public.orders"
