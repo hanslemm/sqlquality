@@ -235,7 +235,10 @@ Update the two call sites in `connect()`: `secrets = secrets_for(params)` and `s
 ```python
                 cursor.execute(
                     "SELECT set_config('statement_timeout', %s, false)",
-                    (f"{clamp_timeout_ms(timeout_s, minimum=1, maximum=3600)}ms",),
+                    (
+                        f"{clamp_timeout_ms(timeout_s, minimum=MIN_TIMEOUT_S, "
+                        f"maximum=MAX_TIMEOUT_S)}ms",
+                    ),
                 )
 ```
 
@@ -1239,7 +1242,7 @@ git commit -m "test(advise): end-to-end run against a real postgres; narrow two 
 
 Deliberately **not** in this plan, and staying in the ledger for Batch 2: join-key and grouping-column proposals; `DECLARE`/`COPY` unwrapping; multi-schema `(schema, table)` keying. Each changes what `advise` *says*, not whether what it says is trustworthy, so they belong after this.
 
-**Type consistency.** `PgIndex` gains `is_partial`, `predicate`, `has_expressions`, `definition` in Task 2 and every later task reads exactly those names. `_covered` keeps `(candidate, existing) -> str | None` throughout. `clamp_timeout_ms` takes keyword-only `minimum`/`maximum` in Task 1 and is called that way in the same task. `ColumnUsage.fingerprints` stops being a constructor argument in Task 5, and Task 5's Step 4 sweeps the call sites.
+**Type consistency.** `PgIndex` gains `is_partial`, `predicate`, `has_expressions`, `definition` in Task 2 and every later task reads exactly those names. `_covered` keeps `(candidate, existing) -> str | None` throughout. `clamp_timeout_ms` takes keyword-only `minimum`/`maximum` in Task 1 and is called with `MIN_TIMEOUT_S`/`MAX_TIMEOUT_S`, which already live in `workload/base.py` and are imported by both the CLI and the adapter. Passing literals there would break `test_the_timeout_bounds_have_a_single_definition`, which asserts `3600` never appears in `postgres.py`'s source — the guard added when the duplicated bounds were first found. `ColumnUsage.fingerprints` stops being a constructor argument in Task 5, and Task 5's Step 4 sweeps the call sites.
 
 **Known risks for the implementer.**
 1. Task 2's twelve-column unpack is order-sensitive and a transposed pair would be invisible to a fixture test that uses the same wrong order. Task 6's live test is the real check — if the two disagree, the live one is right.
