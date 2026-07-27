@@ -1078,36 +1078,35 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         An index with no recorded scans that is *also* a prefix of a wider index gets
         flagged by both ADV002 and ADV003, producing two entries with the same
         `DROP INDEX`. They do not contradict each other, but a reader should not have to
-        notice they are the same object twice. ADV003 wins ties because prefix redundancy
-        is structural — provable from the column lists alone — whereas ADV002 rests on a
-        scan counter that only covers the window since the last statistics reset.
+        notice they are the same object twice. ADV003 is the one kept, because prefix
+        redundancy is structural — provable from the column lists alone — whereas ADV002
+        rests on a scan counter that only covers the window since the last statistics reset.
 
-        That preference used to fall out of the confidence order on its own, when ADV003
-        was HIGH. Capping ADV003 at MEDIUM (it cannot see partial-index predicates) made
-        the two rules tie, and a tie was resolved by list order — silently handing the
-        collapse to ADV002. `_RULE_PRECEDENCE` states the preference instead of relying on
-        it emerging.
+        That preference needs no tie-break rule to state it: the two codes cannot tie.
+        ADV002 is hardcoded MEDIUM — `idx_scan` accumulates only since the last statistics
+        reset, so zero scans can never prove disuse across a business cycle — and ADV003 is
+        hardcoded HIGH, because it can now read `indpred` and so declines to call a partial
+        index redundant rather than guessing. Confidence alone decides, and it decides the
+        way this docstring says it should.
+
+        There was a window where they *did* tie, and it is why a second tuple element used
+        to be here: ADV003 was briefly capped at MEDIUM on the grounds that it could not see
+        partial-index predicates. It can, so the cap is gone and so is the tie. A tie-break
+        that cannot be reached is worse than none — it reads as evidence the collision is
+        handled where the confidence values are what actually handle it.
         """
         best: dict[str, Proposal] = {}
         for proposal in proposals:
             if not proposal.ddl:
                 continue
             incumbent = best.get(proposal.ddl)
-            if incumbent is None or cls._dedupe_rank(proposal) < cls._dedupe_rank(incumbent):
+            if (
+                incumbent is None
+                or cls._CONFIDENCE_ORDER[proposal.confidence]
+                < cls._CONFIDENCE_ORDER[incumbent.confidence]
+            ):
                 best[proposal.ddl] = proposal
         return [p for p in proposals if not p.ddl or best[p.ddl] is p]
-
-    #: Lower wins when two rules propose identical DDL at the same confidence. Only ADV003
-    #: is named: its evidence is structural, every other rule's rests on a counter or an
-    #: estimate. Anything unlisted sorts after it.
-    _RULE_PRECEDENCE = {"ADV003": 0}
-
-    @classmethod
-    def _dedupe_rank(cls, proposal: Proposal) -> tuple[int, int]:
-        return (
-            cls._CONFIDENCE_ORDER[proposal.confidence],
-            cls._RULE_PRECEDENCE.get(proposal.code, 1),
-        )
 
     def propose(
         self,
