@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 
 from sqlglot import exp
@@ -1450,42 +1450,264 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     #: Highest confidence first, then largest cost share — the reading order a human wants.
     _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
 
+    #: Which rule's rationale to keep when two rules propose byte-identical DDL at equal
+    #: confidence. Lower wins. The order is by how directly the evidence supports *this*
+    #: index: a filter predicate (ADV001) is the most direct reason to build a B-tree, a
+    #: join key (ADV007) next, a partial index (ADV004) next since its own `WHERE` clause is
+    #: already a stronger claim than a plain composite's, and a grouping (ADV008) last, since
+    #: whether the planner uses an index for grouping depends on choices this tool cannot
+    #: see. The DROP rules are ranked below them so a CREATE never loses to a DROP that
+    #: happens to render the same text — which it cannot today, but this map is the place
+    #: that would have to change. `.get(code, len(...))` at every call site rather than
+    #: `[code]`, so a code missing from this map sorts last instead of raising `KeyError`
+    #: after the whole analysis has run.
+    _CODE_PREFERENCE = {
+        "ADV001": 0,
+        "ADV007": 1,
+        "ADV004": 2,
+        "ADV008": 3,
+        "ADV003": 4,
+        "ADV002": 5,
+    }
+
+    @classmethod
+    def _fold_discarded(cls, survivor: Proposal, discarded: Sequence[Proposal]) -> Proposal:
+        """Attach every discarded proposal's rationale, verbatim and attributed, to the
+        survivor's.
+
+        `_dedupe_by_ddl` and `_collapse_index_prefixes` each throw a whole `Proposal` away
+        and keep only one rationale where two, or more, existed. Diffing the texts to keep
+        "only the part that's new" would need to guess which sentence is the caveat worth
+        keeping — fragile, and silently wrong the moment a rule's wording changes elsewhere.
+        Folding the *entire* discarded rationale in instead needs no such guess: nothing a
+        discarded proposal said can go missing from the report, for this pair or any future
+        one. The discarded proposal's confidence is stated too, since a reader comparing two
+        proposals for the same index needs to know they disagreed on how sure to be, not
+        just what each said.
+        """
+        if not discarded:
+            return survivor
+        notes = "".join(
+            f" {p.code} reached the same index at {p.confidence.value} confidence: {p.rationale}"
+            for p in discarded
+        )
+        return replace(survivor, rationale=survivor.rationale + notes)
+
     @classmethod
     def _dedupe_by_ddl(cls, proposals: list[Proposal]) -> list[Proposal]:
         """Collapse proposals that would run identical DDL, keeping the strongest evidence.
 
-        An index with no recorded scans that is *also* a prefix of a wider index gets
-        flagged by both ADV002 and ADV003, producing two entries with the same
-        `DROP INDEX`. They do not contradict each other, but a reader should not have to
-        notice they are the same object twice. ADV003 is the one kept, because prefix
-        redundancy is structural — provable from the column lists alone — whereas ADV002
-        rests on a scan counter that only covers the window since the last statistics reset.
+        Two rules can genuinely reach the same index from different evidence — a filter
+        predicate, a join key and a grouping on the same column all render the same
+        `CREATE INDEX` — and an unused index that is also a prefix of a wider one is flagged
+        by both ADV002 and ADV003 as the same `DROP INDEX`. They do not contradict each
+        other, but a reader should not have to notice they are the same object twice.
 
-        That preference needs no tie-break rule to state it: the two codes cannot tie.
-        ADV002 is hardcoded MEDIUM — `idx_scan` accumulates only since the last statistics
-        reset, so zero scans can never prove disuse across a business cycle — and ADV003 is
-        hardcoded HIGH, because it can now read `indpred` and so declines to call a partial
-        index redundant rather than guessing. Confidence alone decides, and it decides the
-        way this docstring says it should.
+        Confidence decides first. When it ties, `_CODE_PREFERENCE` decides, because
+        something has to and list order must not: which rationale leads should not be
+        "whichever `propose()` happened to append first". The proposal that does not lead
+        is not thrown away, though — its rationale is folded into the survivor's via
+        `_fold_discarded`, so a caveat the winner never states does not vanish with it.
 
-        There was a window where they *did* tie, and it is why a second tuple element used
-        to be here: ADV003 was briefly capped at MEDIUM on the grounds that it could not see
-        partial-index predicates. It can, so the cap is gone and so is the tie. A tie-break
-        that cannot be reached is worse than none — it reads as evidence the collision is
-        handled where the confidence values are what actually handle it.
+        There was a window where no tie was reachable — ADV002 is hardcoded MEDIUM and
+        ADV003 HIGH, the only colliding pair at the time — and the tie-break was removed as
+        unreachable code, on the reasoning that a tie-break nothing can reach is worse than
+        none. That reasoning stopped holding the moment two more index-creating rules
+        existed: ADV001 at MEDIUM (NDV unknown) and ADV008 at MEDIUM (row count known, which
+        is all ADV008 ever checks) can produce byte-identical DDL at the same confidence, and
+        list order is not a rule — it is a coincidence of which call happens to come first in
+        `propose()`, and deciding which rationale the operator reads is too important to
+        leave to that.
         """
-        best: dict[str, Proposal] = {}
+
+        def rank(proposal: Proposal) -> tuple[int, int]:
+            return (
+                cls._CONFIDENCE_ORDER[proposal.confidence],
+                cls._CODE_PREFERENCE.get(proposal.code, len(cls._CODE_PREFERENCE)),
+            )
+
+        groups: dict[str, list[Proposal]] = {}
+        for proposal in proposals:
+            if proposal.ddl:
+                groups.setdefault(proposal.ddl, []).append(proposal)
+
+        merged: dict[str, Proposal] = {}
+        for ddl, group in groups.items():
+            if len(group) == 1:
+                merged[ddl] = group[0]
+                continue
+            # `sorted` is stable, so a true tie in `rank` (both confidence and code
+            # preference equal — only possible today if the same code proposes the same
+            # DDL twice) keeps whichever proposal `propose()` happened to append first.
+            # That residual is accepted rather than papered over with a further tie-break
+            # key: two proposals with the same code, the same confidence and the same DDL
+            # carry no information that distinguishes them, so which one is kept cannot
+            # matter to a reader the way which *code* is kept does.
+            ranked = sorted(group, key=rank)
+            winner, *losers = ranked
+            merged[ddl] = cls._fold_discarded(winner, losers)
+
+        result: list[Proposal] = []
+        emitted: set[str] = set()
         for proposal in proposals:
             if not proposal.ddl:
+                result.append(proposal)
                 continue
-            incumbent = best.get(proposal.ddl)
-            if (
-                incumbent is None
-                or cls._CONFIDENCE_ORDER[proposal.confidence]
-                < cls._CONFIDENCE_ORDER[incumbent.confidence]
-            ):
-                best[proposal.ddl] = proposal
-        return [p for p in proposals if not p.ddl or best[p.ddl] is p]
+            if proposal.ddl in emitted:
+                continue
+            emitted.add(proposal.ddl)
+            result.append(merged[proposal.ddl])
+        return result
+
+    @classmethod
+    def _index_creation_columns(cls, proposal: Proposal) -> tuple[Relation, tuple[str, ...]] | None:
+        """`(relation, columns)` for a plain `CREATE INDEX` proposal, or `None` if the
+        proposal cannot participate in prefix collapsing or overlap disclosure.
+
+        Restricted to plain composite/single-column indexes: a `WHERE` predicate (ADV004's
+        partial indexes) makes the index a different object even when its column list is a
+        prefix of a plain index's — the same reasoning `_covered` and
+        `propose_redundant_indexes` already apply to *existing* indexes, applied here to
+        proposals that do not exist as catalog rows yet. `DROP INDEX` proposals (ADV002,
+        ADV003) are excluded by the `CREATE INDEX` check: a prefix relationship between
+        something being created and something being dropped is not a meaningful comparison.
+        """
+        if (
+            not proposal.ddl
+            or not proposal.ddl.startswith("CREATE INDEX")
+            or "WHERE" in proposal.ddl
+        ):
+            return None
+        schema = proposal.evidence.get("schema")
+        table = proposal.evidence.get("table")
+        columns = proposal.evidence.get("columns")
+        if not isinstance(schema, str) or not isinstance(table, str):
+            return None
+        if not isinstance(columns, tuple) or not columns:
+            return None
+        return Relation(schema=schema, table=table), columns
+
+    @classmethod
+    def _collapse_index_prefixes(cls, proposals: list[Proposal]) -> list[Proposal]:
+        """Collapse a `CREATE INDEX` proposal whose columns are a strict prefix of
+        another's, within the same relation.
+
+        ADV001, ADV007 and ADV008 can each reach a plain index from different evidence, and
+        nothing stopped one proposing `(customer_id, created_at)` while another proposed
+        `(customer_id)` in the same report — confirmed end-to-end through `propose()` from a
+        single ordinary query, both at HIGH. An operator who creates both then holds a pair
+        where the narrower is a strict prefix of the wider: exactly what
+        `propose_redundant_indexes` (ADV003) flags as redundant on the *next* run. Shipping
+        both here would be advising a CREATE today and a DROP tomorrow for the same index.
+
+        The wider proposal always survives — it serves every lookup the narrower one does —
+        and the narrower one is folded into it via `_fold_discarded`, so its rationale is
+        never silently dropped. When a narrower proposal is a prefix of more than one
+        *incomparable* wider proposal (say `(a)` under both `(a, b)` and `(a, c)`, neither a
+        prefix of the other), it is folded into all of them: there is no principled way to
+        prefer one over the other, and folding into both costs nothing but a repeated
+        sentence.
+
+        Two proposals that cover the same column *set* in a different order are not a
+        prefix pair — same length, unequal tuples, so `_is_prefix` is false in both
+        directions — and are deliberately left alone here; `_disclose_column_set_overlaps`
+        handles that case by disclosure instead of collapse, since neither is redundant with
+        the other.
+
+        Only within one relation: a prefix relationship across two different tables is
+        meaningless. Only plain proposals participate — see `_index_creation_columns`.
+        """
+        eligible: dict[int, tuple[Relation, tuple[str, ...]]] = {}
+        for i, proposal in enumerate(proposals):
+            key = cls._index_creation_columns(proposal)
+            if key is not None:
+                eligible[i] = key
+
+        # `covers[i]` collects every j whose columns strictly contain i's as a leading
+        # prefix — direct parents and transitive ancestors alike, since the prefix relation
+        # on tuples is transitive: checking every pair once already finds them all.
+        covers: dict[int, list[int]] = {}
+        for i, (relation_i, columns_i) in eligible.items():
+            for j, (relation_j, columns_j) in eligible.items():
+                if (
+                    i != j
+                    and relation_i == relation_j
+                    and len(columns_i) < len(columns_j)
+                    and _is_prefix(columns_i, columns_j)
+                ):
+                    covers.setdefault(i, []).append(j)
+
+        # Maximal: nothing wider exists for it, so it is never removed.
+        maximal = {i for i in eligible if i not in covers}
+
+        # Group each absorbed proposal under every maximal proposal it is a prefix of, then
+        # sort each group by a key with no dependency on `proposals`' incoming order — the
+        # collapse must not depend on which order `propose()` happened to append rules in.
+        absorbed_into: dict[int, list[Proposal]] = {}
+        for i, targets in covers.items():
+            for j in targets:
+                if j in maximal:
+                    absorbed_into.setdefault(j, []).append(proposals[i])
+
+        result = list(proposals)
+        for j, absorbed in absorbed_into.items():
+            ordered = sorted(absorbed, key=lambda p: (p.code, p.title, p.ddl or ""))
+            result[j] = cls._fold_discarded(proposals[j], ordered)
+
+        drop = set(covers)
+        return [p for idx, p in enumerate(result) if idx not in drop]
+
+    @classmethod
+    def _disclose_column_set_overlaps(cls, proposals: list[Proposal]) -> list[Proposal]:
+        """When two surviving `CREATE INDEX` proposals cover the same column *set* for the
+        same relation in a different order, say so in both, naming the other.
+
+        `(status, region)` and `(region, status)` are not redundant — different leading
+        columns genuinely serve different probes — so `_collapse_index_prefixes` correctly
+        leaves both standing, and no future ADV003 pass will ever reconcile them either:
+        prefix redundancy is the only structural overlap it can prove, and neither is a
+        prefix of the other. Silence here would recommend two overlapping indexes with no
+        acknowledgement that they overlap, leaving the operator to notice on their own that
+        creating both means indexing the same columns twice.
+        """
+        pairs: list[tuple[int, tuple[Relation, tuple[str, ...]]]] = []
+        for i, proposal in enumerate(proposals):
+            key = cls._index_creation_columns(proposal)
+            if key is not None:
+                pairs.append((i, key))
+
+        notes: dict[int, list[str]] = {}
+        for a in range(len(pairs)):
+            i, (relation_i, columns_i) = pairs[a]
+            for b in range(a + 1, len(pairs)):
+                j, (relation_j, columns_j) = pairs[b]
+                if relation_i != relation_j or columns_i == columns_j:
+                    continue
+                if set(columns_i) != set(columns_j):
+                    continue
+                notes.setdefault(i, []).append(
+                    f"{proposals[j].code} proposes an index on the same columns in a "
+                    f"different order ({', '.join(columns_j)}) for the same table. Neither "
+                    "is redundant — different leading columns serve different probes — but "
+                    "creating both means two overlapping indexes; confirm the workload "
+                    "needs both orderings before applying both."
+                )
+                notes.setdefault(j, []).append(
+                    f"{proposals[i].code} proposes an index on the same columns in a "
+                    f"different order ({', '.join(columns_i)}) for the same table. Neither "
+                    "is redundant — different leading columns serve different probes — but "
+                    "creating both means two overlapping indexes; confirm the workload "
+                    "needs both orderings before applying both."
+                )
+
+        if not notes:
+            return proposals
+        result = list(proposals)
+        for idx, messages in notes.items():
+            result[idx] = replace(
+                result[idx], rationale=result[idx].rationale + " " + " ".join(messages)
+            )
+        return result
 
     def propose(
         self,
@@ -1531,7 +1753,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             *propose_unused_indexes(existing, hot_tables=aggregation.tables),
             *propose_redundant_indexes(existing),
         ]
-        return sorted(self._dedupe_by_ddl(proposals), key=self._ranking_key)
+        proposals = self._dedupe_by_ddl(proposals)
+        proposals = self._collapse_index_prefixes(proposals)
+        proposals = self._disclose_column_set_overlaps(proposals)
+        return sorted(proposals, key=self._ranking_key)
 
     @classmethod
     def _ranking_key(cls, proposal: Proposal) -> tuple[int, float, str, str]:
