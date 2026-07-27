@@ -132,11 +132,19 @@ class ColumnUsage:
     #:   unqualifiable, so poor schema coverage dilutes every surviving share rather than
     #:   silently inflating it. Read it alongside the report's skipped counts.
     cost_share: float
-    fingerprints: int
     #: Fingerprints of the query groups that contributed this usage. Needed to ask whether
     #: two usages *co-occur* — a partial-index proposal is only supported if some single
     #: query actually filters on the indexed column and the guard column together.
     fingerprint_ids: frozenset[str] = frozenset()
+
+    @property
+    def fingerprints(self) -> int:
+        """How many query groups contributed this usage.
+
+        Derived rather than stored: it and `fingerprint_ids` were two fields carrying one
+        fact, kept in step only by convention.
+        """
+        return len(self.fingerprint_ids)
 
 
 @dataclass(frozen=True)

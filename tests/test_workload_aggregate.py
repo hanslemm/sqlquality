@@ -1,5 +1,6 @@
 from sqlquality.models import ColumnRole, QueryStat, Workload
 from sqlquality.workload.aggregate import aggregate
+from sqlquality.workload.fingerprint import FLAG_SELECT_STAR
 
 SCHEMA = {"orders": {"id": "INT", "status": "TEXT", "created_at": "TIMESTAMP"}}
 
@@ -160,3 +161,37 @@ def test_empty_workload_yields_empty_aggregation_and_no_division_error():
     assert agg.usage == ()
     assert agg.total_cost_ms == 0.0
     assert agg.tables == frozenset()
+
+
+def test_star_tables_compiles_each_table_pattern_once(monkeypatch):
+    """A fresh regex per (stat x table) pair thrashes re's pattern cache on a wide schema."""
+    import re as _re
+
+    from sqlquality.workload import aggregate as agg
+
+    compiles: list[str] = []
+    real_compile = _re.compile
+
+    def counting_compile(pattern, *args, **kwargs):
+        compiles.append(pattern)
+        return real_compile(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(agg._re if hasattr(agg, "_re") else _re, "compile", counting_compile)
+    workload = Workload(
+        stats=tuple(
+            QueryStat(
+                fingerprint=f"fp{i}",
+                sql="select * from orders",
+                calls=1,
+                total_time_ms=1.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            )
+            for i in range(5)
+        ),
+        window_description="w",
+    )
+    schema = {f"t{i}": {"c": "int"} for i in range(20)} | {"orders": {"c": "int"}}
+    assert agg.star_tables(workload, schema) == frozenset({"orders"})
+    assert len(compiles) <= len(schema), (
+        f"compiled {len(compiles)} patterns for {len(schema)} tables across 5 stats"
+    )

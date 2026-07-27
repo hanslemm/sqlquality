@@ -5,6 +5,7 @@ import pytest
 
 from sqlquality.models import ConnectionParams
 from sqlquality.workload import get_workload_adapter
+from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.postgres import (
     CAP_INDEXES,
     CAP_NDV,
@@ -13,9 +14,6 @@ from sqlquality.workload.postgres import (
     CAP_TABLE_FACTS,
     CAP_WORKLOAD,
     PostgresWorkloadAdapter,
-    _scrub,
-    _secrets_for,
-    _WITHHELD,
 )
 
 EXPECTED_CAPABILITIES = {
@@ -160,6 +158,42 @@ def test_fetch_workload_window_is_honest_that_since_is_not_supported():
     assert "since stats reset" in fetch.window_description.lower()
 
 
+def test_a_null_stats_reset_reads_as_an_unknown_time_not_as_None():
+    """`stats_reset` is SQL NULL until someone resets statistics — the *default* state.
+
+    The row is then `(None,)`: non-empty, so truthy, so a guard testing the row's emptiness
+    lets the None straight through and the window line reads "since stats reset at None".
+    That line is the sole statement of what period the advice covers, and ADV002's rationale
+    tells the operator to check it before dropping an index.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_stat_statements": [("select id from orders where status = $1", 10, 250.0, 100)],
+            "pg_stat_database": [(None,)],
+        }
+    )
+    fetch = PostgresWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert "an unknown time" in fetch.window_description
+    assert "None" not in fetch.window_description
+
+
+def test_a_denied_stats_reset_statement_also_reads_as_an_unknown_time():
+    """The control: the empty-row path must keep working once the guard tests the value.
+
+    Written as a pair with the test above because the obvious fix — `reset[0][0] is not
+    None` — reads element 0 of a row that may not exist, and an IndexError on a denied
+    grant would cost the whole run for a missing privilege (invariant 4).
+    """
+    querier = FakeQuerier(
+        {"pg_stat_statements": [("select id from orders where status = $1", 10, 250.0, 100)]},
+        fail_markers=("pg_stat_database",),
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    fetch = adapter.fetch_workload(None, 500)
+    assert "an unknown time" in fetch.window_description
+    assert any(cap == CAP_STATS_RESET for cap, _ in adapter.degraded)
+
+
 def test_fetch_schema_builds_a_sqlglot_schema_mapping():
     querier = FakeQuerier(
         {
@@ -229,6 +263,39 @@ def test_absolute_n_distinct_survives_a_missing_row_count():
     assert facts["orders"].ndv["id"] == 500.0
 
 
+def test_a_never_analyzed_table_reports_an_unknown_row_count():
+    """Postgres 14+ stores -1 in reltuples for a table that has never been analyzed.
+
+    Passed through, the small-table gate reads it as a tiny table and suppresses every
+    proposal — silently, and precisely in the window after a load or migration when someone
+    would run advise. -1 means unknown, and unknown already has a correct path.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_total_relation_size": [("orders", -1, 10**9)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate is None
+
+
+def test_an_analyzed_empty_table_still_reports_zero():
+    """0 is a real answer — analyzed and empty — and must not be conflated with unknown."""
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("orders", "id", "integer")],
+            "pg_total_relation_size": [("orders", 0, 8192)],
+        }
+    )
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate == 0
+
+
 def test_fetch_indexes_restores_column_order_from_ordinality():
     """Rows arriving out of order must still yield the right composite order.
 
@@ -239,8 +306,34 @@ def test_fetch_indexes_restores_column_order_from_ordinality():
     querier = FakeQuerier(
         {
             "pg_index": [
-                ("orders", "idx_status_created", "created_at", 2, False, False, 0, 8192),
-                ("orders", "idx_status_created", "status", 1, False, False, 0, 8192),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "created_at",
+                    2,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
             ]
         }
     )
@@ -285,66 +378,52 @@ def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
     assert exc.value.__context__ is None
 
 
-def test_secrets_for_extracts_the_password_from_an_inline_dsn():
-    """The realistic leak shape: a driver reports the bad password on its own.
-
-    It never echoes the whole connection string back, so a whole-DSN token alone would
-    never match and DSN connections would have no protection.
-    """
-    params = ConnectionParams(
-        engine="postgres",
-        dsn="postgresql://u:hunter2@db:5432/analytics",
-        fields={},
-        source="--dsn",
-    )
-    secrets = _secrets_for(params)
-    assert "hunter2" in secrets
-    realistic = 'connection failed: password authentication failed for user "u" (hunter2)'
-    assert "hunter2" not in _scrub(realistic, secrets)
-
-
-def test_secrets_for_covers_a_percent_encoded_dsn_password():
-    """urlparse leaves the password encoded; libpq decodes it before authenticating.
-
-    So the value a real auth-failure message carries is the *decoded* one, and a token of
-    only the encoded form never matches. Any password containing @ : / % or a space hits
-    this, which is most passwords a generator would produce.
-    """
-    params = ConnectionParams(
-        engine="postgres", dsn="postgresql://u:p%40ss@h/db", fields={}, source="--dsn"
-    )
-    secrets = _secrets_for(params)
-    assert "p%40ss" in secrets
-    assert "p@ss" in secrets
-    driver_message = 'connection failed: password authentication failed for user "u" (p@ss)'
-    assert "p@ss" not in _scrub(driver_message, secrets)
-
-
-def test_secrets_for_tolerates_a_dsn_with_no_password_or_a_malformed_one():
-    for dsn in ("postgresql://u@h/db", "not a valid dsn :: at all ///"):
-        params = ConnectionParams(engine="postgres", dsn=dsn, fields={}, source="--dsn")
-        assert _secrets_for(params) == (dsn,)
-
-
-def test_scrub_withholds_rather_than_mangles_an_unredactable_secret():
-    """A one-character password would blank every occurrence of that letter.
-
-    Nothing leaks either way, but a message redacted into unreadability is worse than an
-    honest refusal to show it.
-    """
-    mangled = _scrub("a database has an admin at a table", ("a",))
-    assert mangled == _WITHHELD
-    # A short secret that does not actually appear must not suppress a usable message.
-    assert _scrub("connection refused", ("a",)) == "connection refused"
-
-
 def test_fetch_indexes_groups_columns_in_ordinal_order():
     querier = FakeQuerier(
         {
             "pg_index": [
-                ("orders", "orders_pkey", "id", 1, True, True, 900, 4096),
-                ("orders", "idx_status_created", "status", 1, False, False, 0, 8192),
-                ("orders", "idx_status_created", "created_at", 2, False, False, 0, 8192),
+                (
+                    "orders",
+                    "orders_pkey",
+                    "id",
+                    1,
+                    True,
+                    True,
+                    900,
+                    4096,
+                    False,
+                    None,
+                    False,
+                    "CREATE UNIQUE INDEX orders_pkey ON orders (id)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "created_at",
+                    2,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
             ]
         }
     )
@@ -396,10 +475,17 @@ def test_the_denial_fixture_would_otherwise_have_returned_statistics():
 
 
 class _FakeCursor:
-    """Enough of a psycopg cursor for connect()'s two session-setup statements."""
+    """Enough of a psycopg cursor for connect()'s two session-setup statements.
 
-    def __init__(self) -> None:
+    `executed` records this cursor's own statements; `log` is the connection-wide
+    transcript, so the *relative* order of session setup and later queries is observable.
+    Ordering across cursors is the whole point of invariant 2 — a read-only setting applied
+    after the first query would be no protection at all.
+    """
+
+    def __init__(self, log: list[tuple] | None = None) -> None:
         self.executed: list[tuple] = []
+        self._log = log if log is not None else []
 
     def __enter__(self):
         return self
@@ -409,6 +495,7 @@ class _FakeCursor:
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        self._log.append((sql, params))
 
     def fetchall(self):
         return []
@@ -417,9 +504,10 @@ class _FakeCursor:
 class _FakeConnection:
     def __init__(self) -> None:
         self.cursors: list[_FakeCursor] = []
+        self.log: list[tuple] = []
 
     def cursor(self):
-        cursor = _FakeCursor()
+        cursor = _FakeCursor(self.log)
         self.cursors.append(cursor)
         return cursor
 
@@ -433,7 +521,8 @@ def _install_fake_psycopg(monkeypatch, seen: dict):
 
     def connect(conninfo, **kwargs):
         seen["conninfo"] = conninfo
-        return _FakeConnection()
+        seen["connection"] = _FakeConnection()
+        return seen["connection"]
 
     module.connect = connect  # type: ignore[attr-defined]
     module.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -511,6 +600,55 @@ def test_forwarded_and_mapped_keys_are_not_reported_as_dropped(monkeypatch, caps
     )
     PostgresWorkloadAdapter().connect(params, 30)
     assert capsys.readouterr().err == ""
+
+
+def test_connect_arms_read_only_and_a_statement_timeout_before_the_querier_is_usable(
+    monkeypatch,
+):
+    """Invariant 2, at unit level: neither session-setup statement had a unit guard.
+
+    Removing `SET default_transaction_read_only = on` left the whole default suite green —
+    the read-only claim rested solely on an integration test that is deselected by default
+    and needs Docker. The statement timeout was asserted nowhere at all, unit or live: a
+    session with no timeout can pin a production server on a catalog query, which is the
+    opposite of the "safe to point at production" promise.
+
+    `before the querier is usable` is asserted against the connection-wide transcript, not
+    just per-cursor: setup applied after the first query would protect nothing, and only the
+    relative order can tell the difference.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    adapter = PostgresWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="postgres", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+
+    setup = seen["connection"].log[:]
+    assert setup == [
+        ("SET default_transaction_read_only = on", None),
+        ("SELECT set_config('statement_timeout', %s, false)", ("30000ms",)),
+    ], setup
+
+    # Usable only now, and every later statement lands after both setup statements.
+    adapter._query("SELECT 1", ())
+    assert seen["connection"].log[:2] == setup
+    assert seen["connection"].log[2] == ("SELECT 1", ())
+
+
+def test_an_out_of_range_timeout_is_clamped_before_it_reaches_the_session(monkeypatch):
+    """The value is `clamp_timeout_ms`'s output in milliseconds, not the raw seconds.
+
+    Passing `7200` through unclamped would arm a two-hour statement timeout, and passing it
+    as `7200` rather than `7200ms` would be read by Postgres as milliseconds — a 7-second
+    ceiling. Both are silent.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    PostgresWorkloadAdapter().connect(
+        ConnectionParams(engine="postgres", dsn="postgresql:///x", fields={}, source="--dsn"), 7200
+    )
+    assert seen["connection"].log[1][1] == (f"{MAX_TIMEOUT_S * 1000}ms",)
 
 
 def test_a_conninfo_build_failure_is_scrubbed_like_a_connect_failure(monkeypatch):
@@ -636,3 +774,104 @@ def test_the_timeout_bounds_have_a_single_definition():
         assert str(base.MAX_TIMEOUT_S) not in source, (
             f"{module.__name__} restates the --timeout ceiling as a literal"
         )
+
+
+def test_fetch_indexes_records_an_expression_index_rather_than_dropping_it():
+    """`indkey` holds 0 for an expression column and no pg_attribute row has attnum 0.
+
+    The old inner join therefore discarded those rows, so an index on `lower(status)`
+    arrived with an empty column tuple and could not be reasoned about at all.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                # attname is NULL for the expression column, as a LEFT JOIN yields.
+                (
+                    "orders",
+                    "idx_lower_status",
+                    None,
+                    1,
+                    False,
+                    False,
+                    3,
+                    8192,
+                    False,
+                    None,
+                    True,
+                    "CREATE INDEX idx_lower_status ON orders (lower(status))",
+                ),
+            ]
+        }
+    )
+    indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )
+    index = indexes["orders"][0]
+    assert index.has_expressions is True
+    assert index.columns == ()
+    assert "lower(status)" in (index.definition or "")
+
+
+def test_fetch_indexes_records_a_partial_index_predicate():
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                (
+                    "orders",
+                    "idx_open",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    7,
+                    4096,
+                    True,
+                    "(shipped_at IS NULL)",
+                    False,
+                    "CREATE INDEX idx_open ON orders (status) WHERE shipped_at IS NULL",
+                ),
+            ]
+        }
+    )
+    index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )["orders"][0]
+    assert index.is_partial is True
+    assert index.predicate == "(shipped_at IS NULL)"
+    assert index.columns == ("status",)
+
+
+def test_fetch_indexes_leaves_a_plain_index_unmarked():
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                (
+                    "orders",
+                    "idx_status",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    12,
+                    4096,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status ON orders (status)",
+                ),
+            ]
+        }
+    )
+    index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )["orders"][0]
+    assert (index.is_partial, index.predicate, index.has_expressions) == (False, None, False)
+
+
+def test_the_indexes_statement_reads_predicate_and_expression_metadata():
+    sql = PostgresWorkloadAdapter().SQL[CAP_INDEXES].lower()
+    assert "indpred" in sql, "the partial-index predicate must be selected"
+    assert "indexprs" in sql, "expression presence must be selected"
+    assert "left join pg_attribute" in sql, (
+        "an inner join drops expression columns, whose indkey entry is 0"
+    )

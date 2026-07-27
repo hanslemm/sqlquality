@@ -1,0 +1,21 @@
+# pg_stat_statements must be preloaded at server start; CREATE EXTENSION alone is not
+# enough, which is why this is a compose file rather than a plain `services:` block.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: sqlquality
+      POSTGRES_DB: sqlquality_test
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlquality_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

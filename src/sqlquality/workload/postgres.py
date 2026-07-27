@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from urllib.parse import unquote, urlparse
 
 from sqlquality.models import (
     Aggregation,
@@ -22,7 +21,7 @@ from sqlquality.models import (
     WorkloadFetch,
     cost_share_of,
 )
-from sqlquality.workload.aggregate import mentions_table
+from sqlquality.workload.aggregate import mentions_identifier, mentions_table
 from sqlquality.workload.base import (
     MAX_TIMEOUT_S,
     MIN_TIMEOUT_S,
@@ -31,6 +30,7 @@ from sqlquality.workload.base import (
     WorkloadAdapter,
 )
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
+from sqlquality.workload.secrets import clamp_timeout_ms, scrub, secrets_for
 
 CAP_WORKLOAD = "workload"
 CAP_STATS_RESET = "stats_reset"
@@ -80,8 +80,6 @@ _PG_FIELD_MAP = {
 _PG_PASSTHROUGH_FIELDS = frozenset(
     {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
 )
-#: profiles.yml keys whose values must never appear in any message we emit.
-_SECRET_FIELDS = frozenset({"password", "pass"})
 
 
 def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
@@ -100,69 +98,6 @@ def _dropped_pg_fields(fields: dict[str, str]) -> tuple[str, ...]:
     return tuple(
         sorted(k for k in fields if k not in _PG_FIELD_MAP and k not in _PG_PASSTHROUGH_FIELDS)
     )
-
-
-def _clamp_timeout_ms(timeout_s: int) -> int:
-    """Statement timeout in milliseconds, clamped into a sane range.
-
-    The CLI rejects an out-of-range value before reaching here; this is the safety net
-    for any other caller. Bounds come from workload.base so the two cannot drift.
-    """
-    return max(MIN_TIMEOUT_S, min(int(timeout_s), MAX_TIMEOUT_S)) * 1000
-
-
-#: A secret shorter than this cannot be redacted by substring replacement without
-#: destroying the message — a one-character password would blank every occurrence of that
-#: letter. When one actually appears, the driver's text is withheld rather than mangled.
-_MIN_SCRUBBABLE_SECRET = 4
-_WITHHELD = "(driver message withheld: it contained a value too short to redact safely)"
-
-
-def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
-    """Every value we know to be secret for this connection.
-
-    A DSN is added *and* its password extracted separately. The whole-DSN token only helps
-    if the driver echoes the connection string back verbatim, which real libpq errors do
-    not do — they report the offending value on its own. Without the extracted password,
-    DSN-based connections would have no effective protection at all.
-
-    The password is added in **both** its percent-encoded and decoded forms.
-    ``urlparse().password`` returns it still encoded, but libpq decodes a URI DSN before
-    authenticating, so the value a real auth-failure message carries is the decoded one:
-    for ``postgresql://u:p%40ss@h/db`` the driver reports ``p@ss`` while urlparse yields
-    ``p%40ss``, and a token of only the encoded form never matches. Any password containing
-    ``@``, ``:``, ``/``, ``%`` or a space hits this. The encoded form is kept too, since a
-    URI-parse error can echo the raw string back instead.
-    """
-    secrets = tuple(
-        value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
-    )
-    if params.dsn:
-        secrets += (params.dsn,)
-        encoded = urlparse(params.dsn).password
-        if encoded:
-            secrets += (encoded,)
-            decoded = unquote(encoded)
-            if decoded != encoded:
-                secrets += (decoded,)
-    return secrets
-
-
-def _scrub(text: str, secrets: Iterable[str]) -> str:
-    """Replace any known secret occurring in ``text`` with a redaction marker.
-
-    Defence in depth for driver exceptions. libpq is not believed to echo a password, but
-    the auth-failure path — the most common real connect failure — cannot be exercised
-    without a live server, and we hold the secret anyway, so its absence can be guaranteed
-    instead of trusted.
-    """
-    present = [secret for secret in secrets if secret and secret in text]
-    if any(len(secret) < _MIN_SCRUBBABLE_SECRET for secret in present):
-        return _WITHHELD
-    scrubbed = text
-    for secret in present:
-        scrubbed = scrubbed.replace(secret, "***")
-    return scrubbed
 
 
 #: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
@@ -199,6 +134,22 @@ def _as_float(value: object) -> float:
     return float(value)  # type: ignore[arg-type]
 
 
+def _row_estimate(value: object) -> int | None:
+    """`pg_class.reltuples`, with Postgres's never-analyzed sentinel translated to unknown.
+
+    Postgres 14+ stores -1 in `reltuples` for a table that has never been analyzed —
+    distinct from 0, which means analyzed and genuinely empty. Passed through as-is, -1
+    reads as a tiny table to the small-table gate in `propose_indexes`, which then
+    suppresses every proposal for that table with no message. The window where this bites
+    is exactly when someone reaches for `advise`: a freshly loaded or migrated table,
+    before autovacuum's first ANALYZE, with slow queries. `None` already means "unknown"
+    throughout — it proposes at LOW and says the row count could not be checked — so
+    translating the sentinel here is the whole fix.
+    """
+    rows = _as_int(value)
+    return None if rows < 0 else rows
+
+
 @dataclass
 class _IndexRows:
     """Mutable per-index collector while unnested index rows are grouped.
@@ -212,6 +163,10 @@ class _IndexRows:
     is_primary: bool
     scans: int
     size_bytes: int
+    is_partial: bool = False
+    predicate: str | None = None
+    has_expressions: bool = False
+    definition: str | None = None
     #: (ordinality, column) so the column order can be restored by sorting.
     columns: list[tuple[int, str]] = field(default_factory=list)
 
@@ -226,6 +181,16 @@ class PgIndex:
     is_primary: bool
     scans: int
     size_bytes: int
+    #: True when the index has a WHERE predicate. A partial index does not serve an
+    #: unfiltered lookup, so it can never be assumed to cover a proposed index.
+    is_partial: bool = False
+    #: The rendered predicate, for showing an operator why a drop was not recommended.
+    predicate: str | None = None
+    #: True when any indexed position is an expression rather than a plain column. Such a
+    #: position contributes no name to `columns`, so the tuple understates the index.
+    has_expressions: bool = False
+    #: The full CREATE INDEX text, the only place an expression is legible.
+    definition: str | None = None
 
 
 #: Below this row estimate a sequential scan is the right plan; an index is pure overhead.
@@ -264,8 +229,18 @@ def _is_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
 
 
 def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | None:
-    """Name of an existing index whose leading columns already cover ``candidate``."""
+    """Name of a *plain* existing index whose leading columns already cover ``candidate``.
+
+    Partial and expression indexes are excluded, for opposite reasons that land in the same
+    place. A partial index does not serve an unfiltered lookup, so calling it coverage
+    silently withholds a real proposal. An expression index's `columns` tuple understates it
+    — the expression positions contribute no name — so a prefix match against it is not a
+    match at all. Neither can be *proven* irrelevant either, which is why `propose_indexes`
+    discloses them instead of dropping them on the floor.
+    """
     for index in existing:
+        if index.is_partial or index.has_expressions:
+            continue
         if _is_prefix(candidate, index.columns):
             return index.name
     return None
@@ -356,6 +331,29 @@ def propose_indexes(
         if covered_by is not None:
             continue
 
+        table_indexes = existing.get(table, ())
+        partial_skipped = tuple(
+            index.name
+            for index in table_indexes
+            if index.is_partial and _is_prefix(columns, index.columns)
+        )
+        # Only expression indexes whose definition mentions the leading column are worth
+        # naming. Proving `lower(status)` equivalent to `status` would need the expression
+        # parsed and matched; naming it lets the operator make that call in one glance.
+        #
+        # Whole-identifier matching, not a substring test. `columns[0] in definition` reports
+        # a candidate on `id` against an index on `lower(guid)`, and the rationale then tells
+        # the operator an index "mentions id" when it does not — a claim the tool cannot
+        # support, in the string someone reads while deciding whether to run DDL. Verified
+        # that `\b` keeps the true positives: `lower(status)`, `lower(customer_id::text)`
+        # and `(id::text)` all still match, because Postgres separates identifiers with
+        # parens, commas, dots and `::`, none of which are word characters.
+        expression_indexes = tuple(
+            index.name
+            for index in table_indexes
+            if index.has_expressions and mentions_identifier(columns[0], index.definition or "")
+        )
+
         ndv = table_facts.ndv if table_facts else {}
         leading_ndv = ndv.get(columns[0])
         if rows is None or not have_index_data:
@@ -388,6 +386,18 @@ def propose_indexes(
             )
         if rows is None:
             rationale += _UNKNOWN_ROWS_NOTE
+        if partial_skipped:
+            rationale += (
+                f" A partial index ({', '.join(partial_skipped)}) leads with these columns "
+                "but carries a WHERE predicate, so it does not serve an unfiltered lookup — "
+                "it is not treated as covering this proposal."
+            )
+        if expression_indexes:
+            rationale += (
+                f" An expression index ({', '.join(expression_indexes)}) mentions "
+                f"{columns[0]}; sqlquality cannot tell whether it already serves this "
+                "lookup, so confirm before applying."
+            )
 
         proposals.append(
             Proposal(
@@ -403,6 +413,8 @@ def propose_indexes(
                     "fingerprints": max(i.fingerprints for i in chosen),
                     "row_estimate": rows,
                     "leading_ndv": leading_ndv,
+                    "partial_indexes_skipped": partial_skipped,
+                    "expression_indexes": expression_indexes,
                 },
                 confidence=confidence,
                 ddl=(
@@ -459,22 +471,31 @@ def propose_redundant_indexes(
 ) -> list[Proposal]:
     """ADV003 — an index whose column list is a strict prefix of another's is redundant.
 
-    Capped at MEDIUM, not HIGH. ``PgIndex`` carries no ``indpred``/``indexprs``, so a
-    partial index (``WHERE shipped_at IS NULL``) and an expression index are both
-    indistinguishable from plain ones here — and for a partial index "serves the same
-    lookups" is simply false. The README says so, but a README does not travel inside the
-    ``.sql`` file the operator runs, so the rationale carries the caveat too.
+    HIGH when both indexes are plain: prefix redundancy is then provable from the column
+    lists alone. A partial index (``WHERE shipped_at IS NULL``) or an expression index is
+    skipped entirely rather than downgraded, on either side of the pair — ``PgIndex`` now
+    carries ``is_partial``/``has_expressions``/``predicate``, and for a partial index
+    "serves the same lookups" is simply false, since the partial index exists precisely to
+    serve a subset the wider index serves differently. Emitting that at MEDIUM would still
+    be advising a `DROP INDEX` with no basis: "probably wrong" is not a confidence level.
     """
     proposals: list[Proposal] = []
     for table, indexes in sorted(existing.items()):
         for narrow in indexes:
-            if narrow.is_unique or narrow.is_primary:
+            # A partial or expression index is not comparable on column lists alone: the
+            # predicate or the expression is the whole point of it. Skipping the pair is
+            # the honest answer, because "probably wrong" is not a confidence level.
+            if narrow.is_unique or narrow.is_primary or narrow.is_partial:
+                continue
+            if narrow.has_expressions:
                 continue
             wider = next(
                 (
                     other
                     for other in indexes
                     if other.name != narrow.name
+                    and not other.is_partial
+                    and not other.has_expressions
                     and len(other.columns) > len(narrow.columns)
                     and _is_prefix(narrow.columns, other.columns)
                 ),
@@ -487,12 +508,10 @@ def propose_redundant_indexes(
                     code="ADV003",
                     title=f"Drop redundant index {narrow.name} on {table}",
                     rationale=(
-                        f"Its columns are a leading prefix of {wider.name}, which can "
-                        "serve the same lookups. This comparison is on column lists only: "
-                        "sqlquality cannot see a partial index's WHERE predicate or an "
-                        "expression index's expressions, and a partial index does not "
-                        "cover the same rows as a wider full one. Confirm that neither "
-                        "index is partial or expression-based before dropping."
+                        f"Its columns are a leading prefix of {wider.name}, which can serve "
+                        "the same lookups. Both indexes are plain — neither carries a WHERE "
+                        "predicate nor an indexed expression — so the column lists are the "
+                        "whole comparison."
                     ),
                     evidence={
                         "table": table,
@@ -502,7 +521,7 @@ def propose_redundant_indexes(
                         "superseding_columns": wider.columns,
                         "size_bytes": narrow.size_bytes,
                     },
-                    confidence=Confidence.MEDIUM,
+                    confidence=Confidence.HIGH,
                     ddl=f"DROP INDEX {_qualified(schema, narrow.name)};",
                 )
             )
@@ -787,21 +806,29 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             FROM pg_stats s
             WHERE s.schemaname = ANY(%s) AND s.tablename = ANY(%s)
         """,
-        # Known limitation: the pg_attribute join silently omits expression indexes.
-        # `indkey` holds 0 for an expression column, which matches no pg_attribute row, so
-        # an index on `lower(status)` is invisible here. Consequence: ADV001 may propose an
-        # index whose expression equivalent already exists. Reading pg_get_indexdef() would
-        # fix it; deferred rather than silently ignored.
+        # LEFT JOIN, not JOIN: Postgres stores 0 in indkey for an expression column and no
+        # pg_attribute row has attnum 0, so an inner join silently discarded every expression
+        # index's columns — they arrived with an empty tuple. The NULL attname a LEFT JOIN
+        # yields is what tells us the position was an expression.
+        #
+        # indpred / indexprs are selected as booleans plus the rendered predicate, because a
+        # partial index does not serve an unfiltered lookup and an expression index does not
+        # serve its bare column — both of which the coverage and redundancy rules previously
+        # had to guess at.
         CAP_INDEXES: """
             SELECT t.relname, i.relname, a.attname, k.ordinality,
                    ix.indisunique, ix.indisprimary,
-                   COALESCE(psui.idx_scan, 0), pg_relation_size(i.oid)
+                   COALESCE(psui.idx_scan, 0), pg_relation_size(i.oid),
+                   ix.indpred IS NOT NULL,
+                   pg_get_expr(ix.indpred, ix.indrelid),
+                   ix.indexprs IS NOT NULL,
+                   pg_get_indexdef(ix.indexrelid)
             FROM pg_index ix
             JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN pg_class t ON t.oid = ix.indrelid
             JOIN pg_namespace n ON n.oid = t.relnamespace
             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON TRUE
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+            LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
             LEFT JOIN pg_stat_user_indexes psui ON psui.indexrelid = i.oid
             WHERE n.nspname = ANY(%s) AND t.relname = ANY(%s)
             ORDER BY t.relname, i.relname, k.ordinality
@@ -857,7 +884,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
         # Everything we know to be secret, so a driver exception can be proven clean rather
         # than trusted.
-        secrets = _secrets_for(params)
+        secrets = secrets_for(params)
 
         failure: str | None = None
         try:
@@ -874,10 +901,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 # is the wrong habit to establish in the one place we talk to a database.
                 cursor.execute(
                     "SELECT set_config('statement_timeout', %s, false)",
-                    (f"{_clamp_timeout_ms(timeout_s)}ms",),
+                    (
+                        f"{clamp_timeout_ms(timeout_s, minimum=MIN_TIMEOUT_S, maximum=MAX_TIMEOUT_S)}ms",
+                    ),
                 )
         except Exception as exc:
-            failure = _scrub(str(exc), secrets)
+            failure = scrub(str(exc), secrets)
         if failure is not None:
             # Raised after the handler, and scrubbed: Task 6 established that a dependency's
             # exception text is exactly where this class of leak hides, and that leaving the
@@ -897,7 +926,14 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
         rows = self._run(CAP_WORKLOAD, (limit,))
         reset = self._run(CAP_STATS_RESET, ())
-        reset_at = reset[0][0] if reset and reset[0] else "an unknown time"
+        # Two different unknowns, one fallback. The statement can be denied (no row at all),
+        # or it can succeed and report SQL NULL — which is the *default* state of
+        # `pg_stat_database.stats_reset` for any database whose statistics have never been
+        # reset. The row is then `(None,)`: non-empty, hence truthy, so testing the row's
+        # emptiness printed "since stats reset at None". The value's nullness is what matters.
+        reset_at: object = "an unknown time"
+        if reset and reset[0] and reset[0][0] is not None:
+            reset_at = reset[0][0]
         # pg_stat_statements is cumulative since reset and carries no per-statement
         # timestamps before PG 17, so --since cannot be honored. Say so rather than
         # implying the requested window was applied.
@@ -930,7 +966,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         wanted = sorted(tables)
         sizes = {
             str(name): (
-                _as_int(rows),
+                _row_estimate(rows),
                 _as_int(size) if size is not None else None,
             )
             for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
@@ -978,7 +1014,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         """Existing indexes per table, columns in ordinal order."""
         grouped: dict[tuple[str, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), sorted(tables))):
-            table, index, column, ordinality, unique, primary, scans, size = row
+            (
+                table,
+                index,
+                column,
+                ordinality,
+                unique,
+                primary,
+                scans,
+                size,
+                is_partial,
+                predicate,
+                has_expressions,
+                definition,
+            ) = row
             entry = grouped.setdefault(
                 (str(table), str(index)),
                 _IndexRows(
@@ -986,13 +1035,20 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     is_primary=bool(primary),
                     scans=_as_int(scans),
                     size_bytes=_as_int(size) if size is not None else 0,
+                    is_partial=bool(is_partial),
+                    predicate=str(predicate) if predicate is not None else None,
+                    has_expressions=bool(has_expressions),
+                    definition=str(definition) if definition is not None else None,
                 ),
             )
+            # A NULL attname is an expression position: it has no column name to record, and
+            # `has_expressions` already marks the index, so skip it rather than storing "None".
             # Keyed by ordinality and sorted below rather than trusting arrival order. The
             # statement does ORDER BY k.ordinality, but composite-index column order decides
             # whether a proposal is right, and a fixture test that pre-sorts its canned rows
             # cannot notice the difference. Cheap defence in depth.
-            entry.columns.append((_as_int(ordinality), str(column)))
+            if column is not None:
+                entry.columns.append((_as_int(ordinality), str(column)))
 
         result: dict[str, list[PgIndex]] = {}
         for (table, index), entry in grouped.items():
@@ -1004,6 +1060,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     is_primary=entry.is_primary,
                     scans=entry.scans,
                     size_bytes=entry.size_bytes,
+                    is_partial=entry.is_partial,
+                    predicate=entry.predicate,
+                    has_expressions=entry.has_expressions,
+                    definition=entry.definition,
                 )
             )
         return {table: tuple(indexes) for table, indexes in result.items()}
@@ -1018,36 +1078,35 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         An index with no recorded scans that is *also* a prefix of a wider index gets
         flagged by both ADV002 and ADV003, producing two entries with the same
         `DROP INDEX`. They do not contradict each other, but a reader should not have to
-        notice they are the same object twice. ADV003 wins ties because prefix redundancy
-        is structural — provable from the column lists alone — whereas ADV002 rests on a
-        scan counter that only covers the window since the last statistics reset.
+        notice they are the same object twice. ADV003 is the one kept, because prefix
+        redundancy is structural — provable from the column lists alone — whereas ADV002
+        rests on a scan counter that only covers the window since the last statistics reset.
 
-        That preference used to fall out of the confidence order on its own, when ADV003
-        was HIGH. Capping ADV003 at MEDIUM (it cannot see partial-index predicates) made
-        the two rules tie, and a tie was resolved by list order — silently handing the
-        collapse to ADV002. `_RULE_PRECEDENCE` states the preference instead of relying on
-        it emerging.
+        That preference needs no tie-break rule to state it: the two codes cannot tie.
+        ADV002 is hardcoded MEDIUM — `idx_scan` accumulates only since the last statistics
+        reset, so zero scans can never prove disuse across a business cycle — and ADV003 is
+        hardcoded HIGH, because it can now read `indpred` and so declines to call a partial
+        index redundant rather than guessing. Confidence alone decides, and it decides the
+        way this docstring says it should.
+
+        There was a window where they *did* tie, and it is why a second tuple element used
+        to be here: ADV003 was briefly capped at MEDIUM on the grounds that it could not see
+        partial-index predicates. It can, so the cap is gone and so is the tie. A tie-break
+        that cannot be reached is worse than none — it reads as evidence the collision is
+        handled where the confidence values are what actually handle it.
         """
         best: dict[str, Proposal] = {}
         for proposal in proposals:
             if not proposal.ddl:
                 continue
             incumbent = best.get(proposal.ddl)
-            if incumbent is None or cls._dedupe_rank(proposal) < cls._dedupe_rank(incumbent):
+            if (
+                incumbent is None
+                or cls._CONFIDENCE_ORDER[proposal.confidence]
+                < cls._CONFIDENCE_ORDER[incumbent.confidence]
+            ):
                 best[proposal.ddl] = proposal
         return [p for p in proposals if not p.ddl or best[p.ddl] is p]
-
-    #: Lower wins when two rules propose identical DDL at the same confidence. Only ADV003
-    #: is named: its evidence is structural, every other rule's rests on a counter or an
-    #: estimate. Anything unlisted sorts after it.
-    _RULE_PRECEDENCE = {"ADV003": 0}
-
-    @classmethod
-    def _dedupe_rank(cls, proposal: Proposal) -> tuple[int, int]:
-        return (
-            cls._CONFIDENCE_ORDER[proposal.confidence],
-            cls._RULE_PRECEDENCE.get(proposal.code, 1),
-        )
 
     def propose(
         self,
