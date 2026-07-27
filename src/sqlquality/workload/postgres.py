@@ -455,22 +455,32 @@ def propose_redundant_indexes(
 ) -> list[Proposal]:
     """ADV003 — an index whose column list is a strict prefix of another's is redundant.
 
-    Capped at MEDIUM, not HIGH. ``PgIndex`` carries no ``indpred``/``indexprs``, so a
-    partial index (``WHERE shipped_at IS NULL``) and an expression index are both
-    indistinguishable from plain ones here — and for a partial index "serves the same
-    lookups" is simply false. The README says so, but a README does not travel inside the
-    ``.sql`` file the operator runs, so the rationale carries the caveat too.
+    HIGH when both indexes are plain: prefix redundancy is then provable from the column
+    lists alone. A partial index (``WHERE shipped_at IS NULL``) or an expression index is
+    skipped entirely rather than downgraded, on either side of the pair — ``PgIndex`` now
+    carries ``is_partial``/``has_expressions``/``predicate`` (see Task 2), and for a
+    partial index "serves the same lookups" is simply false, since the partial index
+    exists precisely to serve a subset the wider index serves differently. Emitting that
+    at MEDIUM would still be advising a `DROP INDEX` with no basis: "probably wrong" is
+    not a confidence level.
     """
     proposals: list[Proposal] = []
     for table, indexes in sorted(existing.items()):
         for narrow in indexes:
-            if narrow.is_unique or narrow.is_primary:
+            # A partial or expression index is not comparable on column lists alone: the
+            # predicate or the expression is the whole point of it. Skipping the pair is
+            # the honest answer, because "probably wrong" is not a confidence level.
+            if narrow.is_unique or narrow.is_primary or narrow.is_partial:
+                continue
+            if narrow.has_expressions:
                 continue
             wider = next(
                 (
                     other
                     for other in indexes
                     if other.name != narrow.name
+                    and not other.is_partial
+                    and not other.has_expressions
                     and len(other.columns) > len(narrow.columns)
                     and _is_prefix(narrow.columns, other.columns)
                 ),
@@ -483,12 +493,10 @@ def propose_redundant_indexes(
                     code="ADV003",
                     title=f"Drop redundant index {narrow.name} on {table}",
                     rationale=(
-                        f"Its columns are a leading prefix of {wider.name}, which can "
-                        "serve the same lookups. This comparison is on column lists only: "
-                        "sqlquality cannot see a partial index's WHERE predicate or an "
-                        "expression index's expressions, and a partial index does not "
-                        "cover the same rows as a wider full one. Confirm that neither "
-                        "index is partial or expression-based before dropping."
+                        f"Its columns are a leading prefix of {wider.name}, which can serve "
+                        "the same lookups. Both indexes are plain — neither carries a WHERE "
+                        "predicate nor an indexed expression — so the column lists are the "
+                        "whole comparison."
                     ),
                     evidence={
                         "table": table,
@@ -498,7 +506,7 @@ def propose_redundant_indexes(
                         "superseding_columns": wider.columns,
                         "size_bytes": narrow.size_bytes,
                     },
-                    confidence=Confidence.MEDIUM,
+                    confidence=Confidence.HIGH,
                     ddl=f"DROP INDEX {_qualified(schema, narrow.name)};",
                 )
             )
