@@ -458,11 +458,10 @@ def propose_redundant_indexes(
     HIGH when both indexes are plain: prefix redundancy is then provable from the column
     lists alone. A partial index (``WHERE shipped_at IS NULL``) or an expression index is
     skipped entirely rather than downgraded, on either side of the pair — ``PgIndex`` now
-    carries ``is_partial``/``has_expressions``/``predicate`` (see Task 2), and for a
-    partial index "serves the same lookups" is simply false, since the partial index
-    exists precisely to serve a subset the wider index serves differently. Emitting that
-    at MEDIUM would still be advising a `DROP INDEX` with no basis: "probably wrong" is
-    not a confidence level.
+    carries ``is_partial``/``has_expressions``/``predicate``, and for a partial index
+    "serves the same lookups" is simply false, since the partial index exists precisely to
+    serve a subset the wider index serves differently. Emitting that at MEDIUM would still
+    be advising a `DROP INDEX` with no basis: "probably wrong" is not a confidence level.
     """
     proposals: list[Proposal] = []
     for table, indexes in sorted(existing.items()):
