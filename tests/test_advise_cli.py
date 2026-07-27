@@ -511,6 +511,67 @@ def test_empty_workload_exits_0(monkeypatch):
     assert json.loads(result.stdout)["proposals"] == []
 
 
+DBT_FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
+
+
+def test_project_dir_loads_a_manifest_and_discloses_only_on_stderr(monkeypatch, tmp_path):
+    """--project-dir must actually reach `load_dbt_context` — replacing `target/manifest.json`
+    with garbage used to leave every test in this module green, because nothing exercised the
+    option at all. The disclosure it produces must land on stderr: stdout has to stay valid
+    JSON under --json, since that is what a later task diffs byte-for-byte against `main`.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(DBT_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--project-dir", str(tmp_path), "--json"],
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment" in result.stderr
+    assert "dbt enrichment" not in result.stdout
+    payload = json.loads(result.stdout)  # stdout must still be pure, parseable JSON
+    assert payload["proposals"] == []
+
+
+def test_project_dir_with_a_broken_manifest_does_not_abort_the_run(monkeypatch, tmp_path):
+    """A garbage `target/manifest.json` must degrade to 'no enrichment', not crash a run
+    that already did the whole catalog analysis."""
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--project-dir", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment unavailable" in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_manifest_option_loads_and_discloses_the_source(monkeypatch):
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE)]
+    )
+    assert result.exit_code == 0
+    assert str(DBT_FIXTURE) in result.stderr
+
+
+def test_no_dbt_option_means_no_disclosure_anywhere(monkeypatch):
+    """The no-manifest path is every existing `advise` invocation. A later task proves
+    byte-identical output against `main` by diffing artifacts, so nothing dbt-shaped may
+    appear anywhere in the output without either --project-dir or --manifest.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "dbt enrichment" not in result.output
+
+
 def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
     _stub_adapter(
         monkeypatch,
