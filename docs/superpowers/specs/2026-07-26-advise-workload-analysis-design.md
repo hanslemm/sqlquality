@@ -438,6 +438,26 @@ records why they changed.
    before the noise filter runs, rather than filtered as maintenance statements. Both are
    ordinary reads with real predicates — `DECLARE` is what every psycopg2 server-side
    cursor emits — but both begin with a keyword the noise filter otherwise drops.
+5. **The rules are evaluated independently but not *reported* independently.** The spec above
+   describes eight rules that each report their own findings; in the shipped code a
+   reconciliation pass runs over the assembled proposal list before the report is written.
+   Proposals with identical DDL collapse into one, and a proposed index whose columns are a
+   leading prefix of another proposed index for the same table collapses into the wider one —
+   without this, ADV001 and ADV007 shipped a `CREATE INDEX` pair on the same table that
+   ADV003 would flag as redundant on the following run, i.e. the tool contradicting itself
+   across runs. The absorbed proposal's rationale and confidence are folded into the
+   survivor's, attributed by code; its `evidence` is discarded. Same column *set* in a
+   different order is not a prefix relationship and both are kept, each disclosing the other.
+   Consequence a consumer must know: a rule can fire and contribute no entry to `proposals`.
+6. **A composite index proposal requires *joint* support.** ADV001, ADV004 and ADV008 only
+   combine columns that some single query group uses together, tracked as a running
+   intersection of contributing fingerprints, and report that joint count as
+   `co_occurring_fingerprints` instead of a per-column `fingerprints`. Cost weighting alone
+   is not enough: a proposal's `cost_share` is the *max* over its columns, so a column
+   carrying ~0% of workload cost could not be filtered out by it, and a near-free query
+   contributing one column to the middle of a composite produced an index no query could use.
+   ADV002 and ADV003, the two `DROP INDEX` rules, are likewise both scoped to the relations
+   the workload was observed using rather than to every relation the catalog query returned.
 
 ### Redshift
 

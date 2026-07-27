@@ -1,10 +1,13 @@
+import inspect
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 from sqlquality.models import ConnectionParams, Relation
 from sqlquality.workload import get_workload_adapter
+from sqlquality.workload import postgres as postgres_module
 from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.postgres import (
     CAP_INDEXES,
@@ -117,19 +120,69 @@ def test_workload_statement_is_scoped_to_the_current_database():
 def test_workload_statement_does_not_filter_on_toplevel():
     """Deliberately not filtered — a documented trade-off, not an oversight.
 
-    Filtering to `s.toplevel` would deduplicate a `COPY (...) TO` execution under
+    A blanket `AND s.toplevel` would deduplicate a `COPY (...) TO` execution under
     `pg_stat_statements.track = all` (see the README's "Prerequisites and limits"), but
     `toplevel = false` is also the *only* way Postgres exposes the SQL executed inside a
-    PL/pgSQL function body, and no `s.query` text pattern distinguishes the two — both are
-    recorded as the bare inner statement once normalised. Tried and reverted: verified live
-    that the filter made a genuinely hot, function-wrapped query disappear from evidence
-    entirely while a colder query took its place as a `high`-confidence proposal —
-    confidently wrong, which is worse than the double-count it would have fixed. This test
-    exists so a future attempt to reintroduce the filter fails here first, rather than
-    silently reopening that regression.
+    PL/pgSQL function body. Tried and reverted: verified live that the filter made a
+    genuinely hot, function-wrapped query disappear from evidence entirely while a colder
+    query took its place as a `high`-confidence proposal — confidently wrong, which is worse
+    than the double-count it would have fixed. A *narrow* predicate does work — the two
+    nested forms are textually distinguishable, see
+    `test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility` — and is
+    declined only because naming `s.toplevel` at all raises the floor to PostgreSQL 14. This
+    test exists so a future attempt to reintroduce the blanket filter fails here first,
+    rather than silently reopening that regression.
     """
     sql = PostgresWorkloadAdapter().SQL[CAP_WORKLOAD].lower()
     assert "toplevel" not in sql
+
+
+def _source_of(module) -> str:
+    return Path(inspect.getsourcefile(module)).read_text(encoding="utf-8")
+
+
+def test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility():
+    """The reason the filter is absent must be the reason it is actually absent.
+
+    Both the source comment and the README claimed no `s.query` text pattern could separate
+    a COPY's nested duplicate from a PL/pgSQL function's nested statement. Measured on
+    PostgreSQL 16 under `track = all` that is false: the COPY's nested row keeps its wrapper
+    while a function body is recorded bare, and
+    `NOT (s.toplevel = false AND s.query ~* '^\\s*COPY\\s*\\(')` removed exactly the
+    duplicate (4 rows -> 3). The filter is declined because *naming* `s.toplevel` requires
+    PostgreSQL 14 while the supported floor is 13 — a price, not an impossibility. A comment
+    that justifies an absence with a false premise is how the wrong decision gets made next
+    time, so the claim is pinned here.
+    """
+    source = _source_of(postgres_module)
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    for text, where in ((source, "the CAP_WORKLOAD comment"), (readme, "the README")):
+        lowered = text.lower()
+        assert "no `s.query`" not in lowered, f"{where} still claims no predicate can work"
+        assert "text pattern separates" not in lowered, f"{where} still claims impossibility"
+        assert "text pattern tells the two apart" not in lowered, (
+            f"{where} still claims impossibility"
+        )
+        assert "postgresql 14" in lowered or "postgres 14" in lowered, (
+            f"{where} does not state the version cost that is the actual reason"
+        )
+
+
+def test_the_plpgsql_double_count_is_documented_as_a_limitation():
+    """The larger, unfixable half of the `track = all` inaccuracy.
+
+    Every PL/pgSQL call is counted twice under `track = all` — measured, `SELECT lc.hot()`
+    at 68.21 ms plus its body at 67.67 ms for one execution — which roughly halves every
+    `cost_share`. Unlike the `COPY` duplicate no predicate can fix it (the call carries the
+    cost, the body carries the predicates), so disclosure is the only honest treatment, and
+    the README documented only the smaller `COPY` half.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "PL/pgSQL function call is counted twice" in readme
+    assert "68.21" in readme and "67.67" in readme, (
+        "the measurement behind the claim is not recorded"
+    )
+    assert "no predicate can fix it" in readme
 
 
 class FakeQuerier:

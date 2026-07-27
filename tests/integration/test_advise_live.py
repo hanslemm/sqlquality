@@ -62,7 +62,16 @@ def test_advise_end_to_end(seeded, tmp_path):
 
     assert payload["engine"] == "postgres"
     assert payload["redacted"] is True
-    assert payload["analyzed"]["query_groups"] > 0
+    # Both numbers, and the arithmetic between them. `query_groups` is what the run
+    # *understood*; `query_groups_in_window` is what `pg_stat_statements` offered. A bare
+    # `> 0` on the former passed equally well when it silently carried the raw window count.
+    analyzed = payload["analyzed"]
+    assert analyzed["query_groups"] > 0
+    assert analyzed["query_groups"] == (
+        analyzed["query_groups_in_window"]
+        - payload["skipped"]["unqualifiable"]
+        - payload["skipped"]["ambiguous"]
+    )
     assert payload["degraded"] == []
     assert md.read_text(encoding="utf-8").startswith("# sqlquality advise")
     assert "REVIEW BEFORE RUNNING" in ddl.read_text(encoding="utf-8")

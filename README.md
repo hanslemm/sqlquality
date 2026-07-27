@@ -378,7 +378,7 @@ statement is not valid SQL to copy out and run.
 
 | Code | Proposal | Evidence |
 |---|---|---|
-| ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3 | cost share, NDV, row estimate, absence of a covering index |
+| ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3, and only columns some single query group filters on *together* | cost share, NDV, row estimate, joint co-occurring fingerprint count, absence of a covering index |
 | ADV002 | Drop an index with zero recorded scans (excludes unique/primary-key indexes) | scans since last stats reset, size |
 | ADV003 | Drop an index whose column list is a strict prefix of a wider index | both column lists |
 | ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
@@ -406,6 +406,32 @@ statement is not valid SQL to copy out and run.
 
 Every proposal's evidence renders inline (cost share, calls, fingerprints, row estimate,
 NDV, existing index state) so it can be judged from the report alone.
+
+**How overlapping proposals are reconciled.** The rules above are evaluated independently,
+but their output is not shipped independently: two of them can reach the same index from
+different evidence, and following both would mean creating a redundant pair that ADV003 then
+advises dropping on the next run. So before anything is reported:
+
+- **Identical DDL collapses to one proposal.** The higher confidence wins; on a tie a fixed
+  rule preference decides, never list order.
+- **A narrower index collapses into a wider one.** If one proposal's columns are a leading
+  prefix of another's for the same table, only the wider survives — it serves every lookup
+  the narrower would. Partial (`WHERE`) proposals never participate: a partial index is a
+  different object even when its column list is a prefix.
+- **Same columns in a different order are both kept**, each disclosing the other. `(status,
+  region)` and `(region, status)` serve different probes, so neither is redundant — but
+  creating both means indexing the same columns twice, and the report says so.
+
+Two consequences worth knowing before you consume the output:
+
+- **A rule can fire and still contribute no proposal.** A `--json` consumer counting
+  `ADV007` entries can legitimately see zero on a run where ADV007 did propose something
+  that was absorbed. The absorbed proposal's rule code, confidence and rationale appear in
+  the surviving proposal's `rationale`, attributed — that is where to look for it.
+- **The absorbed proposal's `evidence` is discarded, not merged.** Its rationale (the
+  constraint an operator needs) is preserved verbatim; its numbers (`leading_ndv`,
+  `partial_indexes_skipped`, `co_occurring_fingerprints`) are not carried into the
+  survivor's evidence block.
 
 `--ddl` writes a standalone, commented script — never executed by sqlquality:
 
@@ -437,6 +463,7 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
 {
   "analyzed": {
     "query_groups": 3,
+    "query_groups_in_window": 3,
     "tables": [
       "orders"
     ],
@@ -451,11 +478,11 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
       "ddl": "CREATE INDEX ON \"orders\" (\"status\");",
       "evidence": {
         "calls": 15000,
+        "co_occurring_fingerprints": 1,
         "columns": [
           "status"
         ],
         "cost_share": 0.6702702702702703,
-        "fingerprints": 1,
         "leading_ndv": 500.0,
         "roles": [
           "equality"
@@ -816,15 +843,32 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   the same execution, and `unwrap`/redaction give the pair different fingerprints (a real
   literal in one, `$1` in the other) — so it lands in `aggregate` as two query groups at
   roughly twice the execution's true cost, inflating both that group's `cost_share` and the
-  whole-window denominator. This is accepted rather than fixed: filtering the workload
-  query to `s.toplevel` removes the duplicate, but `toplevel = false` is also the *only*
-  way Postgres ever exposes the SQL executed inside a PL/pgSQL function body, and no
-  `s.query` text pattern tells the two apart — both are recorded as the bare inner
-  statement once normalised. Tried live: the filter made a genuinely hot, function-wrapped
-  query disappear from evidence entirely (no predicates, no cost, no disclosure that
-  anything was dropped) while a much colder query took its place as a `high`-confidence
-  proposal — confidently wrong, which is strictly worse than an inflated `cost_share` on a
-  setting most installations do not use.
+  whole-window denominator. This is accepted rather than fixed, **for a stated price rather
+  than for want of a way to fix it**. A blanket `AND s.toplevel` is not the answer:
+  `toplevel = false` is also the *only* way Postgres ever exposes the SQL executed inside a
+  PL/pgSQL function body, and tried live it made a genuinely hot, function-wrapped query
+  disappear from evidence entirely (no predicates, no cost, no disclosure that anything was
+  dropped) while a much colder query took its place as a `high`-confidence proposal —
+  confidently wrong, which is strictly worse than an inflated `cost_share`. A *narrow*
+  predicate does exist, though, and was measured to work: on PostgreSQL 16 the COPY's nested
+  row keeps its wrapper (`COPY (SELECT ... $1) TO STDOUT`) while a function body is recorded
+  bare, so `NOT (s.toplevel = false AND s.query ~* '^\s*COPY\s*\(')` removes exactly the
+  duplicate and leaves function bodies alone. It is declined because *naming* `s.toplevel`
+  at all requires PostgreSQL 14 — the column does not exist on 13 — so adding it would cost
+  every PostgreSQL 13 user the entire workload capability in exchange for removing a 2×
+  over-count of one statement form under a non-default setting. If the supported floor ever
+  rises to 14, that is the predicate to add.
+- **Every PL/pgSQL function call is counted twice under `pg_stat_statements.track = all`,
+  and no predicate can fix it.** That setting records both the calling statement and each
+  statement inside the function body: measured on PostgreSQL 16, one execution of
+  `SELECT lc.hot()` appears as the call at 68.21 ms *and* its body at 67.67 ms. Both land in
+  the whole-window denominator, so on a function-heavy workload every `cost_share` is
+  roughly halved and `--min-cost-share` is correspondingly stricter than it looks. Unlike
+  the `COPY` case above there is no filter that helps: the call carries the cost while the
+  body carries the predicates a proposal is built from, so dropping either row loses
+  something real. On the default `track = top` neither this nor the `COPY` duplicate arises,
+  because Postgres records no nested statements at all — if you run `track = all`, read
+  `cost_share` as a lower bound.
 - **Expression indexes are read but not matched.** `advise` now sees that an index on
   `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
   that index already serves a lookup on `status` — so it proposes and says so, rather than
@@ -834,6 +878,10 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   predicate or an indexed expression is skipped entirely rather than proposed at lower
   confidence: a partial index exists to serve a subset, so recommending its removal is
   likely wrong rather than merely uncertain. Plain pairs are reported at HIGH.
+- **Both `DROP INDEX` rules only look at tables the workload actually used.** ADV002 and
+  ADV003 iterate the relations that appear in the analyzed query groups, so an index on a
+  table no observed statement touched is never proposed for removal — including when it sits
+  in a second `--schema` whose table happens to share a bare name with a hot one.
 - **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
   shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
   a candidate index — it is named in the evidence instead. True of all three index-creating

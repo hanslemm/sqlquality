@@ -26,7 +26,13 @@ from sqlquality.dialects import validate_dialect
 from sqlquality.gate import evaluate_gate
 from sqlquality.linter import fix_sql, lint_sql
 from sqlquality.llm import Suggestion, enrich_findings, resolve_provider
-from sqlquality.models import Aggregation, Severity, Workload, cost_share_of
+from sqlquality.models import (
+    Aggregation,
+    Severity,
+    Workload,
+    analyzed_query_groups,
+    cost_share_of,
+)
 from sqlquality.report import (
     advise_payload,
     gate_payload,
@@ -607,23 +613,6 @@ def _validate_timeout(value: int) -> int:
     return value
 
 
-def _analyzed_count(workload: Workload, aggregation: Aggregation) -> int:
-    """Query groups whose usage was actually extracted.
-
-    Unresolvable *and* ambiguous groups are both a *subset* of ``workload.stats``, not a
-    separate pool, so ``len(stats)`` overstates what was understood unless both are
-    subtracted. Omitting `skipped_ambiguous` here used to let an ambiguous statement count
-    as "analyzed" in this line while the *same* statement counted as "unexplained" in
-    `_coverage_warning`'s share — a statement cannot honestly be both, and the share was the
-    one that mattered: it silently deflated toward "coverage is fine", suppressing the
-    low-coverage warning exactly when ambiguity was the reason coverage was bad.
-    """
-    return max(
-        0,
-        len(workload.stats) - aggregation.skipped_unqualifiable - aggregation.skipped_ambiguous,
-    )
-
-
 def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
     """One-line coverage disclosure, printed on every run.
 
@@ -641,7 +630,7 @@ def _coverage_line(workload: Workload, aggregation: Aggregation) -> str:
     maintenance traffic; "filtered" claims only what is true.
     """
     return (
-        f"analyzed {_analyzed_count(workload, aggregation)} of {len(workload.stats)} "
+        f"analyzed {analyzed_query_groups(workload, aggregation)} of {len(workload.stats)} "
         f"query group(s); skipped {workload.skipped_unparseable} unparseable, "
         f"{workload.skipped_noise} filtered, "
         f"{aggregation.skipped_unqualifiable} unresolvable, "
@@ -657,7 +646,7 @@ def _coverage_warning(workload: Workload, aggregation: Aggregation) -> str | Non
     to use count against coverage — an ambiguous statement belongs in that sum exactly like
     an unresolvable one: both are statements `aggregate()` tried and failed to attribute.
     """
-    analyzed = _analyzed_count(workload, aggregation)
+    analyzed = analyzed_query_groups(workload, aggregation)
     unexplained = (
         workload.skipped_unparseable
         + aggregation.skipped_unqualifiable

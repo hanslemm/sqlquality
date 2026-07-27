@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different introspected schemas no longer alias into one another.
 - ADV007 proposes an index on a hot, unindexed join key; ADV008 proposes a composite
   index for a hot `GROUP BY`.
+- Overlapping proposals are reconciled before the report is written, so the eight rules
+  cannot contradict each other: two rules reaching identical DDL collapse into one entry,
+  and a proposed index whose columns are a leading prefix of another proposed index for the
+  same table collapses into the wider one (creating both would have produced a pair ADV003
+  flags as redundant on the next run). The absorbed proposal's rationale and confidence are
+  folded into the survivor's, attributed by rule code; its `evidence` block is **not**
+  merged and is discarded. Two proposals covering the same columns in a different order are
+  both kept, each naming the other. Consequence for `--json` consumers: a rule can fire and
+  contribute no entry of its own to `proposals`, so counting entries by `code` is not a
+  count of which rules matched.
+- ADV001 now requires the columns of a composite candidate to co-occur in at least one query
+  group, and reports that joint count as `co_occurring_fingerprints` in place of the former
+  per-column `fingerprints`. Previously a near-free query could contribute a column to the
+  middle of an otherwise correct composite, producing an index that no query used and that
+  could no longer satisfy the hot query's `ORDER BY`.
+- ADV003 is scoped to the tables the workload was observed using, like ADV002 — it no longer
+  proposes `DROP INDEX` for a relation the run never analysed.
 - `advise` unwraps `DECLARE ... CURSOR FOR` and `COPY (...) TO` reads to their inner
   query before filtering, so server-side-cursor and `COPY`-based workloads (what
   psycopg2, Django and SQLAlchemy emit for large result sets) reach the analysis

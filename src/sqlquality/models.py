@@ -220,6 +220,31 @@ class Proposal:
     ddl: str | None = None
 
 
+def analyzed_query_groups(workload: Workload, aggregation: Aggregation) -> int:
+    """Query groups whose usage was actually extracted.
+
+    Unresolvable *and* ambiguous groups are both a *subset* of ``workload.stats``, not a
+    separate pool, so ``len(stats)`` overstates what was understood unless both are
+    subtracted. Omitting `skipped_ambiguous` used to let an ambiguous statement count as
+    "analyzed" in the terminal's coverage line while the *same* statement counted as
+    "unexplained" in the low-coverage share — a statement cannot honestly be both, and the
+    share was the one that mattered: it silently deflated toward "coverage is fine",
+    suppressing the low-coverage warning exactly when ambiguity was the reason coverage was
+    bad.
+
+    Lives here, beside `cost_share_of`, for the same reason: the terminal, the markdown
+    report and the JSON payload each present this number, and when the terminal alone
+    subtracted the skips, markdown printed "**Query groups analyzed:** 8" directly above
+    "2 ambiguous" while the terminal said "analyzed 6 of 8" — the self-contradiction this
+    function exists to prevent, reintroduced on two surfaces out of three. One helper, three
+    call sites, no way to omit it again.
+    """
+    return max(
+        0,
+        len(workload.stats) - aggregation.skipped_unqualifiable - aggregation.skipped_ambiguous,
+    )
+
+
 def cost_share_of(evidence: Mapping[str, object]) -> float | None:
     """A proposal's cost share as a number, or None when it is absent or not one.
 

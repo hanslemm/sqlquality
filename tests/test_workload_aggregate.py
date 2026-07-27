@@ -168,9 +168,10 @@ def test_identifier_pattern_is_compiled_once_per_name(monkeypatch):
 
     ``star_tables`` no longer text-matches (it parses and resolves through
     ``resolve_relation`` instead — see the ``star_tables`` tests below for why), so the
-    caching this pins is exercised directly through ``mentions_table``, which is what
-    ADV006's wide-table detection and the expression-index disclosure in ``postgres.py``
-    actually call many times over.
+    caching this pins is exercised directly through ``mentions_identifier``, which is what
+    the expression-index disclosures in ADV001/ADV007/ADV008 actually call many times over.
+    It used to go through a `mentions_table` alias, which by then had no production caller at
+    all — a test exercising a wrapper nobody used, of a cache everybody used.
     """
     import re as _re
 
@@ -187,7 +188,7 @@ def test_identifier_pattern_is_compiled_once_per_name(monkeypatch):
     names = [f"t{i}" for i in range(20)] + ["orders"]
     for _ in range(5):
         for name in names:
-            agg.mentions_table(name, "select * from orders")
+            agg.mentions_identifier(name, "select * from orders")
     assert len(compiles) <= len(names), (
         f"compiled {len(compiles)} patterns for {len(names)} distinct identifiers across 5 passes"
     )
@@ -304,6 +305,45 @@ def test_ambiguous_bare_reference_is_counted_even_without_a_literal_star():
     )
     assert result.skipped_ambiguous == 2
     assert result.usage == ()
+
+
+def test_a_qualified_reference_to_a_colliding_name_is_not_counted_ambiguous():
+    """`select * from sales.orders` produces no usage — a star has no predicate to attribute
+    — but it is not *ambiguous*: the statement says which schema it means.
+
+    `_references_an_ambiguous_bare_table` skips any reference carrying a `.db` qualifier, and
+    nothing pinned that skip: removing it left the whole suite green while this statement
+    started counting toward `skipped_ambiguous`, which drives both the low-coverage share and
+    a warning whose remedy is "qualify the table in the query" — advice already followed. The
+    unqualified twin below is asserted in the same test so a guard that silently swallowed
+    *both* cases could not pass either.
+    """
+    qualified = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from sales.orders",
+                calls=1,
+                total_time_ms=100.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    bare = Workload(
+        stats=(
+            QueryStat(
+                fingerprint="fp",
+                sql="select * from orders",
+                calls=1,
+                total_time_ms=100.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+        ),
+        window_description="test",
+    )
+    assert aggregate(qualified, COLLIDING, "postgres").skipped_ambiguous == 0
+    assert aggregate(bare, COLLIDING, "postgres").skipped_ambiguous == 1
 
 
 def test_a_plain_parse_failure_is_not_counted_as_ambiguous():

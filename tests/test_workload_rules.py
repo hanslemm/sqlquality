@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sqlquality.models import (
     Aggregation,
     ColumnRole,
@@ -537,6 +539,79 @@ def test_cost_share_is_the_max_never_the_sum():
     assert proposals[0].evidence["cost_share"] == 0.6
 
 
+def test_adv001_does_not_weld_in_a_column_no_query_uses_with_the_others():
+    """The measured cross-task regression: a near-free cursor read degrading the hot index.
+
+    `DECLARE ... CURSOR FOR SELECT ... WHERE tenant_id = $1` became analysable, and at 0.003%
+    of window cost it put `tenant_id` into position 2 of the hot query's
+    `(customer_id, created_at)`. `cost_share` cannot filter that out — it is the *max* over
+    the chosen columns — and `(customer_id, tenant_id, created_at)` no longer satisfies the
+    hot query's `ORDER BY created_at`, so the tool proposed a strictly worse index at HIGH.
+    """
+    proposals = propose_indexes(
+        [
+            _usage(_ORDERS, "customer_id", ColumnRole.EQUALITY, cost_ms=5000.0, fps=("hot",)),
+            _usage(_ORDERS, "tenant_id", ColumnRole.EQUALITY, cost_ms=0.4, fps=("cursor",)),
+            _usage(_ORDERS, "created_at", ColumnRole.SORT, cost_ms=5000.0, fps=("hot",)),
+        ],
+        _facts_map(columns=("customer_id", "tenant_id", "created_at")),
+        {},
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("customer_id", "created_at")
+
+
+def test_adv001_requires_joint_support_not_merely_pairwise_with_the_seed():
+    """Transitive support is not support: `a` with `b` in one query and with `c` in another
+    is no query filtering on all three. Same guard, same reason, as ADV008's."""
+    proposals = propose_indexes(
+        [
+            _usage(_ORDERS, "a", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp1", "fp2")),
+            _usage(_ORDERS, "b", ColumnRole.EQUALITY, cost_ms=98.0, fps=("fp1",)),
+            _usage(_ORDERS, "c", ColumnRole.EQUALITY, cost_ms=97.0, fps=("fp2",)),
+        ],
+        _facts_map(columns=("a", "b", "c")),
+        {},
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("a", "b")
+
+
+def test_adv001_rejecting_one_column_does_not_block_a_later_co_occurring_one():
+    """A rejected candidate must not narrow the running intersection, or the rule would
+    silently drop a column that a query really does use alongside the seed."""
+    proposals = propose_indexes(
+        [
+            _usage(_ORDERS, "a", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp1",)),
+            _usage(_ORDERS, "b", ColumnRole.EQUALITY, cost_ms=98.0, fps=("fp2",)),
+            _usage(_ORDERS, "c", ColumnRole.EQUALITY, cost_ms=97.0, fps=("fp1",)),
+        ],
+        _facts_map(columns=("a", "b", "c")),
+        {},
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["columns"] == ("a", "c")
+
+
+def test_adv001_reports_the_honest_joint_support_count_and_omits_the_plain_one():
+    """`fingerprints` was `max(per-column)`, so a three-column composite that no single
+    query group supports reported `fingerprints: 1` — a number that reads as corroboration.
+    Only the joint count is reported now, under ADV004's and ADV008's existing key."""
+    proposals = propose_indexes(
+        [
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp1", "fp2")),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=80.0, fps=("fp1",)),
+        ],
+        _facts_map(),
+        {},
+        min_cost_share=0.01,
+    )
+    evidence = proposals[0].evidence
+    assert evidence["columns"] == ("status", "created_at")
+    assert evidence["co_occurring_fingerprints"] == 1
+    assert "fingerprints" not in evidence
+
+
 def test_confidence_is_high_only_with_stats_and_a_selective_leading_column():
     high = propose_indexes(
         [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
@@ -646,7 +721,7 @@ def test_a_plain_redundant_pair_is_high_confidence():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(existing)
+    proposals = propose_redundant_indexes(existing, hot_tables=frozenset(existing))
     assert codes(proposals) == ["ADV003"]
     assert proposals[0].confidence is Confidence.HIGH
     assert proposals[0].evidence["index"] == "idx_narrow"
@@ -655,6 +730,29 @@ def test_a_plain_redundant_pair_is_high_confidence():
     # drop the "both are plain" claim while leaving HIGH, with nothing failing.
     assert "plain" in proposals[0].rationale
     assert "partial" not in proposals[0].rationale
+
+
+def test_adv003_ignores_relations_the_workload_never_touched():
+    """Scope, for a rule whose output is `DROP INDEX`, must not be an accident.
+
+    `fetch_indexes` filters tables by *bare* name, so `schemas=("sales", "staging")` with
+    only `sales.orders` in the workload still returns `staging.orders`'s indexes. Iterating
+    every key of `existing` therefore emitted `DROP INDEX "staging"."idx_narrow"` for a
+    relation with zero recorded column usage — and whether it did depended on whether a
+    bare name happened to collide across two requested schemas. ADV002 was already scoped to
+    `hot_tables`; this asserts both members, so scoping that silently dropped the hot
+    relation as well would fail here rather than look like a pass.
+    """
+    sales, staging = Relation("sales", "orders"), Relation("staging", "orders")
+    redundant_pair = (
+        PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+        PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+    )
+    proposals = propose_redundant_indexes(
+        {sales: redundant_pair, staging: redundant_pair},
+        hot_tables=frozenset({sales}),
+    )
+    assert {p.ddl for p in proposals} == {'DROP INDEX "sales"."idx_narrow";'}
 
 
 def test_a_partial_narrow_index_is_never_called_redundant():
@@ -675,7 +773,7 @@ def test_a_partial_narrow_index_is_never_called_redundant():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    assert propose_redundant_indexes(existing) == []
+    assert propose_redundant_indexes(existing, hot_tables=frozenset(existing)) == []
 
 
 def test_a_partial_wider_index_does_not_supersede_a_plain_one():
@@ -694,7 +792,7 @@ def test_a_partial_wider_index_does_not_supersede_a_plain_one():
             ),
         )
     }
-    assert propose_redundant_indexes(existing) == []
+    assert propose_redundant_indexes(existing, hot_tables=frozenset(existing)) == []
 
 
 def test_a_wider_expression_index_does_not_supersede_a_plain_one():
@@ -719,7 +817,7 @@ def test_a_wider_expression_index_does_not_supersede_a_plain_one():
             ),
         )
     }
-    assert propose_redundant_indexes(existing) == []
+    assert propose_redundant_indexes(existing, hot_tables=frozenset(existing)) == []
 
 
 def test_a_narrow_expression_index_is_never_called_redundant():
@@ -744,7 +842,7 @@ def test_a_narrow_expression_index_is_never_called_redundant():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    assert propose_redundant_indexes(existing) == []
+    assert propose_redundant_indexes(existing, hot_tables=frozenset(existing)) == []
 
 
 def test_a_unique_prefix_index_is_never_called_redundant():
@@ -754,7 +852,7 @@ def test_a_unique_prefix_index_is_never_called_redundant():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    assert propose_redundant_indexes(existing) == []
+    assert propose_redundant_indexes(existing, hot_tables=frozenset(existing)) == []
 
 
 def test_redundant_index_ddl_uses_its_own_relations_schema_not_the_others():
@@ -770,7 +868,7 @@ def test_redundant_index_ddl_uses_its_own_relations_schema_not_the_others():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         ),
     }
-    proposals = propose_redundant_indexes(existing)
+    proposals = propose_redundant_indexes(existing, hot_tables=frozenset(existing))
     ddls = {p.ddl for p in proposals}
     assert ddls == {
         'DROP INDEX "sales"."idx_narrow";',
@@ -1051,7 +1149,7 @@ def test_select_star_does_not_attribute_a_schema_qualified_statement_to_the_wron
 
     Bare-name text matching cannot see the schema qualifier the statement itself carries —
     the same defect class Task 2 already fixed once on this branch for `star_tables`. Before
-    the fix, `mentions_table("orders", "select * from public.orders")` is True for *both*
+    the fix, a bare-name text match of `orders` against `select * from public.orders` hit *both*
     wide relations, so the evidence named a table (`staging.orders`) the statement never
     referenced at all.
     """
@@ -1261,6 +1359,64 @@ def test_prefix_collision_collapses_regardless_of_which_rule_appended_first():
     assert "ADV008" in forward[0].rationale
 
 
+#: Repository root, for the documentation claims the collapse layer is pinned against.
+_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_the_proposal_collapse_layer_is_documented_for_users():
+    """The collapse layer changes what `proposals` contains, so it cannot be internal-only.
+
+    It shipped documented nowhere user-facing, including the two facts an operator or a
+    `--json` consumer actually has to know: a rule can fire and contribute no proposal at
+    all, and the absorbed proposal's `evidence` is discarded while its rationale is kept.
+    Each claim is asserted separately, so documenting one and omitting another cannot pass.
+    """
+    readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "How overlapping proposals are reconciled" in readme
+    assert "Identical DDL collapses to one proposal" in readme
+    assert "A narrower index collapses into a wider one" in readme
+    assert "Same columns in a different order are both kept" in readme
+    assert "A rule can fire and still contribute no proposal" in readme
+    assert "discarded, not merged" in readme, "the evidence loss is not disclosed"
+    assert "Overlapping proposals are reconciled" in changelog
+
+
+def test_a_prefix_collapse_does_not_claim_the_absorbed_rule_endorsed_this_index():
+    """The absorbed proposal reached a *narrower* index, and the text must say which one.
+
+    "ADV007 reached the same index at high confidence" under `(customer_id, tenant_id,
+    created_at)` told the operator ADV007 endorsed a three-column index when ADV007 proposed
+    `(customer_id)` — and the borrowed sentences that follow ("Equality columns come first so
+    the range column can be scanned last", from an ADV001 absorbed into an ADV008 survivor
+    with no equality columns at all) then have no subject they are true of.
+    """
+    wide = _plain_index_proposal("ADV001", ("customer_id", "tenant_id", "created_at"))
+    narrow = _plain_index_proposal("ADV007", ("customer_id",))
+
+    survivor = PostgresWorkloadAdapter._collapse_index_prefixes([wide, narrow])[0]
+
+    assert "reached the same index" not in survivor.rationale
+    assert "ADV007 proposed the narrower (customer_id) on the same table" in survivor.rationale
+    # The absorbed rationale itself is still carried over, attributed — the collapse must
+    # change the attribution, not start discarding text.
+    assert "ADV007 rationale" in survivor.rationale
+
+
+def test_identical_ddl_dedupe_still_says_the_two_rules_reached_the_same_index():
+    """The other half of the split: for byte-identical DDL "the same index" is true by
+    construction, and must not be reworded into the prefix form, which would tell the
+    operator a narrower index was proposed when none was."""
+    survivor = _plain_index_proposal("ADV001", ("tenant_id",))
+    loser = _plain_index_proposal("ADV007", ("tenant_id",), Confidence.MEDIUM)
+
+    merged = PostgresWorkloadAdapter._dedupe_by_ddl([survivor, loser])
+
+    assert len(merged) == 1
+    assert "ADV007 reached the same index at medium confidence" in merged[0].rationale
+    assert "narrower" not in merged[0].rationale
+
+
 def test_adv001_and_adv008_same_column_set_different_order_are_disclosed_not_collapsed():
     """(status, region) and (region, status) are not redundant — different leading columns
     serve different probes — so neither `_collapse_index_prefixes` nor a future ADV003 pass
@@ -1452,7 +1608,9 @@ def test_fold_discarded_deduplicates_repeated_sentences_across_three_proposals()
         ddl="DDL",
     )
 
-    merged = PostgresWorkloadAdapter._fold_discarded(survivor, [loser_one, loser_two])
+    merged = PostgresWorkloadAdapter._fold_discarded(
+        survivor, [loser_one, loser_two], same_index=True
+    )
 
     assert merged.rationale.count(shared) == 1
     assert "Only ADV001 says this." in merged.rationale
@@ -1809,7 +1967,7 @@ def test_dropped_index_ddl_is_schema_qualified():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(redundant)
+    proposals = propose_redundant_indexes(redundant, hot_tables=frozenset(redundant))
     assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_narrow";'
 
 
@@ -1845,7 +2003,7 @@ def test_adv003_evidence_reports_the_bare_table_name_and_its_own_schema():
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(existing)
+    proposals = propose_redundant_indexes(existing, hot_tables=frozenset(existing))
     assert proposals[0].evidence["schema"] == "staging"
     assert proposals[0].evidence["table"] == "orders"
 
