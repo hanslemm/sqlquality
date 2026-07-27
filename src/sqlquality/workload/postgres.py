@@ -926,7 +926,14 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
         rows = self._run(CAP_WORKLOAD, (limit,))
         reset = self._run(CAP_STATS_RESET, ())
-        reset_at = reset[0][0] if reset and reset[0] else "an unknown time"
+        # Two different unknowns, one fallback. The statement can be denied (no row at all),
+        # or it can succeed and report SQL NULL — which is the *default* state of
+        # `pg_stat_database.stats_reset` for any database whose statistics have never been
+        # reset. The row is then `(None,)`: non-empty, hence truthy, so testing the row's
+        # emptiness printed "since stats reset at None". The value's nullness is what matters.
+        reset_at: object = "an unknown time"
+        if reset and reset[0] and reset[0][0] is not None:
+            reset_at = reset[0][0]
         # pg_stat_statements is cumulative since reset and carries no per-statement
         # timestamps before PG 17, so --since cannot be honored. Say so rather than
         # implying the requested window was applied.
