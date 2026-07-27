@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from urllib.parse import unquote, urlparse
 
 from sqlquality.models import (
     Aggregation,
@@ -31,6 +30,7 @@ from sqlquality.workload.base import (
     WorkloadAdapter,
 )
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
+from sqlquality.workload.secrets import clamp_timeout_ms, scrub, secrets_for
 
 CAP_WORKLOAD = "workload"
 CAP_STATS_RESET = "stats_reset"
@@ -80,8 +80,6 @@ _PG_FIELD_MAP = {
 _PG_PASSTHROUGH_FIELDS = frozenset(
     {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
 )
-#: profiles.yml keys whose values must never appear in any message we emit.
-_SECRET_FIELDS = frozenset({"password", "pass"})
 
 
 def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
@@ -100,69 +98,6 @@ def _dropped_pg_fields(fields: dict[str, str]) -> tuple[str, ...]:
     return tuple(
         sorted(k for k in fields if k not in _PG_FIELD_MAP and k not in _PG_PASSTHROUGH_FIELDS)
     )
-
-
-def _clamp_timeout_ms(timeout_s: int) -> int:
-    """Statement timeout in milliseconds, clamped into a sane range.
-
-    The CLI rejects an out-of-range value before reaching here; this is the safety net
-    for any other caller. Bounds come from workload.base so the two cannot drift.
-    """
-    return max(MIN_TIMEOUT_S, min(int(timeout_s), MAX_TIMEOUT_S)) * 1000
-
-
-#: A secret shorter than this cannot be redacted by substring replacement without
-#: destroying the message — a one-character password would blank every occurrence of that
-#: letter. When one actually appears, the driver's text is withheld rather than mangled.
-_MIN_SCRUBBABLE_SECRET = 4
-_WITHHELD = "(driver message withheld: it contained a value too short to redact safely)"
-
-
-def _secrets_for(params: ConnectionParams) -> tuple[str, ...]:
-    """Every value we know to be secret for this connection.
-
-    A DSN is added *and* its password extracted separately. The whole-DSN token only helps
-    if the driver echoes the connection string back verbatim, which real libpq errors do
-    not do — they report the offending value on its own. Without the extracted password,
-    DSN-based connections would have no effective protection at all.
-
-    The password is added in **both** its percent-encoded and decoded forms.
-    ``urlparse().password`` returns it still encoded, but libpq decodes a URI DSN before
-    authenticating, so the value a real auth-failure message carries is the decoded one:
-    for ``postgresql://u:p%40ss@h/db`` the driver reports ``p@ss`` while urlparse yields
-    ``p%40ss``, and a token of only the encoded form never matches. Any password containing
-    ``@``, ``:``, ``/``, ``%`` or a space hits this. The encoded form is kept too, since a
-    URI-parse error can echo the raw string back instead.
-    """
-    secrets = tuple(
-        value for key, value in params.fields.items() if key in _SECRET_FIELDS and value
-    )
-    if params.dsn:
-        secrets += (params.dsn,)
-        encoded = urlparse(params.dsn).password
-        if encoded:
-            secrets += (encoded,)
-            decoded = unquote(encoded)
-            if decoded != encoded:
-                secrets += (decoded,)
-    return secrets
-
-
-def _scrub(text: str, secrets: Iterable[str]) -> str:
-    """Replace any known secret occurring in ``text`` with a redaction marker.
-
-    Defence in depth for driver exceptions. libpq is not believed to echo a password, but
-    the auth-failure path — the most common real connect failure — cannot be exercised
-    without a live server, and we hold the secret anyway, so its absence can be guaranteed
-    instead of trusted.
-    """
-    present = [secret for secret in secrets if secret and secret in text]
-    if any(len(secret) < _MIN_SCRUBBABLE_SECRET for secret in present):
-        return _WITHHELD
-    scrubbed = text
-    for secret in present:
-        scrubbed = scrubbed.replace(secret, "***")
-    return scrubbed
 
 
 #: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
@@ -857,7 +792,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
         # Everything we know to be secret, so a driver exception can be proven clean rather
         # than trusted.
-        secrets = _secrets_for(params)
+        secrets = secrets_for(params)
 
         failure: str | None = None
         try:
@@ -874,10 +809,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 # is the wrong habit to establish in the one place we talk to a database.
                 cursor.execute(
                     "SELECT set_config('statement_timeout', %s, false)",
-                    (f"{_clamp_timeout_ms(timeout_s)}ms",),
+                    (
+                        f"{clamp_timeout_ms(timeout_s, minimum=MIN_TIMEOUT_S, maximum=MAX_TIMEOUT_S)}ms",
+                    ),
                 )
         except Exception as exc:
-            failure = _scrub(str(exc), secrets)
+            failure = scrub(str(exc), secrets)
         if failure is not None:
             # Raised after the handler, and scrubbed: Task 6 established that a dependency's
             # exception text is exactly where this class of leak hides, and that leaving the

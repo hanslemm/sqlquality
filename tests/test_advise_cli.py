@@ -348,8 +348,8 @@ def test_real_adapter_connection_failure_is_reported_once(monkeypatch):
         # test_workload_postgres.py::test_connect_scrubs_a_password_from_a_driver_failure.
         # A fixed message would make the "hunter2 not in output" assertion below unable to
         # fail: it would be asserting the absence of a string nothing ever produced.
-        # Measured: with `_scrub` replaced by the identity function, that assertion now
-        # fails, and with a fixed message it did not.
+        # Measured: with `scrub` (sqlquality.workload.secrets) replaced by the identity
+        # function, that assertion now fails, and with a fixed message it did not.
         raise RuntimeError(f"connection failed for conninfo {conninfo}")
 
     fake_psycopg.connect = explode  # type: ignore[attr-defined]
