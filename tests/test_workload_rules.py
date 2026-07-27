@@ -32,7 +32,6 @@ def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1"
         calls=10,
         cost_ms=cost_ms,
         cost_share=cost_share,
-        fingerprints=len(fps),
         fingerprint_ids=frozenset(fps),
     )
 
