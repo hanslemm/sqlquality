@@ -3,6 +3,14 @@
 Every test in this package is marked `integration` and deselected by default (see
 pyproject.toml's addopts), so a contributor without Docker sees a clean `uv run pytest`.
 
+Nothing here may fail, skip, or import psycopg at *module* scope. Conftest import happens
+during collection, before `addopts` deselects anything, so a module-scope
+`pytest.importorskip("psycopg")` turned the whole package into one collection-level skip for
+anyone who ran the plain `uv sync` CONTRIBUTING.md documents — psycopg is an optional extra,
+not part of the `dev` group. The result was `442 passed, 1 skipped` where the promise above
+says `deselected`. The guard belongs in `live_dsn`, which is reached only once a test has
+already been selected.
+
 Bring the server up with:
     docker compose -f tests/integration/docker-compose.yml up -d
     uv run pytest -m integration
@@ -14,8 +22,6 @@ import os
 from pathlib import Path
 
 import pytest
-
-pytest.importorskip("psycopg", reason="integration tests need the postgres extra")
 
 DEFAULT_DSN = "postgresql://postgres:sqlquality@127.0.0.1:55432/sqlquality_test"
 
@@ -38,7 +44,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 @pytest.fixture(scope="session")
 def live_dsn() -> str:
     """A reachable Postgres, or skip with an actionable message."""
-    import psycopg
+    psycopg = pytest.importorskip(
+        "psycopg", reason="integration tests need the postgres extra: uv sync --extra postgres"
+    )
 
     dsn = os.environ.get("SQLQUALITY_TEST_DSN", DEFAULT_DSN)
     try:
