@@ -104,6 +104,27 @@ class Workload:
         return sum(s.total_time_ms for s in self.stats)
 
 
+@dataclass(frozen=True, order=True)
+class Relation:
+    """A schema-qualified relation — the key every catalog fact is stored under.
+
+    Bare table names were the key until multi-schema support landed, and they aliased: two
+    schemas each holding an `orders` merged into one entry, so the last catalog row won the
+    row estimate while `qualify()` resolved columns against the union of both column sets.
+
+    ``order=True`` because the rules sort their output for canonical, run-to-run stable
+    report ordering, and a bare `sorted()` over relation keys has to work. Field order is
+    (schema, table) so that ordering groups a schema's tables together.
+    """
+
+    schema: str
+    table: str
+
+    def __str__(self) -> str:
+        """`schema.table` — how the relation appears in a proposal title or JSON key."""
+        return f"{self.schema}.{self.table}"
+
+
 class ColumnRole(str, Enum):
     EQUALITY = "equality"
     RANGE = "range"
@@ -117,7 +138,7 @@ class ColumnRole(str, Enum):
 
 @dataclass(frozen=True)
 class ColumnUsage:
-    table: str
+    relation: Relation
     column: str
     role: ColumnRole
     calls: int

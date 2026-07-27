@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from sqlglot import exp
-from sqlglot.errors import OptimizeError
+from sqlglot.errors import OptimizeError, SchemaError
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 
-from sqlquality.models import ColumnRole
+from sqlquality.models import ColumnRole, Relation
 
 #: Comparison nodes that an index can satisfy with an equality probe.
 _EQUALITY_NODES = (exp.EQ, exp.In)
@@ -81,30 +81,63 @@ def _role(column: exp.Column) -> ColumnRole | None:
     return comparison
 
 
-def _scope_tables(scope: Scope) -> dict[str, str]:
-    """Alias (or bare name) -> real table name, for one scope only.
+def resolve_relation(table: exp.Table, schema: dict) -> Relation | None:
+    """The schema-qualified relation for one `exp.Table`, or None if it is not attributable.
+
+    `table.db` is authoritative when present, but `qualify()` leaves it EMPTY for a bare
+    table reference even when the nested schema resolves the name unambiguously — and bare
+    references are the normal case, because production SQL relies on `search_path`. So the
+    fallback is a lookup in the schema map we actually introspected:
+
+    * exactly one introspected schema holds the name -> that is the schema, no guess involved
+    * more than one -> ambiguous, and attributing it would be a coin flip. `qualify()` will
+      normally have raised `SchemaError` before we get here, but a table whose columns are
+      never referenced by name reaches this line, so the guard is real.
+    * none -> the table lives outside the introspected schemas; the caller drops the column.
+    """
+    if table.db:
+        return Relation(schema=table.db, table=table.name)
+    owners = [name for name, tables in schema.items() if table.name in tables]
+    if len(owners) == 1:
+        return Relation(schema=owners[0], table=table.name)
+    return None
+
+
+def _scope_relations(scope: Scope, schema: dict) -> dict[str, Relation]:
+    """Alias (or bare name) -> schema-qualified relation, for one scope only.
 
     A sub-scope source (CTE, derived table) maps to a ``Scope``, not an ``exp.Table``.
     Columns resolving to one of those reference a projection rather than a base-table
     column, so they are omitted here and skipped — the sub-scope contributes its own base
-    tables when ``traverse()`` reaches it.
+    tables when ``traverse()`` reaches it. A source we cannot attribute to a schema is
+    omitted for the same reason: no key, no usage.
     """
-    return {
-        name: source.name for name, source in scope.sources.items() if isinstance(source, exp.Table)
-    }
+    resolved: dict[str, Relation] = {}
+    for name, source in scope.sources.items():
+        if isinstance(source, exp.Table):
+            relation = resolve_relation(source, schema)
+            if relation is not None:
+                resolved[name] = relation
+    return resolved
 
 
-def _record(seen: set[tuple[str, str, ColumnRole]], table: str | None, column: exp.Column) -> None:
-    """Add one (table, column, role) triple, skipping unattributable or unused columns."""
-    if not table or not column.name:
+def _record(
+    seen: set[tuple[Relation, str, ColumnRole]],
+    relation: Relation | None,
+    column: exp.Column,
+) -> None:
+    """Add one (relation, column, role) triple, skipping unattributable or unused columns."""
+    if relation is None or not column.name:
         return
     role = _role(column)
     if role is None:
         return
-    seen.add((table, column.name, role))
+    seen.add((relation, column.name, role))
 
 
-def _collect_dml(qualified: exp.Expression, seen: set[tuple[str, str, ColumnRole]]) -> None:
+def _collect_dml(
+    qualified: exp.Expression, seen: set[tuple[Relation, str, ColumnRole]], schema: dict
+) -> None:
     """Attribute the columns of an UPDATE/DELETE to its sole target table.
 
     ``qualify()`` leaves DML columns bare (``column.table == ''``) rather than raising.
@@ -113,37 +146,48 @@ def _collect_dml(qualified: exp.Expression, seen: set[tuple[str, str, ColumnRole
     instead of misattributed.
     """
     tables = tuple(qualified.find_all(exp.Table))
-    aliases = {t.alias_or_name: t.name for t in tables}
-    sole_table = tables[0].name if len(tables) == 1 else None
+    aliases: dict[str, Relation] = {}
+    for table in tables:
+        relation = resolve_relation(table, schema)
+        if relation is not None:
+            aliases[table.alias_or_name] = relation
+    sole = resolve_relation(tables[0], schema) if len(tables) == 1 else None
     for column in qualified.find_all(exp.Column):
-        _record(seen, aliases.get(column.table) if column.table else sole_table, column)
+        _record(seen, aliases.get(column.table) if column.table else sole, column)
 
 
 def extract_usage(
     tree: exp.Expression, dialect: str, schema: dict
-) -> tuple[tuple[str, str, ColumnRole], ...]:
-    """(table, column, role) triples for one query, deduplicated.
+) -> tuple[tuple[Relation, str, ColumnRole], ...]:
+    """(relation, column, role) triples for one query, deduplicated.
 
-    Stars are not expanded: a projected star tells us nothing about which columns are
-    filtered, and expanding it would drown the rollup in projection noise.
+    ``schema`` is nested — ``{schema_name: {table: {column: type}}}`` — because relations
+    are keyed by schema. Stars are not expanded: a projected star tells us nothing about
+    which columns are filtered, and expanding it would drown the rollup in projection noise.
+
+    ``SchemaError`` is caught alongside ``OptimizeError`` and re-raised as
+    ``UnqualifiableQuery``. It is *not* an ``OptimizeError`` subclass — its bases are
+    ``SqlglotError``, ``Exception`` — so catching only ``OptimizeError`` let an ambiguous
+    bare table name (`Ambiguous mapping for orders: sales, staging.`) escape `aggregate()`
+    and abort the whole run with a traceback.
     """
     try:
         qualified = qualify(tree.copy(), dialect=dialect, schema=schema, expand_stars=False)
-    except OptimizeError as exc:
+    except (OptimizeError, SchemaError) as exc:
         raise UnqualifiableQuery(str(exc)) from exc
 
-    seen: set[tuple[str, str, ColumnRole]] = set()
+    seen: set[tuple[Relation, str, ColumnRole]] = set()
     root = build_scope(qualified)
     if root is None:
         # build_scope() returns None for UPDATE/DELETE — they are not SELECT-rooted.
-        _collect_dml(qualified, seen)
+        _collect_dml(qualified, seen, schema)
     else:
         # Resolve aliases per scope, never with one flat map over the whole tree. Two
         # different tables in different scopes can share an alias, and a flat map keeps
         # whichever `find_all` visited last — silently attributing an outer filter to an
         # inner table and losing the outer one entirely.
         for scope in root.traverse():
-            aliases = _scope_tables(scope)
+            aliases = _scope_relations(scope, schema)
             for column in scope.columns:
                 _record(seen, aliases.get(column.table), column)
     return tuple(sorted(seen, key=lambda triple: (triple[0], triple[1], triple[2].value)))
