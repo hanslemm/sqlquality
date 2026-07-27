@@ -525,6 +525,11 @@ def test_a_plain_redundant_pair_is_high_confidence():
     assert codes(proposals) == ["ADV003"]
     assert proposals[0].confidence is Confidence.HIGH
     assert proposals[0].evidence["index"] == "idx_narrow"
+    # Pin the claim, not just the confidence. Deleting the old MEDIUM test removed the only
+    # assertion on this rationale's wording, so a future edit could reintroduce a hedge, or
+    # drop the "both are plain" claim while leaving HIGH, with nothing failing.
+    assert "plain" in proposals[0].rationale
+    assert "partial" not in proposals[0].rationale
 
 
 def test_a_partial_narrow_index_is_never_called_redundant():
@@ -567,20 +572,51 @@ def test_a_partial_wider_index_does_not_supersede_a_plain_one():
     assert propose_redundant_indexes(existing) == []
 
 
-def test_an_expression_bearing_pair_is_skipped():
+def test_a_wider_expression_index_does_not_supersede_a_plain_one():
+    """The wider index must be strictly wider, or the length guard skips the pair anyway.
+
+    An earlier version of this test gave both indexes one column, so
+    `len(other.columns) > len(narrow.columns)` was already False and it passed whether or
+    not the has_expressions filter existed at all.
+    """
     existing = {
         "orders": (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
             PgIndex(
                 "idx_expr",
+                ("status", "note"),
+                False,
+                False,
+                5,
+                1,
+                has_expressions=True,
+                definition="CREATE INDEX idx_expr ON orders (status, note, lower(note))",
+            ),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_a_narrow_expression_index_is_never_called_redundant():
+    """The other direction, and the reason it matters.
+
+    `columns` understates an expression index — the expression positions contribute no
+    name — so a narrow one may index something the wider one does not. Dropping it on a
+    column-list comparison would discard an index nothing else provides.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_narrow_expr",
                 ("status",),
                 False,
                 False,
                 5,
                 1,
                 has_expressions=True,
-                definition="CREATE INDEX idx_expr ON orders (status, lower(note))",
+                definition="CREATE INDEX idx_narrow_expr ON orders (status, lower(note))",
             ),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
     assert propose_redundant_indexes(existing) == []
