@@ -171,6 +171,53 @@ def test_markdown_discloses_the_window_and_the_skips():
     assert "4 ambiguous" in md
 
 
+def _eight_groups_two_ambiguous():
+    """Eight query groups of which two were dropped as ambiguous — six were understood."""
+    workload = Workload(
+        stats=tuple(
+            QueryStat(fingerprint=f"fp{i}", sql="select 1", calls=1, total_time_ms=1.0)
+            for i in range(8)
+        ),
+        window_description="since stats reset at 2026-07-01",
+        skipped_unparseable=1,
+        skipped_noise=2,
+    )
+    aggregation = Aggregation(
+        usage=(),
+        total_cost_ms=8.0,
+        skipped_unqualifiable=0,
+        tables=frozenset(),
+        skipped_ambiguous=2,
+    )
+    return workload, aggregation
+
+
+def test_all_three_surfaces_report_the_same_analyzed_count():
+    """The terminal said "analyzed 6 of 8" while markdown said "analyzed: 8" and the JSON
+    payload carried 8 under a key named `analyzed` — directly above its own "2 ambiguous".
+
+    The README promises the terminal, markdown *and* JSON paths all print how many query
+    groups were actually understood, and nothing pinned the number on two of the three: it
+    was the sole mutation to survive a 47-mutation whole-branch sweep. All three are asserted
+    here together, so fixing one surface and leaving another cannot pass.
+    """
+    from sqlquality.cli import _coverage_line
+
+    workload, aggregation = _eight_groups_two_ambiguous()
+    terminal = _coverage_line(workload, aggregation)
+    md = render_advise_markdown(
+        PROPOSALS, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    payload = advise_payload(
+        PROPOSALS, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "analyzed 6 of 8 query group(s)" in terminal
+    assert "**Query groups analyzed:** 6 of 8" in md
+    assert payload["analyzed"]["query_groups"] == 6
+    # The window total is still available, just no longer labelled "analyzed".
+    assert payload["analyzed"]["query_groups_in_window"] == 8
+
+
 def test_markdown_escapes_an_evidence_key_as_well_as_its_value():
     """Keys reach the output too. Static today, but the asymmetry is worth closing."""
     hostile = [

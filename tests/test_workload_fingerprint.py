@@ -100,6 +100,30 @@ def test_ingest_groups_by_fingerprint_and_sums_cost():
     assert "999" not in workload.stats[0].sql
 
 
+def test_query_stat_sql_is_the_reserialised_redacted_tree_not_the_row_text():
+    """Pins the premise `_wide_relations_touched` relies on, which its docstring once got
+    backwards.
+
+    That function re-parses `stat.sql` with no fallback, and justified the missing fallback
+    with "it is the same text `ingest()` already parsed". It is not: `stat.sql` is sqlglot's
+    re-serialisation of the *redacted* tree, so the real guarantee is that sqlglot re-parses
+    its own generated SQL — measured, not inherited from the row having parsed. A comment
+    that justifies deleting code with the wrong reason is how the code comes back, so the
+    two properties it actually depends on are asserted here: the text is not the row's, and
+    it round-trips.
+    """
+    raw = "select id from t where email = 'a@b.de' and n > 42"
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql=raw, calls=1, total_time_ms=1.0),), window_description="w"
+    )
+    stat = ingest(fetch, "postgres").stats[0]
+    assert stat.sql != raw, "stat.sql is the row's own text — the false premise, made true"
+    assert "a@b.de" not in stat.sql
+    # Round-trip: parsing sqlglot's own output under the same dialect must succeed, since
+    # ADV006 does exactly this and has no fallback if it raises.
+    assert parse(stat.sql, "postgres") is not None
+
+
 def test_ingest_counts_unparseable_and_noise_without_raising():
     fetch = WorkloadFetch(
         rows=(

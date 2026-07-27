@@ -47,11 +47,6 @@ def mentions_identifier(name: str, text: str) -> bool:
     return _identifier_pattern(name).search(text) is not None
 
 
-def mentions_table(name: str, sql: str) -> bool:
-    """True if a query mentions this table. See :func:`mentions_identifier`."""
-    return mentions_identifier(name, sql)
-
-
 def star_tables(workload: Workload, schema: dict, dialect: str = "postgres") -> frozenset[Relation]:
     """Relations a `SELECT *` query group merely *mentions*, matched against ``schema``.
 

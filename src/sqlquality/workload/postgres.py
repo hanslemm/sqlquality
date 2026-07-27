@@ -267,13 +267,6 @@ def _sentences(text: str) -> list[str]:
     return [s for s in (chunk.strip() for chunk in _SENTENCE_BOUNDARY.split(text.strip())) if s]
 
 
-#: The schema `WorkloadAdapter.schemas` defaults to before the CLI resolves `--schema`.
-#: Each rule now derives its DDL's schema from the `Relation` it is proposing for, since a
-#: single run-wide schema stopped being meaningful once more than one schema is in play —
-#: this constant only documents the adapter-level default, not a per-rule fallback.
-DEFAULT_SCHEMA = "public"
-
-
 def _qualified(schema: str, name: str) -> str:
     """`"schema"."name"` — both parts quoted.
 
@@ -304,6 +297,25 @@ def propose_indexes(
     unknowable, so it is not made and confidence is capped at LOW. ``existing`` being
     empty cannot distinguish "no such index" from "could not look", which is exactly the
     conflation the row-estimate branch below exists to prevent.
+
+    Extending the composite requires *joint* support — every added column sharing a query
+    group with every column already chosen, tracked as a running intersection of
+    ``fingerprint_ids`` — exactly as ADV008 does. Without it this rule welded together the
+    hottest equality columns and the hottest range column from a relation whether or not any
+    single query used them together, and `cost_share` could not filter that out because it is
+    the *max* over the chosen columns, not the min. Measured case: a `DECLARE ... CURSOR FOR
+    SELECT ... WHERE tenant_id = $1` read costing 0.003% of the window put `tenant_id` into
+    position 2 of an otherwise correct `(customer_id, created_at)`, and
+    `(customer_id, tenant_id, created_at)` cannot satisfy the hot query's `ORDER BY
+    created_at` that `(customer_id, created_at)` serves — a strictly worse index, emitted at
+    HIGH, for the query carrying most of the workload's cost.
+
+    Evidence carries `co_occurring_fingerprints` (the size of that intersection) and
+    deliberately no plain `fingerprints` count, matching ADV004 and ADV008 — see
+    `propose_grouping_indexes` for the principle. A rule whose claim is about columns
+    appearing *together* must not also report a per-column count: reports render evidence as
+    bare `k=v` pairs with no per-rule text, so `fingerprints: 1` beside a three-column index
+    read as "one query group uses all three" when zero did.
     """
     proposals: list[Proposal] = []
     for relation, items in sorted(_by_relation(usage).items()):
@@ -333,13 +345,30 @@ def propose_indexes(
         # even suppress: `_is_prefix(("id","id"), ("id",))` is False, so the table's own
         # primary key did not match. Equality wins because equality-first is the B-tree
         # ordering the whole rule is built on.
+        #
+        # `shared` is the running intersection of the chosen columns' query groups, so a
+        # column only joins the composite when some single query group filters on it
+        # *together with* everything already chosen — the same guard, for the same reason,
+        # as `propose_grouping_indexes`. A candidate rejected for lack of joint support does
+        # not narrow `shared`, so a later candidate that does co-occur with the chosen set
+        # can still join it.
         chosen: list[ColumnUsage] = []
         picked: set[str] = set()
+        shared: frozenset[str] = frozenset()
         for item in candidate:
             if item.column in picked:
                 continue
-            picked.add(item.column)
+            if not chosen:
+                chosen.append(item)
+                picked.add(item.column)
+                shared = item.fingerprint_ids
+                continue
+            overlap = shared & item.fingerprint_ids
+            if not overlap:
+                continue
             chosen.append(item)
+            picked.add(item.column)
+            shared = overlap
         if not chosen:
             continue
 
@@ -441,7 +470,14 @@ def propose_indexes(
                     "roles": tuple(i.role.value for i in chosen),
                     "cost_share": cost_share,
                     "calls": max(i.calls for i in chosen),
-                    "fingerprints": max(i.fingerprints for i in chosen),
+                    #: How many query groups filter on *every* chosen column together — the
+                    #: running intersection, not a per-column count. Same name and same
+                    #: meaning as ADV004's and ADV008's identical field, and deliberately no
+                    #: plain `fingerprints` key beside it: this proposal is justified by the
+                    #: columns appearing together, so a per-column count rendered as a bare
+                    #: `k=v` pair next to the joint one can only read as support that is not
+                    #: there.
+                    "co_occurring_fingerprints": len(shared),
                     "row_estimate": rows,
                     "leading_ndv": leading_ndv,
                     "partial_indexes_skipped": partial_skipped,
@@ -785,6 +821,8 @@ def propose_unused_indexes(
 
 def propose_redundant_indexes(
     existing: Mapping[Relation, Sequence[PgIndex]],
+    *,
+    hot_tables: frozenset[Relation],
 ) -> list[Proposal]:
     """ADV003 — an index whose column list is a strict prefix of another's is redundant.
 
@@ -795,9 +833,20 @@ def propose_redundant_indexes(
     "serves the same lookups" is simply false, since the partial index exists precisely to
     serve a subset the wider index serves differently. Emitting that at MEDIUM would still
     be advising a `DROP INDEX` with no basis: "probably wrong" is not a confidence level.
+
+    Scoped to ``hot_tables`` — the relations the workload was actually observed using —
+    exactly as ADV002 is, and not to every key in ``existing``. ``fetch_indexes`` filters
+    tables by *bare* name, so with two requested schemas holding a same-named table it
+    returns rows for relations the run never analysed; iterating all of ``existing`` made
+    whether a schema got `DROP INDEX` hygiene depend on whether one of its tables happened to
+    collide by name with a hot table in another requested schema. Prefix redundancy is
+    provable from the catalog alone, so the advice was not *wrong* — but arbitrary scope for
+    a rule that emits `DROP` is not a scope, and this rule should be able to say which
+    workload its recommendation came from.
     """
     proposals: list[Proposal] = []
-    for relation, indexes in sorted(existing.items()):
+    for relation in sorted(hot_tables):
+        indexes = existing.get(relation, ())
         for narrow in indexes:
             # A partial or expression index is not comparable on column lists alone: the
             # predicate or the expression is the whole point of it. Skipping the pair is
@@ -1024,8 +1073,9 @@ def _wide_relations_touched(
 ) -> tuple[Relation, ...]:
     """Which of the *wide* relations this one statement provably references.
 
-    Bare-name text matching was the original approach — `mentions_table(relation.table,
-    sql)` — and it is exactly right for an *unqualified* reference: real SQL says `from
+    Bare-name text matching was the original approach — a `mentions_identifier` test of
+    `relation.table` against the statement text, since deleted along with its `mentions_table`
+    alias — and it is exactly right for an *unqualified* reference: real SQL says `from
     orders`, not `from public.orders`. Its failure mode is the same one Task 2 already fixed
     once on this branch for `star_tables`: text matching cannot see a schema qualifier, so
     `select * from public.orders` matched *both* `public.orders` and `staging.orders`
@@ -1042,16 +1092,21 @@ def _wide_relations_touched(
     here to the (usually much smaller) wide set, since that is all this rule can ever report
     on.
 
-    No parse-failure fallback: `sql` is always `stat.sql` from `workload.stats`, and
-    `ingest()` never adds a statement to `stats` unless `parse(row.sql, dialect)` already
-    succeeded there — an unparseable row is counted as `skipped_unparseable` and dropped
-    before a `QueryStat` is ever built. Re-parsing that same text with the same dialect here
-    cannot fail differently. A bare-name text-match fallback used to sit here for "just in
-    case", but it reintroduced the exact over-attribution this function exists to fix —
+    No parse-failure fallback. The premise is *not* "the same text parsed twice": `sql` is
+    `stat.sql`, which is sqlglot's own re-serialisation of the **redacted** tree, not the
+    `row.sql` that `ingest()` parsed — different text, so "it already parsed once" would not
+    be an argument. The real premise is that sqlglot re-parses its own generated SQL under
+    the dialect that generated it, which was measured rather than assumed: 0 reparse failures
+    across the 14-statement adversarial corpus, redaction included. `ingest()` also
+    guarantees the *original* row parsed (an unparseable row is counted as
+    `skipped_unparseable` and never becomes a `QueryStat`), so the input to redaction was
+    always a real tree. A bare-name text-match fallback used to sit here for "just in case",
+    but it reintroduced the exact over-attribution this function exists to fix —
     `select * from public.orders` matching both `public.orders` and `staging.orders` — for a
     branch nothing can reach. Same reasoning as `_dedupe_by_ddl`'s deleted tie-break: a
     fallback that cannot be reached is worse than none, since it reads as evidence the case
-    is handled when the real handling is "it cannot happen".
+    is handled when the real handling is "it cannot happen". If a round-trip ever did fail,
+    it raises here instead of silently mis-attributing evidence — the direction to fail in.
     """
     by_bare_name: dict[str, list[Relation]] = {}
     for relation in wide:
@@ -1155,21 +1210,39 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # `total_exec_time` requires PostgreSQL 13+; it was `total_time` on 12 and older,
         # both long past end-of-life. The privilege hint states the floor.
         #
-        # Deliberately NOT filtered on `s.toplevel`: under `pg_stat_statements.track = all`,
-        # a `COPY (SELECT ...) TO ...` produces two rows for one execution — the verbatim
-        # top-level utility statement and its normalised nested query — which `unwrap`/
-        # redaction give different fingerprints, so the same execution is counted as two
-        # query groups at roughly twice its true cost (documented in the README's
-        # "Prerequisites and limits"). Filtering to `s.toplevel` would fix that, but
-        # `toplevel = false` is also the *only* way Postgres ever exposes the SQL inside a
-        # PL/pgSQL function body — verified live: the filter made a genuinely hot,
-        # function-wrapped query (3x the cost of the next candidate) vanish from evidence
-        # entirely, while the surrounding `SELECT my_function()` call sites stayed counted
-        # as zero-column-usage cost with no signal that anything was dropped. No `s.query`
-        # text pattern separates a COPY's nested duplicate from a function's nested
-        # statement (both are recorded as the bare inner SELECT once normalised, indistin-
-        # guishable at this point), so the double-count is accepted rather than risking a
-        # confidently wrong proposal — worse than an inflated cost_share.
+        # Deliberately NOT filtered on `s.toplevel`, and the reason is a *cost*, not an
+        # impossibility. Under `pg_stat_statements.track = all` a `COPY (SELECT ...) TO ...`
+        # produces two rows for one execution — the verbatim top-level utility statement and
+        # its normalised nested query — which `unwrap`/redaction give different fingerprints,
+        # so the same execution is counted as two query groups at roughly twice its true
+        # cost (documented in the README's "Prerequisites and limits").
+        #
+        # A blanket `AND s.toplevel` is not the answer: `toplevel = false` is the *only* way
+        # Postgres ever exposes the SQL inside a PL/pgSQL function body, and verified live
+        # the blanket filter made a genuinely hot, function-wrapped query (3x the cost of the
+        # next candidate) vanish from evidence entirely while the surrounding
+        # `SELECT my_function()` call sites stayed counted as zero-column-usage cost with no
+        # signal that anything was dropped — a confidently wrong proposal, worse than an
+        # inflated cost_share.
+        #
+        # A *narrow* predicate, however, does exist and does work. Measured on PostgreSQL 16
+        # under `track = all`, the two nested forms are textually distinguishable: a COPY's
+        # nested row KEEPS its wrapper (`COPY (SELECT ... $1) TO STDOUT`) while a PL/pgSQL
+        # body is recorded bare (`SELECT count(*) FROM ... WHERE status = $1`), so
+        # `NOT (s.toplevel = false AND s.query ~* '^\\s*COPY\\s*\\(')` removed exactly the
+        # duplicate (4 rows -> 3) and left the function body untouched. It is declined for a
+        # stated price rather than because nothing could work: *naming* `s.toplevel` at all
+        # requires PostgreSQL 14 (the column does not exist on 13), and the documented floor
+        # is 13+, so a PG13 user would lose the entire workload capability — one missing
+        # column costing the whole run — to remove a 2x over-count of one statement form
+        # under a non-default setting. That trade is why the filter is absent; if the floor
+        # ever rises to 14, this is the predicate to add.
+        #
+        # Not fixable by any predicate, and documented alongside the COPY case: under
+        # `track = all` every PL/pgSQL call is counted twice — measured, `SELECT lc.hot()` at
+        # 68.21 ms plus its body at 67.67 ms for one execution — which roughly halves every
+        # `cost_share` in the run. The call carries the cost while the body carries the
+        # predicates, so excluding either row loses something real.
         CAP_WORKLOAD: """
             SELECT s.query, s.calls, s.total_exec_time, s.rows
             FROM pg_stat_statements s
@@ -1428,8 +1501,15 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # See the identical note in fetch_table_facts: the table parameter is bare names,
         # so a same-named table in a *different requested* schema not itself in
         # `relations` can come back too — `n.nspname = ANY(%s)` still excludes a schema we
-        # were not asked to introspect at all. That row's relation key then simply has no
-        # consumer.
+        # were not asked to introspect at all.
+        #
+        # Unlike fetch_table_facts, this method does NOT drop those rows: `_covered` needs
+        # only the relations it is asked about, but the returned mapping is also handed
+        # whole to ADV002 and ADV003, which iterate it. Both are therefore scoped to
+        # `aggregation.tables` by their callers rather than to `existing`'s key set — an
+        # earlier version of this comment claimed the over-fetched rows had "no consumer",
+        # and ADV003 was that consumer, emitting `DROP INDEX` for relations the workload
+        # never touched whenever a bare name collided across two requested schemas.
         wanted = sorted({relation.table for relation in relations})
         grouped: dict[tuple[Relation, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), wanted)):
@@ -1513,9 +1593,43 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     }
 
     @classmethod
-    def _fold_discarded(cls, survivor: Proposal, discarded: Sequence[Proposal]) -> Proposal:
+    def _attribution(cls, discarded: Proposal, *, same_index: bool) -> str:
+        """How the folded text introduces a discarded proposal — one phrasing per collapse
+        kind, because the two collapses did different things to it.
+
+        `_dedupe_by_ddl` collapses byte-identical DDL, so "reached the same index" is true by
+        construction. `_collapse_index_prefixes` collapses a *narrower* proposal into a wider
+        one, where it is never true: the operator was told "ADV007 reached the same index at
+        high confidence" under `Add index on sales.orders(customer_id, tenant_id,
+        created_at)` when ADV007 proposed `(customer_id)` — an endorsement of a three-column
+        index that no rule ever made, in the paragraph someone reads before running DDL. The
+        second symptom is the same sentence: an ADV008 survivor carried ADV001's "Equality
+        columns come first so the range column can be scanned last" with no equality columns
+        anywhere in it. Naming the narrower column list gives the borrowed sentences the
+        subject they are actually about.
+        """
+        if same_index:
+            return f"{discarded.code} reached the same index"
+        key = cls._index_creation_columns(discarded)
+        # `None` is unreachable from `_collapse_index_prefixes`, which only ever absorbs
+        # proposals this same function accepted — but the fallback keeps the sentence
+        # grammatical rather than raising in a report renderer if a future caller differs.
+        narrower = f"({', '.join(key[1])})" if key else "a narrower index"
+        return (
+            f"{discarded.code} proposed the narrower {narrower} on the same table, which this "
+            f"index's leading columns already serve, and said of it"
+        )
+
+    @classmethod
+    def _fold_discarded(
+        cls, survivor: Proposal, discarded: Sequence[Proposal], *, same_index: bool
+    ) -> Proposal:
         """Attach every discarded proposal's distinguishing rationale, attributed, to the
         survivor's.
+
+        ``same_index`` distinguishes the two callers — see `_attribution`. It is required
+        rather than defaulted: a new collapse rule that forgets to say which kind it is would
+        otherwise silently claim an endorsement it did not get.
 
         `_dedupe_by_ddl` and `_collapse_index_prefixes` each throw a whole `Proposal` away
         and keep only one rationale where two, or more, existed. Diffing the texts to keep
@@ -1541,15 +1655,15 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         for p in discarded:
             fresh = [s for s in _sentences(p.rationale) if s not in seen]
             seen.update(fresh)
+            attribution = cls._attribution(p, same_index=same_index)
             if fresh:
                 notes.append(
-                    f" {p.code} reached the same index at {p.confidence.value} confidence: "
-                    f"{' '.join(fresh)}"
+                    f" {attribution} at {p.confidence.value} confidence: {' '.join(fresh)}"
                 )
             else:
                 notes.append(
-                    f" {p.code} reached the same index at {p.confidence.value} confidence, "
-                    "stating nothing beyond what is already covered above."
+                    f" {attribution} at {p.confidence.value} confidence, stating nothing "
+                    "beyond what is already covered above."
                 )
         return replace(survivor, rationale=survivor.rationale + "".join(notes))
 
@@ -1605,7 +1719,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             # matter to a reader the way which *code* is kept does.
             ranked = sorted(group, key=rank)
             winner, *losers = ranked
-            merged[ddl] = cls._fold_discarded(winner, losers)
+            merged[ddl] = cls._fold_discarded(winner, losers, same_index=True)
 
         result: list[Proposal] = []
         emitted: set[str] = set()
@@ -1712,7 +1826,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         result = list(proposals)
         for j, absorbed in absorbed_into.items():
             ordered = sorted(absorbed, key=lambda p: (p.code, p.title, p.ddl or ""))
-            result[j] = cls._fold_discarded(proposals[j], ordered)
+            result[j] = cls._fold_discarded(proposals[j], ordered, same_index=False)
 
         drop = set(covers)
         return [p for idx, p in enumerate(result) if idx not in drop]
@@ -1829,7 +1943,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 workload, facts, min_cost_share=min_cost_share, dialect=self.engine
             ),
             *propose_unused_indexes(existing, hot_tables=aggregation.tables),
-            *propose_redundant_indexes(existing),
+            *propose_redundant_indexes(existing, hot_tables=aggregation.tables),
         ]
         proposals = self._dedupe_by_ddl(proposals)
         proposals = self._collapse_index_prefixes(proposals)

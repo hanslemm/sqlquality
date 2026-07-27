@@ -65,10 +65,18 @@ def test_out_of_range_timeout_exit_2_before_connecting(monkeypatch):
         assert "between 1 and 3600" in result.output
 
 
-def test_two_schemas_are_accepted(monkeypatch):
-    """Facts, NDV maps, index lists and qualify() are all keyed by `Relation` now, so a
-    second `--schema` no longer aliases same-named tables across schemas together."""
-    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+def test_two_schemas_are_accepted_and_both_reach_every_catalog_query(monkeypatch):
+    """A second `--schema` is accepted *and* forwarded to every schema-scoped statement.
+
+    The docstring used to claim this test proved `Relation` keying prevented cross-schema
+    aliasing; all it actually asserted was `exit_code == 0`, and `_stub_adapter` overwrote
+    `adapter.schemas` with `("public",)` so it could not have proved anything about
+    `--schema` at all. It now asserts the bind parameter of each schema-scoped query, and
+    names both members rather than checking that the list is non-empty.
+    """
+    recorded = _stub_adapter(
+        monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]}
+    )
     result = runner.invoke(
         app,
         [
@@ -83,6 +91,43 @@ def test_two_schemas_are_accepted(monkeypatch):
         ],
     )
     assert result.exit_code == 0
+    # Every statement that takes a schema list: the qualify() schema map, table facts, NDV
+    # and the existing-index catalog. Each is checked separately — one of the four carrying
+    # both schemas while another silently narrowed to one is the failure being excluded.
+    # One marker per statement, each unique to it: `pg_class` would have matched both the
+    # table-facts and the index statement and so could not tell which one narrowed.
+    for marker in ("information_schema.columns", "pg_total_relation_size", "pg_stats", "pg_index"):
+        binds = [bind for sql, bind in recorded if marker in sql]
+        assert binds, f"no query ran against {marker}"
+        for bind in binds:
+            assert bind[0] == ["sales", "staging"], f"{marker} received {bind[0]!r}"
+
+
+def test_the_resolved_schemas_reach_the_existing_index_query(monkeypatch):
+    """`adapter.schemas` is the *only* route `--schema` takes into `fetch_indexes`.
+
+    `fetch_schema`, `fetch_table_facts` and `fetch_ndv` are handed the resolved tuple
+    directly by the CLI; `propose()` reads `self.schemas` instead. Drop the CLI's
+    `adapter.schemas = schemas` assignment and `fetch_indexes` silently queries `("public",)`
+    — which returns zero rows *without raising*, so nothing lands in `degraded`,
+    `have_index_data` stays True, and ADV001/ADV007 then claim "no existing index leads with
+    them" at HIGH for tables that are fully indexed while ADV002/ADV003 go silent. That is a
+    check that could not run, reported as a check that ran and passed.
+    """
+    recorded = _stub_adapter(
+        monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]}
+    )
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--schema", "sales", "--schema", "staging"],
+    )
+    assert result.exit_code == 0
+    index_binds = [bind for sql, bind in recorded if "pg_index" in sql]
+    assert index_binds, "the existing-index catalog query never ran"
+    assert all(bind[0] == ["sales", "staging"] for bind in index_binds), (
+        f"fetch_indexes was called with {[bind[0] for bind in index_binds]!r} — the CLI's "
+        "resolved --schema tuple never reached the adapter"
+    )
 
 
 def test_duplicate_schemas_are_deduplicated():
@@ -113,7 +158,7 @@ def test_analyzed_count_excludes_ambiguous_statements():
 
 def test_coverage_warning_fires_when_ambiguity_alone_crosses_the_threshold():
     """100 stats, 25 ambiguous, nothing else unexplained: the true unexplained share is
-    25/100 = 25%, above the 20% low-coverage threshold. Before `_analyzed_count` subtracted
+    25/100 = 25%, above the 20% low-coverage threshold. Before `analyzed_query_groups` subtracted
     `skipped_ambiguous`, the 25 ambiguous statements were counted as both analyzed (inflating
     `considered`) and unexplained, diluting the share to exactly 20% — at the threshold, not
     above it — so the warning never fired precisely when ambiguity was the whole reason
@@ -272,13 +317,22 @@ def test_good_coverage_does_not_warn(monkeypatch):
 
 
 def _stub_adapter(monkeypatch, rows):
-    """Replace connect() with an injected fake querier."""
+    """Replace connect() with an injected fake querier. Returns the recorded `(sql, bind)`.
+
+    Deliberately does **not** assign `self.schemas`. It used to hard-code `("public",)`,
+    *after* the CLI had already resolved `--schema` onto the adapter — so every test in this
+    module ran `fetch_indexes(("public",), ...)` no matter what schemas it passed, and
+    deleting the CLI's `adapter.schemas = schemas` line left the whole default suite green.
+    The adapter's own `__init__` default is `("public",)` already, so single-schema tests are
+    unaffected; multi-schema ones now exercise the real wiring.
+    """
     from sqlquality.workload.postgres import PostgresWorkloadAdapter
 
-    def fake_connect(self, params, timeout_s):
-        self.schemas = ("public",)
+    recorded: list[tuple[str, object]] = []
 
+    def fake_connect(self, params, timeout_s):
         def query(sql, bind):
+            recorded.append((sql, bind))
             for marker, result in rows.items():
                 if marker in sql:
                     return result
@@ -287,6 +341,7 @@ def _stub_adapter(monkeypatch, rows):
         self._query = query
 
     monkeypatch.setattr(PostgresWorkloadAdapter, "connect", fake_connect)
+    return recorded
 
 
 WIDE_COLUMNS = [
