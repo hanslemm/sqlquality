@@ -1839,6 +1839,57 @@ def test_adv008_groups_only_columns_that_co_occur_in_one_query():
     assert proposals[0].evidence["columns"] == ("tenant_id",)
 
 
+def test_adv008_requires_joint_support_not_just_pairwise_with_the_seed():
+    """A transitive chain must not be welded into one composite.
+
+    `a` co-occurs with `b` in fp1 and with `c` in fp2, but `b` and `c` never co-occur with
+    each other — no query in the workload groups by `a, b, c` together. Checking each
+    candidate only against the seed's fingerprints (the old, pairwise rule) let `c` join
+    once `b` had already been accepted, on the strength of `a`'s membership in fp2 — even
+    though the *composite so far*, `(a, b)`, is never grouped by alongside `c`. Requiring the
+    running intersection to stay non-empty catches this: after `b` joins, the shared set
+    narrows to fp1 alone, and `c` (only in fp2) can no longer extend it.
+    """
+    relation = Relation("public", "events")
+    usage = (
+        _usage(relation, "a", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1", "fp2")),
+        _usage(relation, "b", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp1",)),
+        _usage(relation, "c", ColumnRole.GROUP, cost_share=0.5, cost_ms=300.0, fps=("fp2",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["columns"] == ("a", "b")
+    assert proposals[0].evidence["columns"] != ("a", "b", "c")
+
+
+def test_adv008_reports_the_honest_joint_support_count():
+    """`co_occurring_fingerprints` must report the running intersection's size, not the
+    per-column `fingerprints` max, which would (falsely) read as "two query groups back this
+    three-column composite" when the joint support for `(a, b)` is exactly one query group."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(relation, "a", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1", "fp2")),
+        _usage(relation, "b", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp1",)),
+        _usage(relation, "c", ColumnRole.GROUP, cost_share=0.5, cost_ms=300.0, fps=("fp2",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["co_occurring_fingerprints"] == 1
+
+
+def test_adv008_composite_is_just_the_seed_when_it_shares_nothing_with_any_other_column():
+    relation = Relation("public", "events")
+    usage = (
+        _usage(relation, "a", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)),
+        _usage(relation, "b", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp2",)),
+        _usage(relation, "c", ColumnRole.GROUP, cost_share=0.5, cost_ms=300.0, fps=("fp3",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["columns"] == ("a",)
+    assert proposals[0].evidence["co_occurring_fingerprints"] == 1
+
+
 def test_adv008_is_silent_when_an_index_already_leads_with_the_grouping_columns():
     relation = Relation("public", "events")
     usage = (

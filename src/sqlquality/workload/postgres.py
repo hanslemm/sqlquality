@@ -580,6 +580,14 @@ def propose_grouping_indexes(
     *order* is inferred from cost, not read from the query — redaction and fingerprinting do
     not preserve each column's position in the GROUP BY clause — and the rationale says so,
     because getting the order wrong makes the index serve only its leading column.
+
+    Extension requires *joint* support — every chosen column sharing a fingerprint with every
+    other chosen column, via a running intersection — not merely pairwise support with the
+    seed. Checking only against the seed lets a transitive chain through: `a` grouped with `b`
+    in one query and with `c` in another welds `(a, b, c)` into one composite that no query
+    groups by, even though `a` alone passes both pairwise checks. That composite would still
+    report cost and fingerprint evidence that reads as support, which is worse than proposing
+    nothing.
     """
     proposals: list[Proposal] = []
     for relation, items in sorted(_by_relation(usage).items()):
@@ -594,15 +602,23 @@ def propose_grouping_indexes(
         if not grouping:
             continue
         seed = grouping[0]
-        # Extend the composite only with columns some single query groups by *alongside* the
-        # seed. Without this, two unrelated GROUP BYs on the same table are welded into one
-        # composite index that serves neither beyond its leading column.
+        # Extend the composite only with columns that share a fingerprint with *every*
+        # column already chosen — not merely with the seed. Pairwise-with-seed is not
+        # enough: given a in {fp1, fp2}, b in {fp1} and c in {fp2}, checking each candidate
+        # against the seed alone welds (a, b, c) into one composite even though no query
+        # groups by all three — fp1 groups by (a, b), fp2 groups by (a, c). Tracking the
+        # running intersection catches this: the moment a candidate's overlap does not
+        # include every fingerprint the chosen set already agrees on, its joint support for
+        # the *whole* composite is a query that does not exist.
         chosen = [seed]
+        shared = seed.fingerprint_ids
         for candidate in grouping[1:]:
             if len(chosen) >= max_arity:
                 break
-            if candidate.fingerprint_ids & seed.fingerprint_ids:
+            overlap = shared & candidate.fingerprint_ids
+            if overlap:
                 chosen.append(candidate)
+                shared = overlap
 
         cost_share = max(i.cost_share for i in chosen)
         if cost_share < min_cost_share:
@@ -670,6 +686,14 @@ def propose_grouping_indexes(
                     "cost_share": cost_share,
                     "calls": max(i.calls for i in chosen),
                     "fingerprints": max(i.fingerprints for i in chosen),
+                    #: How many query groups actually group by *every* chosen column
+                    #: together — the running intersection, not a per-column count. Same
+                    #: name and same meaning as ADV004's identical field: the overlap is
+                    #: what makes this composite supported rather than a guess. Deliberately
+                    #: separate from `fingerprints` above, which is the ordinary per-column
+                    #: max shared with every other index-creating rule and does not, on its
+                    #: own, claim the columns are ever grouped by jointly.
+                    "co_occurring_fingerprints": len(shared),
                     "row_estimate": rows,
                     "partial_indexes_skipped": partial_skipped,
                     "expression_indexes": expression_indexes,
