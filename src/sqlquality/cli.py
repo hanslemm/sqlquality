@@ -720,7 +720,19 @@ def advise(
     ),
     limit: int = typer.Option(500, "--limit", help="Max query-history rows to read."),
     min_cost_share: float = typer.Option(
-        0.01, "--min-cost-share", help="Suppress proposals below this share of workload cost."
+        0.01,
+        "--min-cost-share",
+        # The unqualified "suppress proposals below this share" was a promise the flag
+        # cannot keep: propose_unused_indexes and propose_redundant_indexes do not take the
+        # parameter, because index hygiene is read out of the catalog and has no cost
+        # evidence to weigh. --min-cost-share 5 -- an impossible threshold -- still returned
+        # both. Naming the rules it does not reach is the honest fix; filtering them on a
+        # share they do not have would be inventing evidence.
+        help=(
+            "Suppress proposals below this share of workload cost. Applies to the "
+            "cost-weighted rules (ADV001, ADV004, ADV005, ADV006); the index-hygiene rules "
+            "ADV002 and ADV003 carry no cost evidence and are always reported."
+        ),
     ),
     keep_literals: bool = typer.Option(
         False, "--keep-literals", help="Do NOT redact literal values from query text."

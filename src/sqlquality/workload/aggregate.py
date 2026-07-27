@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Workload
 from sqlquality.sqlast import SqlParseError, parse
@@ -13,15 +14,34 @@ from sqlquality.workload.fingerprint import FLAG_SELECT_STAR
 _Key = tuple[str, str, ColumnRole]
 
 
-def mentions_table(name: str, sql: str) -> bool:
-    """True if ``name`` appears in ``sql`` as a whole identifier, not merely a substring.
+@lru_cache(maxsize=4096)
+def _identifier_pattern(name: str) -> re.Pattern[str]:
+    """Compiled whole-identifier matcher for one name, compiled once per name.
 
-    A plain `name in sql` test would false-positive three ways: a table `order` inside a
+    ``star_tables`` tests every (star-stat, table) pair, and a schema with many tables was
+    recompiling the same handful of table-name patterns over and over, thrashing `re`'s own
+    pattern cache. Caching by name here means each identifier is compiled once regardless of
+    how many stats or tables it is checked against.
+    """
+    return re.compile(rf"\b{re.escape(name)}\b")
+
+
+def mentions_identifier(name: str, text: str) -> bool:
+    """True if ``name`` appears in ``text`` as a whole identifier, not merely a substring.
+
+    A plain `name in text` test would false-positive three ways: a table `order` inside a
     query on `orders`, a table `cart` inside `shopping_cart`, and a table `orders` that only
     appears as part of a column alias like `orders_total`. `\\b` already treats `_` as a word
-    character in Python's `re`, so it rejects all three without a custom boundary class.
+    character in Python's `re`, so it rejects all three without a custom boundary class,
+    while still matching across the punctuation SQL puts around identifiers: parens, commas,
+    dots and `::` are all non-word characters.
     """
-    return re.search(rf"\b{re.escape(name)}\b", sql) is not None
+    return _identifier_pattern(name).search(text) is not None
+
+
+def mentions_table(name: str, sql: str) -> bool:
+    """True if a query mentions this table. See :func:`mentions_identifier`."""
+    return mentions_identifier(name, sql)
 
 
 def star_tables(workload: Workload, schema: dict) -> frozenset[str]:
@@ -49,7 +69,6 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
     """Weight every (table, column, role) by the cost of the queries that use it."""
     calls: dict[_Key, int] = defaultdict(int)
     cost: dict[_Key, float] = defaultdict(float)
-    fingerprints: dict[_Key, int] = defaultdict(int)
     #: Which query groups contributed each usage, so downstream rules can ask whether two
     #: usages co-occur in a single query rather than merely both being hot on the table.
     contributors: dict[_Key, set[str]] = defaultdict(set)
@@ -66,7 +85,6 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
         for key in triples:
             calls[key] += stat.calls
             cost[key] += stat.total_time_ms
-            fingerprints[key] += 1
             contributors[key].add(stat.fingerprint)
             tables.add(key[0])
 
@@ -87,7 +105,6 @@ def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
                     calls=calls[(table, column, role)],
                     cost_ms=cost[(table, column, role)],
                     cost_share=(cost[(table, column, role)] / total) if total else 0.0,
-                    fingerprints=fingerprints[(table, column, role)],
                     fingerprint_ids=frozenset(contributors[(table, column, role)]),
                 )
                 for (table, column, role) in calls

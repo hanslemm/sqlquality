@@ -66,10 +66,26 @@ def literal_flags(tree: exp.Expression) -> frozenset[str]:
     return frozenset(flags)
 
 
+def _inside_placeholder(node: exp.Expression) -> bool:
+    """True if ``node`` sits inside a `$N` parameter marker.
+
+    `pg_stat_statements` has already replaced the literal that was there; the integer left
+    behind is Postgres's own index, not user data, and rewriting it corrupts the statement.
+    """
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Parameter):
+            return True
+        parent = parent.parent
+    return False
+
+
 def redact_tree(tree: exp.Expression) -> exp.Expression:
     """Return a copy of ``tree`` with every literal replaced by a bind placeholder."""
     copy = tree.copy()
     for literal in list(copy.find_all(exp.Literal)):
+        if _inside_placeholder(literal):
+            continue
         literal.replace(exp.Placeholder())
     return copy
 

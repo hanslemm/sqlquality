@@ -32,7 +32,6 @@ def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1"
         calls=10,
         cost_ms=cost_ms,
         cost_share=cost_share,
-        fingerprints=len(fps),
         fingerprint_ids=frozenset(fps),
     )
 
@@ -156,6 +155,185 @@ def test_a_narrower_existing_index_does_not_cover_a_wider_candidate():
     )
     assert codes(proposals) == ["ADV001"]
     assert proposals[0].evidence["columns"] == ("status", "created_at")
+
+
+def test_a_partial_index_does_not_suppress_a_candidate():
+    """`idx ON orders(status) WHERE shipped_at IS NULL` does not serve `WHERE status = $1`.
+
+    Treating it as coverage silently withheld a good proposal — the inverse of the
+    confidently-wrong failures, and just as invisible.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_open",
+                ("status",),
+                False,
+                False,
+                5,
+                4096,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].evidence["partial_indexes_skipped"] == ("idx_open",)
+    assert "partial" in proposals[0].rationale.lower()
+
+
+def test_a_plain_index_still_suppresses_a_candidate():
+    """The control. Task 2's new fields default to False, so this must not have changed."""
+    existing = {"orders": (PgIndex("idx_status", ("status",), False, False, 5, 4096),)}
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals == []
+
+
+def test_an_expression_index_is_disclosed_not_silently_ignored():
+    """We cannot prove `lower(status)` makes an index on `status` redundant — or that it
+    doesn't. Saying so beats both suppressing and pretending it isn't there."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_status",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_status ON orders (lower(status))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].evidence["expression_indexes"] == ("idx_lower_status",)
+    assert "expression" in proposals[0].rationale.lower()
+
+
+def test_a_mixed_expression_index_sharing_a_prefix_does_not_count_as_coverage():
+    """The `has_expressions` half of `_covered`, which every other test leaves unexercised.
+
+    Those tests all build `columns=()`, where `_is_prefix(candidate, ())` is already False —
+    so the guard can never be the reason they pass, and deleting `or index.has_expressions`
+    left the whole suite green. This is the shape that needs it, and it is ordinary:
+
+        CREATE INDEX idx_mixed ON orders (lower(note), status)
+
+    `indkey` is `[0, status_attnum]`; the expression position at ordinality 1 yields a NULL
+    attname and is dropped, so the tuple sqlquality reconstructs is `("status",)` — position
+    1 is *lost*. `_is_prefix(("status",), ("status",))` is then True and the index reads as
+    coverage, silently withholding a genuine HIGH-confidence ADV001. The real index leads
+    with `lower(note)` and cannot serve a bare `status` lookup.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_mixed",
+                # Non-empty on purpose: the reconstructed tuple from a mixed index, with the
+                # leading expression position missing. This is what the catalog query yields.
+                ("status",),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_mixed ON orders (lower(note), status)",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(ndv={"status": 500.0}),
+        existing,
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].confidence is Confidence.HIGH
+    assert proposals[0].evidence["expression_indexes"] == ("idx_mixed",)
+    assert "expression index" in proposals[0].rationale.lower()
+
+
+def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
+    """Only expression indexes that plausibly relate to the candidate are worth naming."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_note",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_note ON orders (lower(note))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals[0].evidence["expression_indexes"] == ()
+    assert "expression index" not in proposals[0].rationale.lower()
+
+
+def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
+    """`id` is a substring of `guid`, and a substring test said so out loud.
+
+    The rationale would have told the operator an index "mentions id" when it indexes
+    `lower(guid)` — a false claim in the text someone reads before running DDL.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_lower_guid",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_guid ON orders (lower(guid))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("id", ColumnRole.EQUALITY)],
+        facts(columns=("id", "guid")),
+        existing,
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["expression_indexes"] == ()
+
+
+def test_an_expression_index_on_a_cast_of_the_column_is_still_disclosed():
+    """The control for the fix: word boundaries must not cost a true positive."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_status_cast",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_status_cast ON orders ((status::text))",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+    )
+    assert proposals[0].evidence["expression_indexes"] == ("idx_status_cast",)
 
 
 def test_arity_cap_keeps_the_range_column_last_when_it_bites():
@@ -378,7 +556,7 @@ def test_unused_index_rule_ignores_tables_outside_the_workload():
     assert propose_unused_indexes(existing, hot_tables=frozenset({"orders"})) == []
 
 
-def test_redundant_prefix_index_proposed_for_drop():
+def test_a_plain_redundant_pair_is_high_confidence():
     existing = {
         "orders": (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
@@ -387,28 +565,103 @@ def test_redundant_prefix_index_proposed_for_drop():
     }
     proposals = propose_redundant_indexes(existing)
     assert codes(proposals) == ["ADV003"]
+    assert proposals[0].confidence is Confidence.HIGH
     assert proposals[0].evidence["index"] == "idx_narrow"
-    # Capped at MEDIUM: PgIndex carries no predicate, so a partial index is
-    # indistinguishable from a full one here. See the test below.
-    assert proposals[0].confidence is Confidence.MEDIUM
+    # Pin the claim, not just the confidence. Deleting the old MEDIUM test removed the only
+    # assertion on this rationale's wording, so a future edit could reintroduce a hedge, or
+    # drop the "both are plain" claim while leaving HIGH, with nothing failing.
+    assert "plain" in proposals[0].rationale
+    assert "partial" not in proposals[0].rationale
 
 
-def test_redundant_index_rationale_admits_it_cannot_see_a_partial_predicate():
-    """HIGH is the strongest claim the tool makes, and "serves the same lookups" is false
-    for a partial or expression index. The README limitation does not travel inside the
-    .sql file the operator actually runs, so the caveat has to be in the rationale.
+def test_a_partial_narrow_index_is_never_called_redundant():
+    """The partial index exists to serve a subset; the wider full index serves it
+    differently. Dropping it is not less certain, it is probably wrong."""
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_open",
+                ("status",),
+                False,
+                False,
+                5,
+                1,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_a_partial_wider_index_does_not_supersede_a_plain_one():
+    existing = {
+        "orders": (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex(
+                "idx_wide_open",
+                ("status", "created_at"),
+                False,
+                False,
+                5,
+                1,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_a_wider_expression_index_does_not_supersede_a_plain_one():
+    """The wider index must be strictly wider, or the length guard skips the pair anyway.
+
+    An earlier version of this test gave both indexes one column, so
+    `len(other.columns) > len(narrow.columns)` was already False and it passed whether or
+    not the has_expressions filter existed at all.
     """
     existing = {
         "orders": (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex(
+                "idx_expr",
+                ("status", "note"),
+                False,
+                False,
+                5,
+                1,
+                has_expressions=True,
+                definition="CREATE INDEX idx_expr ON orders (status, note, lower(note))",
+            ),
+        )
+    }
+    assert propose_redundant_indexes(existing) == []
+
+
+def test_a_narrow_expression_index_is_never_called_redundant():
+    """The other direction, and the reason it matters.
+
+    `columns` understates an expression index — the expression positions contribute no
+    name — so a narrow one may index something the wider one does not. Dropping it on a
+    column-list comparison would discard an index nothing else provides.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_narrow_expr",
+                ("status",),
+                False,
+                False,
+                5,
+                1,
+                has_expressions=True,
+                definition="CREATE INDEX idx_narrow_expr ON orders (status, lower(note))",
+            ),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(existing)
-    rationale = proposals[0].rationale.lower()
-    assert "column list" in rationale
-    assert "partial" in rationale
-    assert "expression" in rationale
+    assert propose_redundant_indexes(existing) == []
 
 
 def test_a_unique_prefix_index_is_never_called_redundant():
