@@ -75,7 +75,13 @@ class WorkloadAdapter(ABC):
 
     @abstractmethod
     def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
-        """Schema mapping for sqlglot qualify(): {table: {column: type}}."""
+        """Schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+
+        Nested rather than flat: a flat `{table: {column: type}}` map cannot tell two
+        same-named tables in different schemas apart, so a column that exists in only one
+        of them resolves against the union of both — the exact aliasing this task exists
+        to remove.
+        """
 
     @abstractmethod
     def fetch_table_facts(
@@ -87,7 +93,7 @@ class WorkloadAdapter(ABC):
     def propose(
         self,
         aggregation: Aggregation,
-        facts: dict[str, TableFacts],
+        facts: dict[Relation, TableFacts],
         workload: Workload,
         *,
         min_cost_share: float,

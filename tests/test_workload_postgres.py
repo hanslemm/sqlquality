@@ -278,7 +278,21 @@ def test_indexes_do_not_alias_across_schemas():
     rows = {
         CAP_INDEXES: [
             ("sales", "orders", "idx_a", "id", 1, False, False, 0, 100, False, None, False, "..."),
-            ("staging", "orders", "idx_b", "id", 1, False, False, 9, 200, False, None, False, "..."),
+            (
+                "staging",
+                "orders",
+                "idx_b",
+                "id",
+                1,
+                False,
+                False,
+                9,
+                200,
+                False,
+                None,
+                False,
+                "...",
+            ),
         ]
     }
     adapter = PostgresWorkloadAdapter(querier=_canned(rows))
@@ -291,15 +305,35 @@ def test_indexes_do_not_alias_across_schemas():
     assert indexes[Relation("staging", "orders")][0].scans == 9
 
 
+def _select_list(sql: str) -> str:
+    """The text between `SELECT` and the first `FROM` — the columns actually returned.
+
+    Grepping the whole statement cannot tell a `SELECT` list from a `WHERE` clause, and
+    every one of these statements already filtered on the schema before this task — the
+    substring the naive version of this check looked for was there from the start, in the
+    WHERE clause, regardless of what the SELECT list returned.
+    """
+    match = re.search(r"select\s+(.*?)\s+from\b", sql, re.IGNORECASE | re.DOTALL)
+    assert match, f"no SELECT ... FROM found in statement: {sql!r}"
+    return match.group(1)
+
+
 def test_every_relation_returning_statement_selects_its_schema():
     """A statement that filters on schema but does not return it cannot be keyed by it.
 
     This is the whole defect class of this task: the rows come back indistinguishable and
-    the last one silently wins.
+    the last one silently wins. An earlier version of this test grepped the *entire*
+    statement for `nspname`/`schemaname`/`table_schema` and passed even with the schema
+    column stripped from the SELECT list — those substrings were already present in every
+    WHERE clause at d0421d0, since each statement already filtered on schema without
+    returning it. Restricting the search to the select list (see `_select_list`) is what
+    actually pins the defect this task exists to close.
     """
     for capability in (CAP_SCHEMA, CAP_TABLE_FACTS, CAP_NDV, CAP_INDEXES):
-        sql = PostgresWorkloadAdapter.SQL[capability].lower()
-        assert "nspname" in sql or "schemaname" in sql or "table_schema" in sql, capability
+        select_list = _select_list(PostgresWorkloadAdapter.SQL[capability])
+        assert (
+            "nspname" in select_list or "schemaname" in select_list or "table_schema" in select_list
+        ), capability
 
 
 def test_fetch_table_facts_resolves_negative_n_distinct_as_a_row_fraction():
