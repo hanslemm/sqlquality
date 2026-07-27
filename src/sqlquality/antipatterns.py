@@ -37,7 +37,8 @@ def _is_cte_closer(select: exp.Select, cte_names: set[str]) -> bool:
     return isinstance(table, exp.Table) and table.name.lower() in cte_names
 
 
-def _has_select_star(tree: exp.Expression) -> bool:
+def has_select_star(tree: exp.Expression) -> bool:
+    """True if any SELECT projects a star, ignoring EXISTS probes and dbt CTE closers."""
     cte_names = {cte.alias.lower() for cte in tree.find_all(exp.CTE)}
     for select in tree.find_all(exp.Select):
         if not any(_is_star_projection(p) for p in select.expressions):
@@ -141,7 +142,7 @@ def antipattern_findings(sql: str, dialect: str) -> list[Finding]:
         return [Finding("SQ000", f"Unparseable SQL: {exc}", 0, Severity.ERROR, False)]
 
     findings: list[Finding] = []
-    if _has_select_star(tree):
+    if has_select_star(tree):
         findings.append(
             Finding(
                 "SQ001",
