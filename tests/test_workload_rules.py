@@ -1137,23 +1137,72 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
 
 
 def test_propose_composes_all_rules_and_ranks_high_confidence_first():
+    """Pins that every one of the seven rules `propose()` wires in actually fired.
+
+    Deliberately an equality set, not a superset assertion (`>=`): a set comparison that
+    only checks two of seven codes would stay green even if a rule's whole block were
+    deleted from `propose()` — which is exactly what happened to ADV007 before this test
+    was tightened. Each rule below gets its own trigger, on distinct columns/index names so
+    none of them suppress or collide with another:
+      - ADV001: hot equality column `status`.
+      - ADV002: `idx_unused` on an unrelated column, zero scans.
+      - ADV003: `idx_narrow_redundant` is a plain prefix of `idx_wide_redundant`.
+      - ADV004: `status` (equality) and `shipped_at` (not-null check) share fingerprint fp1.
+      - ADV005: `note` is non-sargable.
+      - ADV006: a hot `SELECT *` over the wide `orders` table.
+      - ADV007: hot join key `customer_id`, unrelated to `status` so it cannot collide with
+        ADV001's candidate.
+    """
     aggregation = Aggregation(
         usage=(
             _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.3, cost_ms=30.0),
             _usage(_ORDERS, "note", ColumnRole.NON_SARGABLE, cost_share=0.2, cost_ms=20.0),
+            _usage(_ORDERS, "customer_id", ColumnRole.JOIN, cost_share=0.5, cost_ms=50.0),
         ),
         total_cost_ms=100.0,
         skipped_unqualifiable=0,
         tables=frozenset({_ORDERS}),
     )
+    existing = {
+        _ORDERS: (
+            PgIndex("idx_unused", ("zzz",), False, False, 0, 4096),
+            PgIndex("idx_narrow_redundant", ("aaa",), False, False, 5, 1),
+            PgIndex("idx_wide_redundant", ("aaa", "bbb"), False, False, 5, 1),
+        )
+    }
+    wide_columns = (
+        "status",
+        "shipped_at",
+        "note",
+        "customer_id",
+        "created_at",
+        *(f"c{i}" for i in range(10)),
+    )
+    select_star_stat = QueryStat(
+        fingerprint="fp_star",
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
     adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
     proposals = adapter.propose(
         aggregation,
-        _facts_map(ndv={"status": 9999.0}),
-        _workload(),
+        _facts_map(ndv={"status": 9999.0, "customer_id": 9999.0}, columns=wide_columns),
+        _workload(select_star_stat),
         min_cost_share=0.01,
     )
-    assert {p.code for p in proposals} >= {"ADV001", "ADV005"}
+    assert {p.code for p in proposals} == {
+        "ADV001",
+        "ADV002",
+        "ADV003",
+        "ADV004",
+        "ADV005",
+        "ADV006",
+        "ADV007",
+    }
     assert proposals[0].confidence is Confidence.HIGH
 
 
@@ -1602,6 +1651,84 @@ def test_adv007_is_low_for_a_low_cardinality_join_key():
     facts = {relation: _facts(relation, rows=100_000, ndv={"kind": 3.0})}
     proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
     assert proposals[0].confidence is Confidence.LOW
+
+
+def test_adv007_is_medium_when_ndv_is_unknown():
+    """The middle rung of the confidence ladder: `rows` and `have_index_data` are both
+    fine, but the NDV catalog has nothing for this column. Changing that branch to return
+    HIGH instead of MEDIUM would overstate a claim with no selectivity evidence behind it —
+    exactly the failure mode this rule set exists to avoid — and must fail this test."""
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_adv007_suppresses_a_join_key_below_the_cost_share_threshold():
+    """Pins that `--min-cost-share` actually reaches ADV007, as its own help text now
+    claims. Replacing the `cost_share < min_cost_share` guard with `if False` must fail
+    this test."""
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.005, cost_ms=5.0),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    assert propose_join_keys(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv007_discloses_a_partial_index_leading_with_the_join_key():
+    """Mirrors ADV001's `test_a_partial_index_does_not_suppress_a_candidate` exactly.
+    `_covered` correctly does not treat a partial index as coverage — a WHERE-guarded index
+    does not serve an unfiltered join probe either — but before this test existed, ADV007
+    silently said nothing about `idx_open` at all. Naming it in the evidence and rationale,
+    the same way ADV001 does for the same gap, is the fix."""
+    relation = Relation("public", "order_items")
+    existing = {
+        relation: (
+            PgIndex(
+                "idx_open",
+                ("order_id",),
+                False,
+                False,
+                5,
+                4096,
+                is_partial=True,
+                predicate="(shipped_at IS NULL)",
+            ),
+        )
+    }
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, existing, min_cost_share=0.01)
+    assert codes(proposals) == ["ADV007"]
+    assert proposals[0].evidence["partial_indexes_skipped"] == ("idx_open",)
+    assert "partial" in proposals[0].rationale.lower()
+
+
+def test_adv007_discloses_an_expression_index_mentioning_the_join_key():
+    """Mirrors ADV001's `test_an_expression_index_is_disclosed_not_silently_ignored`. The
+    `columns` tuple of an expression index understates it, so `_covered` cannot see
+    `lower(order_id)` leads with `order_id` — naming the index is the only honest option."""
+    relation = Relation("public", "order_items")
+    existing = {
+        relation: (
+            PgIndex(
+                "idx_lower_order_id",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_order_id ON order_items (lower(order_id))",
+            ),
+        )
+    }
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, existing, min_cost_share=0.01)
+    assert codes(proposals) == ["ADV007"]
+    assert proposals[0].evidence["expression_indexes"] == ("idx_lower_order_id",)
+    assert "expression" in proposals[0].rationale.lower()
 
 
 def test_adv007_ignores_non_join_roles():

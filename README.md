@@ -384,7 +384,7 @@ statement is not valid SQL to copy out and run.
 | ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
 | ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
-| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate |
+| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -800,14 +800,16 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
 - **Expression indexes are read but not matched.** `advise` now sees that an index on
   `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
   that index already serves a lookup on `status` — so it proposes and says so, rather than
-  suppressing or ignoring. Confirm before applying.
+  suppressing or ignoring. Confirm before applying. True of both index-creating rules,
+  ADV001 and ADV007.
 - **ADV003 only compares plain indexes.** A pair where either index carries a `WHERE`
   predicate or an indexed expression is skipped entirely rather than proposed at lower
   confidence: a partial index exists to serve a subset, so recommending its removal is
   likely wrong rather than merely uncertain. Plain pairs are reported at HIGH.
 - **A partial index does not suppress a proposal.** `idx ON orders(status) WHERE
   shipped_at IS NULL` does not serve `WHERE status = $1`, so it is not treated as covering
-  a candidate index — it is named in the evidence instead.
+  a candidate index — it is named in the evidence instead. True of both index-creating
+  rules, ADV001 and ADV007.
 - **Multiple `--schema` values are supported, with one honest caveat.** Every catalog fact
   (table sizes, NDV statistics, index lists, the `qualify()` schema) is keyed by
   `schema.table`, so `orders` in two introspected schemas no longer aliases into one
