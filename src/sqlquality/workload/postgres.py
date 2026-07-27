@@ -463,11 +463,29 @@ def propose_join_keys(
             (i for i in items if i.role is ColumnRole.JOIN),
             key=lambda i: (-i.cost_ms, i.column),
         )
+        table_indexes = existing.get(relation, ())
         for item in joins:
             if item.cost_share < min_cost_share:
                 continue
-            if _covered((item.column,), existing.get(relation, ())) is not None:
+            if _covered((item.column,), table_indexes) is not None:
                 continue
+            # Same guards as ADV001, same reasons: a partial index leading with this column
+            # does not serve an unfiltered lookup, and an expression index's `columns` tuple
+            # understates it, so `_covered` already treats neither as coverage. But silence
+            # on both would let this rule say "No existing index leads with it" at HIGH next
+            # to an index that, in plain English, does lead with it — just partially, or
+            # under an expression. Naming them is what ADV001 does for the same reason.
+            partial_skipped = tuple(
+                index.name
+                for index in table_indexes
+                if index.is_partial and _is_prefix((item.column,), index.columns)
+            )
+            expression_indexes = tuple(
+                index.name
+                for index in table_indexes
+                if index.has_expressions
+                and mentions_identifier(item.column, index.definition or "")
+            )
             column_ndv = ndv.get(item.column)
             if rows is None or not have_index_data:
                 confidence = Confidence.LOW
@@ -497,6 +515,18 @@ def propose_join_keys(
                     f" Only about {column_ndv:.0f} distinct values, so the index may not be "
                     "selective enough to be worth its write cost."
                 )
+            if partial_skipped:
+                rationale += (
+                    f" A partial index ({', '.join(partial_skipped)}) leads with these "
+                    "columns but carries a WHERE predicate, so it does not serve an "
+                    "unfiltered lookup — it is not treated as covering this proposal."
+                )
+            if expression_indexes:
+                rationale += (
+                    f" An expression index ({', '.join(expression_indexes)}) mentions "
+                    f"{item.column}; sqlquality cannot tell whether it already serves this "
+                    "lookup, so confirm before applying."
+                )
 
             proposals.append(
                 Proposal(
@@ -513,6 +543,8 @@ def propose_join_keys(
                         "fingerprints": item.fingerprints,
                         "row_estimate": rows,
                         "leading_ndv": column_ndv,
+                        "partial_indexes_skipped": partial_skipped,
+                        "expression_indexes": expression_indexes,
                     },
                     confidence=confidence,
                     ddl=(
