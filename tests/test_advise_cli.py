@@ -630,3 +630,32 @@ def test_missing_driver_exits_2_with_install_hint(monkeypatch):
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 2
     assert "sqlquality[postgres]" in result.output
+
+
+def test_coverage_warning_is_silent_exactly_at_the_threshold():
+    """`share <= _LOW_COVERAGE_FRACTION` returns None, and the boundary is deliberate.
+
+    Nothing pinned which comparison was used, so flipping `<=` to `<` — making the warning
+    fire at exactly 20% — passed the whole suite. Either choice is defensible; leaving it
+    unpinned is not, because the threshold is what decides whether a user is told their
+    proposals may reflect coverage rather than a healthy workload.
+
+    20 unexplained of 100 candidates is exactly 0.2. The pair below it and above it are
+    asserted too, so the test fails whichever direction the comparison is flipped rather than
+    only one of them.
+    """
+    # exactly at the threshold: silent
+    at = _coverage_warning(_workload_with(stats=80, unparseable=20, noise=0), _aggregation_with())
+    assert at is None, "the warning fired at exactly the threshold"
+
+    # one statement worse: 21 of 101 is above 0.2, so it must fire
+    above = _coverage_warning(
+        _workload_with(stats=80, unparseable=21, noise=0), _aggregation_with()
+    )
+    assert above is not None, "the warning stayed silent above the threshold"
+
+    # one statement better: 19 of 99 is below 0.2, so it must stay silent
+    below = _coverage_warning(
+        _workload_with(stats=80, unparseable=19, noise=0), _aggregation_with()
+    )
+    assert below is None, "the warning fired below the threshold"
