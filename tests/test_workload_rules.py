@@ -219,6 +219,49 @@ def test_an_expression_index_is_disclosed_not_silently_ignored():
     assert "expression" in proposals[0].rationale.lower()
 
 
+def test_a_mixed_expression_index_sharing_a_prefix_does_not_count_as_coverage():
+    """The `has_expressions` half of `_covered`, which every other test leaves unexercised.
+
+    Those tests all build `columns=()`, where `_is_prefix(candidate, ())` is already False —
+    so the guard can never be the reason they pass, and deleting `or index.has_expressions`
+    left the whole suite green. This is the shape that needs it, and it is ordinary:
+
+        CREATE INDEX idx_mixed ON orders (lower(note), status)
+
+    `indkey` is `[0, status_attnum]`; the expression position at ordinality 1 yields a NULL
+    attname and is dropped, so the tuple sqlquality reconstructs is `("status",)` — position
+    1 is *lost*. `_is_prefix(("status",), ("status",))` is then True and the index reads as
+    coverage, silently withholding a genuine HIGH-confidence ADV001. The real index leads
+    with `lower(note)` and cannot serve a bare `status` lookup.
+    """
+    existing = {
+        "orders": (
+            PgIndex(
+                "idx_mixed",
+                # Non-empty on purpose: the reconstructed tuple from a mixed index, with the
+                # leading expression position missing. This is what the catalog query yields.
+                ("status",),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_mixed ON orders (lower(note), status)",
+            ),
+        )
+    }
+    proposals = propose_indexes(
+        [usage("status", ColumnRole.EQUALITY)],
+        facts(ndv={"status": 500.0}),
+        existing,
+        min_cost_share=0.01,
+    )
+    assert codes(proposals) == ["ADV001"]
+    assert proposals[0].confidence is Confidence.HIGH
+    assert proposals[0].evidence["expression_indexes"] == ("idx_mixed",)
+    assert "expression index" in proposals[0].rationale.lower()
+
+
 def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
     """Only expression indexes that plausibly relate to the candidate are worth naming."""
     existing = {
