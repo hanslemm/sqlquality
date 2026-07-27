@@ -994,6 +994,23 @@ services:
 
 `tests/integration/__init__.py`: empty.
 
+**`pytestmark` in `conftest.py` does not mark sibling test modules.** A module-level
+`pytestmark` applies only to the module it is written in, so putting it in `conftest.py`
+marks nothing and `-m integration` selects zero tests. Mark the package from the conftest
+with a collection hook instead:
+
+```python
+def pytest_collection_modifyitems(items):
+    """Mark every test in this package `integration`.
+
+    A module-level `pytestmark` in a conftest does not propagate to sibling modules, so
+    without this the marker exists and selects nothing.
+    """
+    for item in items:
+        if "tests/integration/" in str(item.path).replace("\\", "/"):
+            item.add_marker("integration")
+```
+
 `tests/integration/conftest.py`:
 
 ```python
@@ -1189,6 +1206,85 @@ uv run pytest -q
 ```
 
 Expected: the same count as before this task, no skips, no errors.
+
+- [ ] **Step 4b: Translate Postgres's never-analyzed sentinel**
+
+The live run surfaced a production bug no fixture could have shown. `pg_class.reltuples` is
+**-1** on Postgres 14+ for a table that has never been analyzed — distinct from `0`, which
+means analyzed and genuinely empty. `fetch_table_facts` passes that straight through as a
+row estimate, and `propose_indexes`' small-table gate then reads `-1 < MIN_ROWS_FOR_INDEX`
+and **suppresses every proposal for the table, silently**. Measured:
+
+```
+reltuples=      -1  never analyzed (PG14+)   -> NO PROPOSAL (suppressed)
+reltuples=       0  analyzed, empty          -> NO PROPOSAL (suppressed)
+reltuples=    None  unknown                  -> low — Add index on orders(status)
+reltuples= 8000000  large                    -> high — Add index on orders(status)
+```
+
+The window where this bites is exactly when someone reaches for `advise`: a freshly loaded
+or migrated table, before autovacuum's first `ANALYZE`, with slow queries. They get no
+advice and no reason.
+
+`None` already means "unknown" throughout, and that path is correct — it proposes at LOW and
+says the row count could not be checked. So the whole fix is translating the sentinel at the
+boundary. In `fetch_table_facts`, replace the `sizes` comprehension's row term:
+
+```python
+        sizes = {
+            str(name): (
+                # Postgres uses -1 for "never analyzed", which is *unknown*, not "very
+                # small". Passed through, it reads as a tiny table and the small-table gate
+                # silently suppresses every proposal — worst exactly after a load or
+                # migration, which is when someone runs advise. None routes it into the
+                # existing unknown-row-count path: proposed at LOW, with the gap stated.
+                (lambda r: None if r < 0 else r)(_as_int(rows)),
+                _as_int(size) if size is not None else None,
+            )
+            for name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
+        }
+```
+
+Prefer a small named helper over the inline lambda if it reads better; the behaviour is what
+matters. Add to `tests/test_workload_postgres.py`:
+
+```python
+def test_a_never_analyzed_table_reports_an_unknown_row_count():
+    """Postgres 14+ stores -1 in reltuples for a table that has never been analyzed.
+
+    Passed through, the small-table gate reads it as a tiny table and suppresses every
+    proposal — silently, and precisely in the window after a load or migration when someone
+    would run advise. -1 means unknown, and unknown already has a correct path.
+    """
+    querier = FakeQuerier({
+        "information_schema.columns": [("orders", "id", "integer")],
+        "pg_total_relation_size": [("orders", -1, 10**9)],
+    })
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate is None
+
+
+def test_an_analyzed_empty_table_still_reports_zero():
+    """0 is a real answer — analyzed and empty — and must not be conflated with unknown."""
+    querier = FakeQuerier({
+        "information_schema.columns": [("orders", "id", "integer")],
+        "pg_total_relation_size": [("orders", 0, 8192)],
+    })
+    facts = PostgresWorkloadAdapter(querier=querier).fetch_table_facts(
+        ("public",), frozenset({"orders"})
+    )
+    assert facts["orders"].row_estimate == 0
+```
+
+Commit this separately from the integration suite — it is a production fix that the
+integration suite happened to find, and the two do not belong in one commit:
+
+```bash
+git add src/sqlquality/workload/postgres.py tests/test_workload_postgres.py
+git commit -m "fix(advise): treat reltuples -1 as unknown, not as a tiny table"
+```
 
 - [ ] **Step 5: Document it**
 
