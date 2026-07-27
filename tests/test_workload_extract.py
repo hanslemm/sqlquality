@@ -7,6 +7,7 @@ from sqlquality.sqlast import parse
 from sqlquality.workload.extract import (
     AmbiguousRelation,
     UnqualifiableQuery,
+    _is_negated,
     extract_usage,
     resolve_relation,
 )
@@ -90,6 +91,33 @@ def test_null_checks_carry_polarity():
     assert (ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK) in _usage(
         "select id from orders where shipped_at is not null"
     )
+
+
+@pytest.mark.parametrize("negated", [False, True])
+def test_null_polarity_is_read_from_both_sqlglot_encodings(negated):
+    """`IS NOT NULL` has two representations inside the declared `sqlglot>=30.12,<31` range.
+
+    Up to 30.12 it is `Not(Is(col, Null()))`; from 30.13 it is `Is(col, Null(), negate=True)`
+    with no `exp.Not` in the tree. Parsing SQL only ever exercises whichever encoding the
+    installed version produces — which is why the lockfile hid the bug while a fresh
+    `pip install sqlquality` inverted every `IS NOT NULL` into a `NULL_CHECK`, and ADV004 then
+    emitted `WHERE col IS NULL` for a workload filtering `IS NOT NULL`.
+
+    So both trees are built directly rather than parsed. This test therefore fails on either
+    encoding regardless of which sqlglot is installed, where a parse-based test can only ever
+    check one of them.
+    """
+    column = exp.column("shipped_at", table="orders")
+    predicate = exp.Is(this=column, expression=exp.Null())
+    if negated:
+        # Both shapes at once is not a real tree, so exercise them one at a time: the flag
+        # form on this pass, the wrapper form on the same pass through `_is_negated`'s other
+        # branch below.
+        predicate.set("negate", True)
+    assert _is_negated(predicate) is negated
+
+    wrapped = exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null()))
+    assert _is_negated(wrapped.this) is True
 
 
 def test_function_wrapped_predicate_is_non_sargable():
