@@ -752,8 +752,9 @@ def advise(
         # share they do not have would be inventing evidence.
         help=(
             "Suppress proposals below this share of workload cost. Applies to the "
-            "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007); the index-hygiene "
-            "rules ADV002 and ADV003 carry no cost evidence and are always reported."
+            "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008); the "
+            "index-hygiene rules ADV002 and ADV003 carry no cost evidence and are always "
+            "reported."
         ),
     ),
     keep_literals: bool = typer.Option(

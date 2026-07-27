@@ -14,6 +14,7 @@ from sqlquality.workload.postgres import (
     PgIndex,
     PostgresWorkloadAdapter,
     _quote_ident,
+    propose_grouping_indexes,
     propose_indexes,
     propose_join_keys,
     propose_partial_indexes,
@@ -1137,10 +1138,10 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
 
 
 def test_propose_composes_all_rules_and_ranks_high_confidence_first():
-    """Pins that every one of the seven rules `propose()` wires in actually fired.
+    """Pins that every one of the eight rules `propose()` wires in actually fired.
 
     Deliberately an equality set, not a superset assertion (`>=`): a set comparison that
-    only checks two of seven codes would stay green even if a rule's whole block were
+    only checks two of eight codes would stay green even if a rule's whole block were
     deleted from `propose()` — which is exactly what happened to ADV007 before this test
     was tightened. Each rule below gets its own trigger, on distinct columns/index names so
     none of them suppress or collide with another:
@@ -1152,6 +1153,8 @@ def test_propose_composes_all_rules_and_ranks_high_confidence_first():
       - ADV006: a hot `SELECT *` over the wide `orders` table.
       - ADV007: hot join key `customer_id`, unrelated to `status` so it cannot collide with
         ADV001's candidate.
+      - ADV008: hot grouping column `region`, unrelated to every other column above so it
+        cannot collide with ADV001's or ADV007's candidate.
     """
     aggregation = Aggregation(
         usage=(
@@ -1159,6 +1162,7 @@ def test_propose_composes_all_rules_and_ranks_high_confidence_first():
             _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.3, cost_ms=30.0),
             _usage(_ORDERS, "note", ColumnRole.NON_SARGABLE, cost_share=0.2, cost_ms=20.0),
             _usage(_ORDERS, "customer_id", ColumnRole.JOIN, cost_share=0.5, cost_ms=50.0),
+            _usage(_ORDERS, "region", ColumnRole.GROUP, cost_share=0.15, cost_ms=15.0),
         ),
         total_cost_ms=100.0,
         skipped_unqualifiable=0,
@@ -1202,6 +1206,7 @@ def test_propose_composes_all_rules_and_ranks_high_confidence_first():
         "ADV005",
         "ADV006",
         "ADV007",
+        "ADV008",
     }
     assert proposals[0].confidence is Confidence.HIGH
 
@@ -1757,3 +1762,228 @@ def test_adv007_evidence_reports_the_bare_table_name_and_its_own_schema():
     proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
     assert proposals[0].evidence["schema"] == "staging"
     assert proposals[0].evidence["table"] == "order_items"
+
+
+def test_adv008_proposes_a_composite_index_for_a_hot_group_by():
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+        _usage(relation, "day", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp1",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert [p.code for p in proposals] == ["ADV008"]
+    assert proposals[0].evidence["columns"] == ("tenant_id", "day")
+    assert proposals[0].ddl == 'CREATE INDEX ON "public"."events" ("tenant_id", "day");'
+
+
+def test_adv008_never_reaches_high_confidence():
+    """Whether the planner picks GroupAggregate over HashAggregate is not visible to us."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.9, cost_ms=900.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000, ndv={"tenant_id": 100_000.0})}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_adv008_is_low_when_the_row_count_is_unknown():
+    """The other rung of the confidence ladder: row count unknown, so the small-table gate
+    could not run. Changing this branch to MEDIUM would claim a check happened that did not,
+    exactly the failure mode the ladder exists to avoid."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.9, cost_ms=900.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=None)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.LOW
+    assert "small-table floor" in proposals[0].rationale
+
+
+def test_adv008_is_low_when_the_index_list_could_not_be_read():
+    """The other LOW trigger: the existing-index catalog query was denied, so whether an
+    index already leads with these columns is unknowable."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.9, cost_ms=900.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(
+        usage, facts, {}, min_cost_share=0.01, have_index_data=False
+    )
+    assert proposals[0].confidence is Confidence.LOW
+    assert "could not be read" in proposals[0].rationale
+
+
+def test_adv008_groups_only_columns_that_co_occur_in_one_query():
+    """Two GROUP BYs in two different queries are not one composite index."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+        _usage(relation, "day", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp2",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["columns"] == ("tenant_id",)
+
+
+def test_adv008_is_silent_when_an_index_already_leads_with_the_grouping_columns():
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    existing = {
+        relation: (
+            PgIndex(
+                name="idx_events_tenant",
+                columns=("tenant_id", "day"),
+                is_unique=False,
+                is_primary=False,
+                scans=3,
+                size_bytes=1,
+            ),
+        )
+    }
+    assert propose_grouping_indexes(usage, facts, existing, min_cost_share=0.01) == []
+
+
+def test_adv008_respects_max_arity():
+    relation = Relation("public", "events")
+    usage = tuple(
+        _usage(relation, name, ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0 - i, fps=("fp1",))
+        for i, name in enumerate(["a", "b", "c", "d"])
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["columns"] == ("a", "b", "c")
+
+
+def test_adv008_discloses_that_the_column_order_is_inferred():
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+        _usage(relation, "day", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=("fp1",)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert "inferred" in proposals[0].rationale.lower()
+
+
+def test_adv008_ignores_non_group_roles():
+    relation = Relation("public", "orders")
+    usage = (_usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.9),)
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    assert propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv008_respects_the_small_table_floor():
+    relation = Relation("public", "tiny")
+    usage = (_usage(relation, "tenant_id", ColumnRole.GROUP, cost_share=0.9),)
+    facts = {relation: _facts(relation, rows=10)}
+    assert propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv008_suppresses_a_grouping_below_the_cost_share_threshold():
+    """Pins the `cost_share < min_cost_share` guard specifically: rows are well above
+    MIN_ROWS_FOR_INDEX (10,000) so the small-table floor cannot be why this is suppressed."""
+    relation = Relation("public", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.005, cost_ms=5.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    assert propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01) == []
+
+
+def test_adv008_discloses_a_partial_index_leading_with_the_grouping_columns():
+    """Mirrors ADV001's/ADV007's identical disclosure. `_covered` correctly does not treat a
+    partial index as coverage — a WHERE-guarded index does not serve an unfiltered GROUP BY
+    either — but silence on that gap would let ADV008 say nothing next to an index that, in
+    plain English, does lead with these columns."""
+    relation = Relation("public", "events")
+    existing = {
+        relation: (
+            PgIndex(
+                "idx_events_open",
+                ("tenant_id",),
+                False,
+                False,
+                5,
+                4096,
+                is_partial=True,
+                predicate="(closed_at IS NULL)",
+            ),
+        )
+    }
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, existing, min_cost_share=0.01)
+    assert codes(proposals) == ["ADV008"]
+    assert proposals[0].evidence["partial_indexes_skipped"] == ("idx_events_open",)
+    assert "partial" in proposals[0].rationale.lower()
+
+
+def test_adv008_discloses_an_expression_index_mentioning_the_leading_grouping_column():
+    """Mirrors ADV001's/ADV007's identical disclosure. The `columns` tuple of an expression
+    index understates it, so `_covered` cannot see `lower(tenant_id)` leads with `tenant_id`
+    — naming the index is the only honest option."""
+    relation = Relation("public", "events")
+    existing = {
+        relation: (
+            PgIndex(
+                "idx_lower_tenant",
+                (),
+                False,
+                False,
+                5,
+                4096,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_tenant ON events (lower(tenant_id))",
+            ),
+        )
+    }
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, existing, min_cost_share=0.01)
+    assert codes(proposals) == ["ADV008"]
+    assert proposals[0].evidence["expression_indexes"] == ("idx_lower_tenant",)
+    assert "expression" in proposals[0].rationale.lower()
+
+
+def test_adv008_evidence_reports_the_bare_table_name_and_its_own_schema():
+    relation = Relation("staging", "events")
+    usage = (
+        _usage(
+            relation, "tenant_id", ColumnRole.GROUP, cost_share=0.5, cost_ms=500.0, fps=("fp1",)
+        ),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].evidence["schema"] == "staging"
+    assert proposals[0].evidence["table"] == "events"
