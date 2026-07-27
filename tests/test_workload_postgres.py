@@ -157,6 +157,42 @@ def test_fetch_workload_window_is_honest_that_since_is_not_supported():
     assert "since stats reset" in fetch.window_description.lower()
 
 
+def test_a_null_stats_reset_reads_as_an_unknown_time_not_as_None():
+    """`stats_reset` is SQL NULL until someone resets statistics — the *default* state.
+
+    The row is then `(None,)`: non-empty, so truthy, so a guard testing the row's emptiness
+    lets the None straight through and the window line reads "since stats reset at None".
+    That line is the sole statement of what period the advice covers, and ADV002's rationale
+    tells the operator to check it before dropping an index.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_stat_statements": [("select id from orders where status = $1", 10, 250.0, 100)],
+            "pg_stat_database": [(None,)],
+        }
+    )
+    fetch = PostgresWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert "an unknown time" in fetch.window_description
+    assert "None" not in fetch.window_description
+
+
+def test_a_denied_stats_reset_statement_also_reads_as_an_unknown_time():
+    """The control: the empty-row path must keep working once the guard tests the value.
+
+    Written as a pair with the test above because the obvious fix — `reset[0][0] is not
+    None` — reads element 0 of a row that may not exist, and an IndexError on a denied
+    grant would cost the whole run for a missing privilege (invariant 4).
+    """
+    querier = FakeQuerier(
+        {"pg_stat_statements": [("select id from orders where status = $1", 10, 250.0, 100)]},
+        fail_markers=("pg_stat_database",),
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    fetch = adapter.fetch_workload(None, 500)
+    assert "an unknown time" in fetch.window_description
+    assert any(cap == CAP_STATS_RESET for cap, _ in adapter.degraded)
+
+
 def test_fetch_schema_builds_a_sqlglot_schema_mapping():
     querier = FakeQuerier(
         {

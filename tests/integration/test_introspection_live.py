@@ -32,8 +32,17 @@ def test_every_introspection_statement_executes(adapter, seeded):
 
 
 def test_workload_statement_returns_our_own_queries(adapter):
+    """The window line must name a real time, not merely start with the right prefix.
+
+    `"since stats reset at" in ...` was satisfied by the broken `"since stats reset at
+    None"` — the prefix is the boilerplate, the payload is the suffix. The `seeded` fixture
+    calls `pg_stat_statements_reset()`, but `pg_stat_database.stats_reset` is a *separate*
+    counter that a fresh container has never reset, so this assertion is precisely where a
+    NULL surfaces live.
+    """
     fetch = adapter.fetch_workload(None, 500)
     assert fetch.rows, "pg_stat_statements returned nothing"
+    assert "None" not in fetch.window_description, fetch.window_description
     assert "since stats reset at" in fetch.window_description
 
 
