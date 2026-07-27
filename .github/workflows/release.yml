@@ -9,6 +9,15 @@ name: Release
 on:
   push:
     tags:
+      # Release tags are bare semver: 0.3.0, not v0.3.0.
+      #
+      # `v*` is kept only as a safety net. Tag filters are globs, not regexes, so a bare
+      # pattern cannot be made to reject a `v` prefix — and a pushed tag that matches
+      # nothing fails *silently*: no workflow run appears, so it looks like a release that
+      # is merely slow rather than one that never started. Matching both means an
+      # out-of-habit `v0.3.0` still publishes. Drop the `v*` line if you would rather that
+      # mistake fail loudly.
+      - "[0-9]*.[0-9]*.[0-9]*"
       - "v*"
 
 jobs:
