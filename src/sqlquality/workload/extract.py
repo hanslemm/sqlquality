@@ -166,6 +166,14 @@ def _collect_dml(
     With exactly one table in the statement the target is unambiguous; with more than one
     (``UPDATE ... FROM``) attribution would be a guess, so bare columns are dropped
     instead of misattributed.
+
+    A `len(tables) == 1` target is the one case that needs its own ambiguity check rather
+    than deferring to `resolve_relation`'s plain `None`: `qualify()` does not validate
+    UPDATE/DELETE targets (see `resolve_relation`'s docstring), so a bare name held by two
+    introspected schemas reaches here with no `SchemaError` ever raised. Left as a silent
+    `None`, the statement would vanish with no usage recorded and *neither* counter
+    incremented — reported as analysed when it was not. Raising here routes it into the
+    same `skipped_ambiguous` counter as the SELECT-path ambiguity sqlglot itself detects.
     """
     tables = tuple(qualified.find_all(exp.Table))
     aliases: dict[str, Relation] = {}
@@ -173,7 +181,17 @@ def _collect_dml(
         relation = resolve_relation(table, schema)
         if relation is not None:
             aliases[table.alias_or_name] = relation
-    sole = resolve_relation(tables[0], schema) if len(tables) == 1 else None
+    sole: Relation | None = None
+    if len(tables) == 1:
+        target = tables[0]
+        sole = resolve_relation(target, schema)
+        if sole is None and not target.db:
+            owners = [name for name, tbls in schema.items() if target.name in tbls]
+            if len(owners) > 1:
+                raise AmbiguousRelation(
+                    f"Ambiguous mapping for DML target '{target.name}': "
+                    f"held by {', '.join(sorted(owners))}."
+                )
     for column in qualified.find_all(exp.Column):
         _record(seen, aliases.get(column.table) if column.table else sole, column)
 

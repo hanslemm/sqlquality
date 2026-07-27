@@ -6,9 +6,16 @@ import re
 from collections import defaultdict
 from functools import lru_cache
 
+from sqlglot import exp
+
 from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Relation, Workload
 from sqlquality.sqlast import SqlParseError, parse
-from sqlquality.workload.extract import AmbiguousRelation, UnqualifiableQuery, extract_usage
+from sqlquality.workload.extract import (
+    AmbiguousRelation,
+    UnqualifiableQuery,
+    extract_usage,
+    resolve_relation,
+)
 from sqlquality.workload.fingerprint import FLAG_SELECT_STAR
 
 _Key = tuple[Relation, str, ColumnRole]
@@ -18,10 +25,11 @@ _Key = tuple[Relation, str, ColumnRole]
 def _identifier_pattern(name: str) -> re.Pattern[str]:
     """Compiled whole-identifier matcher for one name, compiled once per name.
 
-    ``star_tables`` tests every (star-stat, table) pair, and a schema with many tables was
-    recompiling the same handful of table-name patterns over and over, thrashing `re`'s own
-    pattern cache. Caching by name here means each identifier is compiled once regardless of
-    how many stats or tables it is checked against.
+    Callers such as ADV006's wide-table detection and the expression-index disclosure in
+    `postgres.py` test one name against many statements (or vice versa), and a schema with
+    many tables was recompiling the same handful of name patterns over and over, thrashing
+    `re`'s own pattern cache. Caching by name here means each identifier is compiled once
+    regardless of how many times it is checked.
     """
     return re.compile(rf"\b{re.escape(name)}\b")
 
@@ -44,38 +52,49 @@ def mentions_table(name: str, sql: str) -> bool:
     return mentions_identifier(name, sql)
 
 
-def star_tables(workload: Workload, schema: dict) -> frozenset[Relation]:
+def star_tables(workload: Workload, schema: dict, dialect: str = "postgres") -> frozenset[Relation]:
     """Relations a `SELECT *` query group merely *mentions*, matched against ``schema``.
 
     A bare `select * from wide_t` filters nothing, so it contributes no column usage and
     the relation never appears in ``Aggregation.tables``. Introspecting only the relations
     that produced usage therefore left the star rule with no column counts to test — inert
-    for precisely the workload it exists to catch. These names are unioned in before catalog
-    facts are fetched.
+    for precisely the workload it exists to catch. These relations are unioned in before
+    catalog facts are fetched.
 
-    A name held by two introspected schemas is skipped rather than attributed to either or
-    to both: over-reporting would put a wide-table warning on a table the query never
-    touched. Consistent with `resolve_relation`, which declines the same guess.
+    Resolved by parsing each starred statement and running its actual `exp.Table` nodes
+    through `resolve_relation` — not by text-matching the schema's table names against the
+    raw SQL. Text matching cannot see a schema qualifier at all, and that blindness cuts
+    both ways: `select * from nosuch.items` would resolve through a bare-name collision
+    with an unrelated schema (a phantom `resolve_relation`'s `table.db` guard exists
+    specifically to refuse), while `select * from sales.orders` naming one side of a
+    same-table-name collision would be dropped even though it is not actually ambiguous.
+    Resolving through the same function `extract_usage` uses makes the two agree by
+    construction; a second, hand-rolled ambiguity policy here previously did not.
+
+    A parse failure is not counted here: the same statement was already counted
+    unparseable at ingest (`Workload.skipped_unparseable`), so re-counting it under a
+    different name would make the two counters disagree about what "unparseable" means.
 
     Deliberately *not* added to ``Aggregation.tables``: that set means "relations with
     recorded column usage" and feeds the unused-index rule's notion of a hot table.
+
+    ``dialect`` defaults to `"postgres"`, the only workload adapter registered today
+    (see `sqlquality.workload.get_workload_adapter`); a caller wiring in a second engine
+    must pass its dialect explicitly rather than rely on the default.
     """
     found: set[Relation] = set()
     for stat in workload.stats:
         if FLAG_SELECT_STAR not in stat.flags:
             continue
-        for table in _table_names(schema):
-            if not mentions_table(table, stat.sql):
-                continue
-            owners = [name for name, tables in schema.items() if table in tables]
-            if len(owners) == 1:
-                found.add(Relation(schema=owners[0], table=table))
+        try:
+            tree = parse(stat.sql, dialect)
+        except SqlParseError:
+            continue
+        for table in tree.find_all(exp.Table):
+            relation = resolve_relation(table, schema)
+            if relation is not None:
+                found.add(relation)
     return frozenset(found)
-
-
-def _table_names(schema: dict) -> frozenset[str]:
-    """Every bare table name in a nested schema map, deduplicated across schemas."""
-    return frozenset(table for tables in schema.values() for table in tables)
 
 
 def aggregate(workload: Workload, schema: dict, dialect: str) -> Aggregation:
