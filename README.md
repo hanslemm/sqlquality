@@ -329,11 +329,11 @@ exits 0 without connecting:
 
 ```console
 $ sqlquality advise --engine postgres --dry-run
--- workload: requires the pg_stat_statements extension (PostgreSQL 14+) and pg_read_all_stats or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On PostgreSQL 13 and older the view lacks the toplevel column this query filters on (needed to avoid double-counting a COPY (...) TO execution under pg_stat_statements.track = all) and this will fail.
+-- workload: requires the pg_stat_statements extension (PostgreSQL 13+) and pg_read_all_stats or superuser; enable via shared_preload_libraries then CREATE EXTENSION. On PostgreSQL 12 and older the view lacks total_exec_time and this will fail.
 SELECT s.query, s.calls, s.total_exec_time, s.rows
             FROM pg_stat_statements s
             JOIN pg_database d ON d.oid = s.dbid
-            WHERE d.datname = current_database() AND s.toplevel
+            WHERE d.datname = current_database()
             ORDER BY s.total_exec_time DESC
             LIMIT %s
 
@@ -367,10 +367,8 @@ statement is not valid SQL to copy out and run.
 - **`pg_stat_statements`** must be installed (`shared_preload_libraries` +
   `CREATE EXTENSION`), and the connecting role needs `pg_read_all_stats` or superuser to
   see queries run by other users.
-- **PostgreSQL 14+.** `pg_stat_statements.total_exec_time` did not exist before version 13
-  (it was `total_time`), and the `toplevel` column the workload query filters on — needed
-  to avoid double-counting a `COPY (...) TO` execution under `pg_stat_statements.track =
-  all` — did not exist before version 14; older servers fail the workload read outright.
+- **PostgreSQL 13+.** `pg_stat_statements.total_exec_time` did not exist before version 13
+  (it was `total_time`); older servers fail the workload read outright.
 - **`--since` cannot be honored on Postgres.** `pg_stat_statements` is cumulative since the
   last statistics reset and carries no per-statement timestamps before PostgreSQL 17
   (which added `stats_since`). Passing `--since` does not narrow the query — the report
@@ -807,11 +805,26 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   the first form, so on a Django codebase this can be most of your hot reads. `COPY (...)
   TO` attributes correctly: Postgres charges the whole execution's time and rows to the
   `COPY` statement. A `DECLARE`, measured on PostgreSQL 16, does not — opening a cursor
-  does no scanning, so it is recorded with near-zero calls, time and rows, while the actual
-  work is charged to the `FETCH` statements that follow, which carry no query text and stay
-  filtered as noise. So a cursor read's columns can still join an index candidate, but the
-  read cannot earn a proposal on cost alone, and the default `--min-cost-share` can
-  suppress it outright.
+  does no scanning, so while it is counted accurately by *call count* (one call per cursor
+  opened), its time and rows read as near-zero; the actual work is charged to the `FETCH`
+  statements that follow, which carry no query text and stay filtered as noise. So a
+  cursor read's columns can still join an index candidate, but the read cannot earn a
+  proposal on cost alone, and the default `--min-cost-share` can suppress it outright.
+- **A `COPY (...) TO` execution can be counted twice under `pg_stat_statements.track =
+  all`.** That setting (not the default `track = top`) makes Postgres record both the
+  verbatim top-level `COPY` statement and its normalised nested query as separate rows for
+  the same execution, and `unwrap`/redaction give the pair different fingerprints (a real
+  literal in one, `$1` in the other) — so it lands in `aggregate` as two query groups at
+  roughly twice the execution's true cost, inflating both that group's `cost_share` and the
+  whole-window denominator. This is accepted rather than fixed: filtering the workload
+  query to `s.toplevel` removes the duplicate, but `toplevel = false` is also the *only*
+  way Postgres ever exposes the SQL executed inside a PL/pgSQL function body, and no
+  `s.query` text pattern tells the two apart — both are recorded as the bare inner
+  statement once normalised. Tried live: the filter made a genuinely hot, function-wrapped
+  query disappear from evidence entirely (no predicates, no cost, no disclosure that
+  anything was dropped) while a much colder query took its place as a `high`-confidence
+  proposal — confidently wrong, which is strictly worse than an inflated `cost_share` on a
+  setting most installations do not use.
 - **Expression indexes are read but not matched.** `advise` now sees that an index on
   `lower(status)` exists and names it in the proposal's evidence, but it cannot tell whether
   that index already serves a lookup on `status` — so it proposes and says so, rather than

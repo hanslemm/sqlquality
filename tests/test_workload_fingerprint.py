@@ -115,6 +115,35 @@ def test_ingest_counts_unparseable_and_noise_without_raising():
     assert len(workload.stats) == 1
 
 
+def test_ingest_filters_fetch_as_noise():
+    """`FETCH` carries no query text, so it must stay filtered rather than analysed.
+
+    Left unfiltered, sqlglot parses `FETCH 100 FROM c` as `exp.Command` — it would become
+    an analysed query group with zero column usage but the cursor's full cost attached
+    (see `unwrap`'s docstring on where a cursor's cost actually lands), which is worse than
+    the noise it should have been.
+    """
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="FETCH 100 FROM c", calls=2, total_time_ms=72.9),),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
+
+
+def test_ingest_filters_close_as_noise():
+    """`CLOSE` carries no query text either; left unfiltered, sqlglot parses `CLOSE bigcur`
+    as `exp.Alias`, which would also become an analysed, zero-column-usage query group."""
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql="CLOSE bigcur", calls=1, total_time_ms=0.1),),
+        window_description="w",
+    )
+    workload = ingest(fetch, "postgres")
+    assert workload.skipped_noise == 1
+    assert workload.stats == ()
+
+
 def test_ingest_captures_literal_flags_before_redaction():
     """The load-bearing ordering guard.
 
@@ -270,8 +299,9 @@ def test_unwrap_leaves_everything_else_alone(sql):
     `_DECLARE_CURSOR` or `_COPY_QUERY`'s internals would make any of them match — they
     passed before the patterns existed and would pass against almost any broken version of
     them just the same. `FETCH`/`CLOSE` staying noise is `is_noise`'s contract, not
-    `unwrap`'s, and is already exercised where it matters: at the `ingest` level, by the
-    ordering tests below.
+    `unwrap`'s — see `test_ingest_filters_fetch_as_noise` and
+    `test_ingest_filters_close_as_noise`, which pin that contract directly and go red if
+    either keyword is removed from `_LEADING_NOISE`.
     """
     assert unwrap(sql) == sql
 
