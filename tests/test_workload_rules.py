@@ -1043,6 +1043,74 @@ def test_select_star_evidence_reports_the_qualified_relation():
     assert "staging.orders" in proposals[0].title
 
 
+def test_select_star_does_not_attribute_a_schema_qualified_statement_to_the_wrong_schema():
+    """`select * from public.orders` must report only `public.orders`, even when
+    `staging.orders` is also wide and shares the bare name `orders`.
+
+    Bare-name text matching cannot see the schema qualifier the statement itself carries —
+    the same defect class Task 2 already fixed once on this branch for `star_tables`. Before
+    the fix, `mentions_table("orders", "select * from public.orders")` is True for *both*
+    wide relations, so the evidence named a table (`staging.orders`) the statement never
+    referenced at all.
+    """
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select * from public.orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    public_orders = Relation("public", "orders")
+    staging_orders = Relation("staging", "orders")
+    wide = {
+        public_orders: TableFacts(
+            relation=public_orders,
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+        staging_orders: TableFacts(
+            relation=staging_orders,
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+    }
+    proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
+    assert proposals[0].evidence["tables"] == ("public.orders",)
+
+
+def test_select_star_attributes_an_ambiguous_bare_reference_to_neither_wide_relation():
+    """A *bare* `select * from orders` with both `public.orders` and `staging.orders` wide
+    cannot be attributed to either — the statement itself does not say which. Reporting
+    either would be a guess; reporting both repeats the original defect. Dropping it entirely
+    is the same cannot-prove-it-so-drop-it policy `resolve_relation`/`star_tables` follow."""
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    public_orders = Relation("public", "orders")
+    staging_orders = Relation("staging", "orders")
+    wide = {
+        public_orders: TableFacts(
+            relation=public_orders,
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+        staging_orders: TableFacts(
+            relation=staging_orders,
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        ),
+    }
+    assert propose_select_star(_workload(stat), wide, min_cost_share=0.01) == []
+
+
 def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     """ADV002 and ADV003 can both fire on one index, emitting the same DROP twice.
 
@@ -1341,6 +1409,82 @@ def test_dropped_index_ddl_is_schema_qualified():
     }
     proposals = propose_redundant_indexes(redundant)
     assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_narrow";'
+
+
+def test_adv002_evidence_reports_the_bare_table_name_and_its_own_schema():
+    """The brief's evidence contract — `"schema": relation.schema`, `"table": relation.table`
+    (the *bare* name, so existing JSON consumers keep reading the same value from the same
+    key) — applies to every rule, not just ADV001. `staging` (not `public`) pins that the
+    schema is not a hardcoded default, and the bare `"orders"` (not `"staging.orders"`) pins
+    that `evidence["table"]` was not quietly switched to the qualified string."""
+    existing = {
+        Relation("staging", "orders"): (
+            PgIndex(
+                name="idx_cold",
+                columns=("note",),
+                is_unique=False,
+                is_primary=False,
+                scans=0,
+                size_bytes=1,
+            ),
+        )
+    }
+    proposals = propose_unused_indexes(
+        existing, hot_tables=frozenset({Relation("staging", "orders")})
+    )
+    assert proposals[0].evidence["schema"] == "staging"
+    assert proposals[0].evidence["table"] == "orders"
+
+
+def test_adv003_evidence_reports_the_bare_table_name_and_its_own_schema():
+    existing = {
+        Relation("staging", "orders"): (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        )
+    }
+    proposals = propose_redundant_indexes(existing)
+    assert proposals[0].evidence["schema"] == "staging"
+    assert proposals[0].evidence["table"] == "orders"
+
+
+def test_adv004_evidence_reports_the_bare_table_name_and_its_own_schema():
+    relation = Relation("staging", "orders")
+    proposals = propose_partial_indexes(
+        [
+            _usage(relation, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(relation, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+        ],
+        _facts_map(relation),
+        min_cost_share=0.01,
+    )
+    assert proposals[0].evidence["schema"] == "staging"
+    assert proposals[0].evidence["table"] == "orders"
+
+
+def test_propose_end_to_end_uses_a_non_public_relations_own_schema():
+    """The three adapter-level `propose()` tests elsewhere in this file all use
+    `public.orders`, so the end-to-end path was only ever exercised with the default
+    schema. A relation living anywhere else must flow through unchanged."""
+    relation = Relation("analytics", "orders")
+    aggregation = Aggregation(
+        usage=(_usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
+        total_cost_ms=100.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({relation}),
+    )
+    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
+    proposals = adapter.propose(
+        aggregation,
+        _facts_map(relation, ndv={"status": 9999.0}),
+        _workload(),
+        min_cost_share=0.01,
+    )
+    adv001 = [p for p in proposals if p.code == "ADV001"]
+    assert adv001
+    assert adv001[0].ddl == 'CREATE INDEX ON "analytics"."orders" ("status");'
+    assert adv001[0].evidence["schema"] == "analytics"
+    assert adv001[0].evidence["table"] == "orders"
 
 
 def test_adv005_reports_a_short_fingerprint_id_and_keeps_the_sql_separately():

@@ -8,6 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from sqlglot import exp
+
 from sqlquality.models import (
     Aggregation,
     ColumnRole,
@@ -22,6 +24,7 @@ from sqlquality.models import (
     WorkloadFetch,
     cost_share_of,
 )
+from sqlquality.sqlast import SqlParseError, parse
 from sqlquality.workload.aggregate import mentions_identifier, mentions_table
 from sqlquality.workload.base import (
     MAX_TIMEOUT_S,
@@ -702,12 +705,60 @@ def propose_sargability(
     return proposals
 
 
+def _wide_relations_touched(
+    sql: str, dialect: str, wide: Mapping[Relation, TableFacts]
+) -> tuple[Relation, ...]:
+    """Which of the *wide* relations this one statement provably references.
+
+    Bare-name text matching was the original approach — `mentions_table(relation.table,
+    sql)` — and it is exactly right for an *unqualified* reference: real SQL says `from
+    orders`, not `from public.orders`. Its failure mode is the same one Task 2 already fixed
+    once on this branch for `star_tables`: text matching cannot see a schema qualifier, so
+    `select * from public.orders` matched *both* `public.orders` and `staging.orders`
+    whenever both were wide — an evidence block naming a table the statement never
+    referenced.
+
+    So this parses the statement (with the adapter's own dialect — the same one `aggregate`
+    used to build `facts` in the first place) and resolves each `exp.Table` node against
+    `wide` specifically, not the full introspected schema: a schema-qualified reference
+    (`table.db` set) is matched only against that same relation; a bare reference is
+    attributed only when exactly one wide relation shares its name. An ambiguous bare name
+    — two wide relations sharing it — is dropped rather than guessed at, the same
+    cannot-prove-it policy `resolve_relation`/`star_tables` already apply, just restricted
+    here to the (usually much smaller) wide set, since that is all this rule can ever report
+    on.
+
+    A statement that fails to parse falls back to the original bare-name text match rather
+    than reporting nothing — the same "keep the signal, note the limitation" trade-off the
+    rest of this rule makes for unparseable input elsewhere in the pipeline.
+    """
+    by_bare_name: dict[str, list[Relation]] = {}
+    for relation in wide:
+        by_bare_name.setdefault(relation.table, []).append(relation)
+    try:
+        tree = parse(sql, dialect)
+    except SqlParseError:
+        return tuple(sorted(relation for relation in wide if mentions_table(relation.table, sql)))
+    touched: set[Relation] = set()
+    for table in tree.find_all(exp.Table):
+        if table.db:
+            candidate = Relation(schema=table.db, table=table.name)
+            if candidate in wide:
+                touched.add(candidate)
+            continue
+        owners = by_bare_name.get(table.name, ())
+        if len(owners) == 1:
+            touched.add(owners[0])
+    return tuple(sorted(touched))
+
+
 def propose_select_star(
     workload: Workload,
     facts: Mapping[Relation, TableFacts],
     *,
     min_cost_share: float,
     min_columns: int = WIDE_TABLE_COLUMNS,
+    dialect: str = "postgres",
 ) -> list[Proposal]:
     """ADV006 — hot query groups projecting a star from a wide table."""
     wide = {relation: fact for relation, fact in facts.items() if len(fact.columns) >= min_columns}
@@ -718,12 +769,7 @@ def propose_select_star(
     for stat in workload.stats:
         if FLAG_SELECT_STAR not in stat.flags:
             continue
-        # Matched against statement text on the bare table name — that is what the SQL
-        # actually says. The relation is carried through separately so the evidence can
-        # still report the qualified name.
-        touched = sorted(
-            (relation for relation in wide if mentions_table(relation.table, stat.sql)),
-        )
+        touched = sorted(_wide_relations_touched(stat.sql, dialect, wide))
         if not touched:
             continue
         share = (stat.total_time_ms / total) if total else 0.0
@@ -1173,7 +1219,9 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             ),
             *propose_partial_indexes(aggregation.usage, facts, min_cost_share=min_cost_share),
             *propose_sargability(aggregation.usage, workload, min_cost_share=min_cost_share),
-            *propose_select_star(workload, facts, min_cost_share=min_cost_share),
+            *propose_select_star(
+                workload, facts, min_cost_share=min_cost_share, dialect=self.engine
+            ),
             *propose_unused_indexes(existing, hot_tables=aggregation.tables),
             *propose_redundant_indexes(existing),
         ]
