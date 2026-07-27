@@ -173,7 +173,11 @@ class Aggregation:
     usage: tuple[ColumnUsage, ...]
     total_cost_ms: float
     skipped_unqualifiable: int
-    tables: frozenset[str]
+    tables: frozenset[Relation]
+    #: Statements dropped because a bare table name is held by two introspected schemas.
+    #: Separate from `skipped_unqualifiable` because the remedy differs: qualify the query
+    #: or run once per schema, rather than widen the schema.
+    skipped_ambiguous: int = 0
 
 
 @dataclass(frozen=True)

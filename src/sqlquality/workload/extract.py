@@ -21,6 +21,16 @@ class UnqualifiableQuery(ValueError):
     """Raised when a query's columns cannot be resolved against the supplied schema."""
 
 
+class AmbiguousRelation(UnqualifiableQuery):
+    """A table name that two introspected schemas both hold, in a query that did not qualify it.
+
+    A subclass, not a sibling: every caller that wants to treat all resolution failures
+    alike keeps working with one `except UnqualifiableQuery`, while `aggregate` can count
+    this case separately because its remedy is different — qualify the query or run once per
+    schema, rather than widen the schema.
+    """
+
+
 def _within(node: exp.Expression, *types: type[exp.Expression]) -> bool:
     """True if any ancestor of ``node`` is one of ``types``. Mirrors antipatterns._within_exists."""
     parent = node.parent
@@ -177,15 +187,24 @@ def extract_usage(
     are keyed by schema. Stars are not expanded: a projected star tells us nothing about
     which columns are filtered, and expanding it would drown the rollup in projection noise.
 
-    ``SchemaError`` is caught alongside ``OptimizeError`` and re-raised as
-    ``UnqualifiableQuery``. It is *not* an ``OptimizeError`` subclass — its bases are
-    ``SqlglotError``, ``Exception`` — so catching only ``OptimizeError`` let an ambiguous
-    bare table name (`Ambiguous mapping for orders: sales, staging.`) escape `aggregate()`
-    and abort the whole run with a traceback.
+    ``SchemaError`` is *not* an ``OptimizeError`` subclass — its bases are ``SqlglotError``,
+    ``Exception`` — so catching only ``OptimizeError`` let an ambiguous bare table name
+    (`Ambiguous mapping for orders: sales, staging.`) escape `aggregate()` and abort the whole
+    run with a traceback. It is now caught on its own and, when the message signals ambiguity
+    specifically, re-raised as `AmbiguousRelation` rather than the plain `UnqualifiableQuery`
+    every other resolution failure gets.
     """
     try:
         qualified = qualify(tree.copy(), dialect=dialect, schema=schema, expand_stars=False)
-    except (OptimizeError, SchemaError) as exc:
+    except SchemaError as exc:
+        # sqlglot has exactly one ambiguity message and no error code to match on, so the
+        # text is the only signal available. Matching it loosely (lowercased substring)
+        # rather than exactly, because a wording change upstream should degrade this to
+        # "counted as unqualifiable" — the pre-existing behaviour — not crash.
+        if "ambiguous mapping" in str(exc).lower():
+            raise AmbiguousRelation(str(exc)) from exc
+        raise UnqualifiableQuery(str(exc)) from exc
+    except OptimizeError as exc:
         raise UnqualifiableQuery(str(exc)) from exc
 
     seen: set[tuple[Relation, str, ColumnRole]] = set()
