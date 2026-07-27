@@ -19,6 +19,7 @@ from sqlquality.models import (
     Aggregation,
     ConnectionParams,
     Proposal,
+    Relation,
     TableFacts,
     Workload,
     WorkloadFetch,
@@ -74,19 +75,25 @@ class WorkloadAdapter(ABC):
 
     @abstractmethod
     def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
-        """Schema mapping for sqlglot qualify(): {table: {column: type}}."""
+        """Schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+
+        Nested rather than flat: a flat `{table: {column: type}}` map cannot tell two
+        same-named tables in different schemas apart, so a column that exists in only one
+        of them resolves against the union of both — the exact aliasing this task exists
+        to remove.
+        """
 
     @abstractmethod
     def fetch_table_facts(
-        self, schemas: tuple[str, ...], tables: frozenset[str]
-    ) -> dict[str, TableFacts]:
-        """Row estimates, sizes, columns and per-column NDV for the given tables."""
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, TableFacts]:
+        """Row estimates, sizes, columns and per-column NDV for the given relations."""
 
     @abstractmethod
     def propose(
         self,
         aggregation: Aggregation,
-        facts: dict[str, TableFacts],
+        facts: dict[Relation, TableFacts],
         workload: Workload,
         *,
         min_cost_share: float,

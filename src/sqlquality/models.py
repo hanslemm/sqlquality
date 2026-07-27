@@ -104,6 +104,27 @@ class Workload:
         return sum(s.total_time_ms for s in self.stats)
 
 
+@dataclass(frozen=True, order=True)
+class Relation:
+    """A schema-qualified relation — the key every catalog fact is stored under.
+
+    Bare table names were the key until multi-schema support landed, and they aliased: two
+    schemas each holding an `orders` merged into one entry, so the last catalog row won the
+    row estimate while `qualify()` resolved columns against the union of both column sets.
+
+    ``order=True`` because the rules sort their output for canonical, run-to-run stable
+    report ordering, and a bare `sorted()` over relation keys has to work. Field order is
+    (schema, table) so that ordering groups a schema's tables together.
+    """
+
+    schema: str
+    table: str
+
+    def __str__(self) -> str:
+        """`schema.table` — how the relation appears in a proposal title or JSON key."""
+        return f"{self.schema}.{self.table}"
+
+
 class ColumnRole(str, Enum):
     EQUALITY = "equality"
     RANGE = "range"
@@ -117,7 +138,7 @@ class ColumnRole(str, Enum):
 
 @dataclass(frozen=True)
 class ColumnUsage:
-    table: str
+    relation: Relation
     column: str
     role: ColumnRole
     calls: int
@@ -152,14 +173,30 @@ class Aggregation:
     usage: tuple[ColumnUsage, ...]
     total_cost_ms: float
     skipped_unqualifiable: int
-    tables: frozenset[str]
+    tables: frozenset[Relation]
+    #: Statements dropped because a bare table name is held by two introspected schemas.
+    #: Separate from `skipped_unqualifiable` because the remedy differs: qualify the query
+    #: or run once per schema, rather than widen the schema.
+    #:
+    #: Counts two distinct discovery situations, both the same underlying fact. Most
+    #: statements reference a column by name, so `qualify()` (or the DML sole-target check)
+    #: raises trying to resolve it and `aggregate()` counts the exception directly. A
+    #: statement that names the ambiguous table but references none of its columns by name
+    #: — `select * from orders`, `select count(*) from orders`, `select 1 from orders` —
+    #: gives `qualify()` nothing to validate, so it raises nothing either; `aggregate()`
+    #: instead recognizes this case directly (zero usage extracted, plus a bare table name
+    #: two introspected schemas both hold) and counts it the same way.
+    skipped_ambiguous: int = 0
 
 
 @dataclass(frozen=True)
 class TableFacts:
     """Engine-neutral catalog facts. Engine-specific physical design stays in the adapter."""
 
-    name: str
+    #: The schema-qualified key this table is stored under — not a display name. Two
+    #: same-named tables in different schemas each get their own `TableFacts`, keyed by
+    #: their own `Relation`; a bare name here would alias them back together.
+    relation: Relation
     row_estimate: int | None
     size_bytes: int | None
     columns: tuple[str, ...]
@@ -181,6 +218,31 @@ class Proposal:
     evidence: dict[str, object]
     confidence: Confidence
     ddl: str | None = None
+
+
+def analyzed_query_groups(workload: Workload, aggregation: Aggregation) -> int:
+    """Query groups whose usage was actually extracted.
+
+    Unresolvable *and* ambiguous groups are both a *subset* of ``workload.stats``, not a
+    separate pool, so ``len(stats)`` overstates what was understood unless both are
+    subtracted. Omitting `skipped_ambiguous` used to let an ambiguous statement count as
+    "analyzed" in the terminal's coverage line while the *same* statement counted as
+    "unexplained" in the low-coverage share — a statement cannot honestly be both, and the
+    share was the one that mattered: it silently deflated toward "coverage is fine",
+    suppressing the low-coverage warning exactly when ambiguity was the reason coverage was
+    bad.
+
+    Lives here, beside `cost_share_of`, for the same reason: the terminal, the markdown
+    report and the JSON payload each present this number, and when the terminal alone
+    subtracted the skips, markdown printed "**Query groups analyzed:** 8" directly above
+    "2 ambiguous" while the terminal said "analyzed 6 of 8" — the self-contradiction this
+    function exists to prevent, reintroduced on two surfaces out of three. One helper, three
+    call sites, no way to omit it again.
+    """
+    return max(
+        0,
+        len(workload.stats) - aggregation.skipped_unqualifiable - aggregation.skipped_ambiguous,
+    )
 
 
 def cost_share_of(evidence: Mapping[str, object]) -> float | None:

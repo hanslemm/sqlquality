@@ -1,10 +1,13 @@
 # Design: `sqlquality advise` — workload-driven database optimization
 
 Date: 2026-07-26
-Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`; Redshift, Snowflake and
-dbt enrichment (steps 5–7) remain design-only, not yet implemented. See
+Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`, now including ADV007
+(join keys), ADV008 (`GROUP BY`), multi-schema `(schema, table)` keying, and
+`DECLARE`/`COPY` unwrapping (Batch 2, 2026-07-27); Redshift, Snowflake and dbt enrichment
+(steps 5–7) remain design-only, not yet implemented. See
 `docs/superpowers/plans/2026-07-26-advise-postgres.md` for the implementation plan and its
-"Deviations from the spec" section, reconciled into this document below.
+"Deviations from the spec" section, reconciled into this document below, and "Deviations
+from the spec (Batch 2)" further down for what changed after the initial ship.
 
 ## Summary
 
@@ -104,16 +107,21 @@ class WorkloadAdapter(ABC):
         redacted — redaction happens once, in the engine-agnostic `ingest()`, so there is
         exactly one place to audit for literal leakage instead of one per adapter."""
 
-    def fetch_schema(self, tables: set[str]) -> dict:
-        """Schema mapping for sqlglot qualify()."""
+    def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
+        """Nested schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+        Nested, not flat, so qualify() can tell two same-named tables in different
+        schemas apart — see "Deviations from the spec (Batch 2)" below."""
 
-    def fetch_table_facts(self, tables: set[str]) -> dict[str, TableFacts]:
-        """Row estimates, sizes, per-column NDV, current physical design."""
+    def fetch_table_facts(
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> dict[Relation, TableFacts]:
+        """Row estimates, sizes, per-column NDV, current physical design, keyed by the
+        schema-qualified relation each row belongs to."""
 
     def propose(
         self,
         aggregation: Aggregation,
-        facts: dict[str, TableFacts],
+        facts: dict[Relation, TableFacts],
         workload: Workload,
         *,
         min_cost_share: float,
@@ -136,6 +144,18 @@ class WorkloadAdapter(ABC):
 Added to `models.py` alongside the existing `Finding` / `ComplexityScore`:
 
 ```python
+@dataclass(frozen=True, order=True)
+class Relation:
+    """A schema-qualified relation — the key every catalog fact is stored under.
+    Bare table names aliased: two schemas each holding an `orders` merged into one entry,
+    so the last catalog row read won the row estimate. `order=True` so rules can sort
+    their output for stable report ordering."""
+    schema: str
+    table: str
+
+    def __str__(self) -> str:
+        return f"{self.schema}.{self.table}"
+
 @dataclass(frozen=True)
 class ConnectionParams:
     engine: str               # postgres | redshift | snowflake
@@ -192,16 +212,19 @@ class ColumnRole(str, Enum):
 
 @dataclass(frozen=True)
 class ColumnUsage:
-    table: str
+    relation: Relation
     column: str
     role: ColumnRole
     calls: int
     cost_ms: float
     cost_share: float         # fraction of total analyzed workload cost — NOT a partition,
                               # see the "cost_share is not a partition" note in the README
-    fingerprints: int
     fingerprint_ids: frozenset[str] = frozenset()  # which query groups contributed this
                                                     # usage, so rules can test co-occurrence
+
+    @property
+    def fingerprints(self) -> int:
+        return len(self.fingerprint_ids)
 
 @dataclass(frozen=True)
 class Aggregation:
@@ -211,11 +234,16 @@ class Aggregation:
     skipped_unqualifiable: int  # queries that failed qualify() — lives here, not on
                                 # Workload, because qualification happens during
                                 # aggregation, not ingest
-    tables: frozenset[str]
+    tables: frozenset[Relation]
+    skipped_ambiguous: int = 0  # a bare table name held by 2+ introspected schemas,
+                                # named without qualification — attributing it would be a
+                                # coin flip, so it is counted and dropped instead
 
 @dataclass(frozen=True)
 class TableFacts:
-    name: str
+    relation: Relation        # the schema-qualified key this table is stored under — not
+                              # a display name; two same-named tables in different
+                              # schemas each get their own TableFacts
     row_estimate: int | None
     size_bytes: int | None
     columns: tuple[str, ...]
@@ -356,6 +384,8 @@ Workload from `pg_stat_statements` (`queryid`, `query`, `calls`, `total_exec_tim
 | ADV004 | Partial index for a hot fingerprint carrying a constant structural predicate | fingerprint count, cost share |
 | ADV005 | Non-sargable hot predicate (`lower(col) =`, casts, leading wildcard) → rewrite or expression index | cost share |
 | ADV006 | Hot `SELECT *` on a wide table | column count, cost share |
+| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
+| ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
 
 Proposals are suppressed entirely for tables below a row-count floor, where a sequential
 scan is the correct plan and an index would be pure overhead.
@@ -364,6 +394,70 @@ scan is the correct plan and an index would be pure overhead.
 per-statement timestamps before PostgreSQL 17 added `stats_since`. On earlier versions
 `--since` cannot be honored: the report states the window as "since stats reset at
 `<timestamp>`" rather than implying the requested window was applied.
+
+## Deviations from the spec (Batch 2)
+
+Found and agreed while implementing ADV007/ADV008, multi-schema support and wrapped-read
+handling, after the initial ship this document otherwise describes. The dataclass shapes
+in "Core dataclasses" and "Interface" above already reflect what shipped as a result —
+`ColumnUsage.relation: Relation`, `Aggregation.tables: frozenset[Relation]`,
+`TableFacts.relation`, `fetch_schema`/`fetch_table_facts`/`fetch_indexes` keyed and
+parameterized by `Relation` — not the bare-string shapes (`ColumnUsage.table: str`,
+`Aggregation.tables: frozenset[str]`, `TableFacts.name`) that shipped first. This section
+records why they changed.
+
+1. **Every catalog fact is keyed by `Relation(schema, table)`, not a bare table name.** A
+   bare-name key aliased two same-named tables in different schemas: whichever catalog row
+   was read last won the row estimate, while `qualify()` resolved columns against the
+   union of both tables' columns. `ColumnUsage.table` becomes `ColumnUsage.relation`,
+   `Aggregation.tables` becomes `frozenset[Relation]`, `TableFacts.name` becomes
+   `TableFacts.relation`, and `fetch_schema`/`fetch_table_facts`/`fetch_indexes` are all
+   keyed and parameterized by `Relation`. `fetch_schema` also changes shape, from a flat
+   `{table: {column: type}}` to a nested `{schema: {table: {column: type}}}` — the nesting
+   is what lets `qualify()` tell two same-named tables apart at all; a flat map resolves a
+   column against the union of both column sets.
+2. **Schema resolution reads the introspected schema map, not `Table.db`.** The obvious
+   implementation attributes a query's table to `table.db`, the schema sqlglot's `qualify()`
+   already resolved. That is wrong for the common case: `qualify()` leaves `db` **empty**
+   for a bare table reference — `SELECT * FROM orders`, not `SELECT * FROM public.orders`
+   — because production SQL relies on `search_path`, not full qualification, and
+   `qualify()` has no schema to fill `db` in with. A `Table.db`-only implementation would
+   therefore key every search_path-reliant workload under `Relation(schema="", ...)`,
+   silently suppressing every proposal for it — exactly the shape-of-real-data failure
+   this batch's live suite exists to catch. The shipped resolver (`resolve_relation` in
+   `workload/extract.py`) instead trusts `table.db` only once it is checked against the
+   introspected schema map, and falls back to looking the bare table name up in that map:
+   exactly one introspected schema holding the name resolves unambiguously; more than one
+   is genuinely ambiguous and is counted (`Aggregation.skipped_ambiguous`) rather than
+   guessed at; none means the table lives outside the introspected schemas and the column
+   is dropped.
+3. **`advise` accepts repeated `--schema`.** Multiple schemas used to be rejected outright
+   because the bare-name key could not tell two schemas' same-named tables apart; the
+   `Relation` keying above is what makes accepting more than one safe.
+4. **`DECLARE ... CURSOR FOR` and `COPY (...) TO` reads are unwrapped to their inner query**
+   before the noise filter runs, rather than filtered as maintenance statements. Both are
+   ordinary reads with real predicates — `DECLARE` is what every psycopg2 server-side
+   cursor emits — but both begin with a keyword the noise filter otherwise drops.
+5. **The rules are evaluated independently but not *reported* independently.** The spec above
+   describes eight rules that each report their own findings; in the shipped code a
+   reconciliation pass runs over the assembled proposal list before the report is written.
+   Proposals with identical DDL collapse into one, and a proposed index whose columns are a
+   leading prefix of another proposed index for the same table collapses into the wider one —
+   without this, ADV001 and ADV007 shipped a `CREATE INDEX` pair on the same table that
+   ADV003 would flag as redundant on the following run, i.e. the tool contradicting itself
+   across runs. The absorbed proposal's rationale and confidence are folded into the
+   survivor's, attributed by code; its `evidence` is discarded. Same column *set* in a
+   different order is not a prefix relationship and both are kept, each disclosing the other.
+   Consequence a consumer must know: a rule can fire and contribute no entry to `proposals`.
+6. **A composite index proposal requires *joint* support.** ADV001, ADV004 and ADV008 only
+   combine columns that some single query group uses together, tracked as a running
+   intersection of contributing fingerprints, and report that joint count as
+   `co_occurring_fingerprints` instead of a per-column `fingerprints`. Cost weighting alone
+   is not enough: a proposal's `cost_share` is the *max* over its columns, so a column
+   carrying ~0% of workload cost could not be filtered out by it, and a near-free query
+   contributing one column to the middle of a composite produced an index no query could use.
+   ADV002 and ADV003, the two `DROP INDEX` rules, are likewise both scoped to the relations
+   the workload was observed using rather than to every relation the catalog query returned.
 
 ### Redshift
 

@@ -42,6 +42,81 @@ _INTROSPECTION = re.compile(
 )
 
 
+#: `DECLARE <name> [BINARY] [ASENSITIVE|INSENSITIVE] [[NO] SCROLL] CURSOR
+#:  [WITH|WITHOUT HOLD] FOR <query>` — the full PostgreSQL grammar for the statement every
+#: psycopg2 server-side cursor emits.
+#:
+#: Anchored on `CURSOR ... FOR` rather than on the first `FOR`, because a cursor name is an
+#: identifier and a quoted one may contain the word: `DECLARE "for sale" CURSOR FOR ...`
+#: would otherwise be cut at the wrong place and yield unparseable text. The name alternative
+#: matches a quoted identifier (with doubled quotes escaped) before an unquoted one for the
+#: same reason.
+_DECLARE_CURSOR = re.compile(
+    r"^\s*DECLARE\s+"
+    r'(?:"(?:[^"]|"")*"|[A-Za-z_]\w*)\s+'
+    r"(?:BINARY\s+)?"
+    r"(?:ASENSITIVE\s+|INSENSITIVE\s+)?"
+    r"(?:NO\s+SCROLL\s+|SCROLL\s+)?"
+    r"CURSOR\s+"
+    r"(?:WITH\s+HOLD\s+|WITHOUT\s+HOLD\s+)?"
+    r"FOR\s+(?P<query>\S.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: `COPY ( <query> ) TO ...` — the only COPY form carrying predicates worth analysing.
+#: `COPY <table> TO` is a whole-relation dump with no predicates, and `COPY ... FROM` is a
+#: write; both stay noise. The capture is greedy to the last `)` so a query containing
+#: parentheses survives; the result is validated by the caller's parse, so a mis-cut yields
+#: an unparseable count rather than a wrong analysis.
+_COPY_QUERY = re.compile(
+    r"^\s*COPY\s*\(\s*(?P<query>.*)\s*\)\s*TO\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def unwrap(sql: str) -> str:
+    """The inner query of a cursor declaration or `COPY (...) TO`, else ``sql`` unchanged.
+
+    `DECLARE ... CURSOR FOR SELECT ...` and `COPY (SELECT ...) TO ...` are ordinary reads
+    with real predicates, but both begin with a keyword the noise filter drops — so on any
+    workload using server-side cursors (every psycopg2 `cursor(name=...)`, which is what
+    Django and SQLAlchemy emit for large result sets) the hottest reads were counted as
+    "filtered" and thrown away.
+
+    What this actually restores differs by form, measured on PostgreSQL 16. `COPY
+    (SELECT ...) TO ...` attributes correctly: `pg_stat_statements` charges the whole
+    execution's time and row count to the `COPY` statement itself, so cost-weighted rules
+    see the real number.
+
+    `DECLARE ... CURSOR FOR` does **not**: Postgres attributes the work of actually reading
+    rows to the `FETCH` statements that follow, which `is_noise` still filters (a `FETCH`
+    carries no query text, so it has no predicates to attribute and unfiltering it would
+    only inflate the denominator with uncounted cost). The `DECLARE` itself is recorded
+    accurately by *call count* — one call per cursor opened — but with near-zero time and
+    rows, since opening a cursor does no scanning. So a cursor
+    read recovered here contributes its predicate columns to `aggregate` and can still join
+    an index candidate, but it cannot earn a proposal on cost alone: the default
+    `--min-cost-share` can suppress it outright, and `WITH HOLD` does not change this.
+
+    Text surgery rather than AST surgery, for a reason that is not a preference: sqlglot
+    cannot parse `DECLARE` at all — it falls back to `exp.Command` and leaves the entire
+    tail as a single string literal, so there is no inner tree to lift. `COPY` *does* parse
+    (to `exp.Copy` with a `Subquery`), but doing both here keeps one code path and, more
+    importantly, lets `is_noise` run on the *unwrapped* text — which is what stops a
+    `DECLARE c CURSOR FOR SELECT * FROM pg_stat_statements` from smuggling our own
+    introspection into the analysed workload.
+
+    Returns the input unchanged when nothing matches. The caller parses the result, so a
+    partial or malformed wrapper degrades to the pre-existing behaviour — counted
+    unparseable or filtered — rather than producing a wrong analysis.
+    """
+    for pattern in (_DECLARE_CURSOR, _COPY_QUERY):
+        match = pattern.match(sql)
+        if match is not None:
+            return match.group("query").strip()
+    return sql
+
+
 def is_noise(sql: str) -> bool:
     """True for session control, DDL, maintenance, and introspection statements.
 
@@ -105,11 +180,15 @@ def ingest(fetch: WorkloadFetch, dialect: str, *, keep_literals: bool = False) -
     skipped_noise = 0
 
     for row in fetch.rows:
-        if is_noise(row.sql):
+        # Unwrap *before* the noise test, so a cursor declaration is judged on the query it
+        # declares. Judging the wrapper drops the read; judging the inner query keeps a real
+        # read and still filters an inner introspection query.
+        sql = unwrap(row.sql)
+        if is_noise(sql):
             skipped_noise += 1
             continue
         try:
-            tree = parse(row.sql, dialect)
+            tree = parse(sql, dialect)
         except SqlParseError:
             skipped_unparseable += 1
             continue
