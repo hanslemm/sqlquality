@@ -220,3 +220,29 @@ def test_lint_fix_bad_second_path_leaves_first_unmodified(tmp_path):
     result = runner.invoke(app, ["lint", "--fix", str(good), str(missing)])
     assert result.exit_code == 2
     assert good.read_text() == before  # untouched
+
+
+def test_lint_fix_writes_utf8(tmp_path, monkeypatch):
+    """--fix rewrites the user's own source file.
+
+    read_sql_file already reads as UTF-8; writing without an encoding meant a non-ASCII
+    comment could come back as mojibake, or raise UnicodeEncodeError — which escapes as
+    exit 1, the code `lint` also uses for findings.
+    """
+    from pathlib import Path as _P
+
+    seen: list[str | None] = []
+    real = _P.write_text
+
+    def spy(self, data, encoding=None, *args, **kwargs):
+        seen.append(encoding)
+        return real(self, data, encoding=encoding or "utf-8", *args, **kwargs)
+
+    monkeypatch.setattr(_P, "write_text", spy)
+    f = tmp_path / "m.sql"
+    f.write_text("-- \u2705 v\u00e9rifi\u00e9\nselect a from t as t\n", encoding="utf-8")
+    seen.clear()
+    result = runner.invoke(app, ["lint", str(f), "--fix"])
+    assert result.exit_code in (0, 1), result.output
+    assert seen == ["utf-8"], f"--fix wrote the source file without an encoding: {seen}"
+    assert "v\u00e9rifi\u00e9" in f.read_text(encoding="utf-8")
