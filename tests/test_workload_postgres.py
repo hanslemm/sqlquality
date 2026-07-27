@@ -154,14 +154,22 @@ def test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility():
     that justifies an absence with a false premise is how the wrong decision gets made next
     time, so the claim is pinned here.
     """
+    # Scoped to the CAP_WORKLOAD comment block rather than the whole module: searching all of
+    # `postgres.py` for "postgresql 14" is satisfied by `_row_estimate`'s unrelated docstring
+    # about the `reltuples` sentinel, so the assertion passed with the real sentence deleted.
     source = _source_of(postgres_module)
+    marker = "Deliberately NOT filtered on `s.toplevel`"
+    assert marker in source, "the CAP_WORKLOAD comment explaining the absence is gone"
+    start = source.index(marker)
+    comment_block = source[start : source.index('"""', start)]
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    for text, where in ((source, "the CAP_WORKLOAD comment"), (readme, "the README")):
+    for text, where in ((comment_block, "the CAP_WORKLOAD comment"), (readme, "the README")):
         lowered = text.lower()
-        assert "no `s.query`" not in lowered, f"{where} still claims no predicate can work"
-        assert "text pattern separates" not in lowered, f"{where} still claims impossibility"
+        # One absence check, not an enumeration of every phrasing the false claim once had:
+        # whack-a-mole substrings go stale and give false confidence. The positive assertion
+        # below is what actually pins the reasoning.
         assert "text pattern tells the two apart" not in lowered, (
-            f"{where} still claims impossibility"
+            f"{where} still claims no predicate can separate the two"
         )
         assert "postgresql 14" in lowered or "postgres 14" in lowered, (
             f"{where} does not state the version cost that is the actual reason"
@@ -171,17 +179,19 @@ def test_the_toplevel_tradeoff_is_documented_as_a_price_not_an_impossibility():
 def test_the_plpgsql_double_count_is_documented_as_a_limitation():
     """The larger, unfixable half of the `track = all` inaccuracy.
 
-    Every PL/pgSQL call is counted twice under `track = all` — measured, `SELECT lc.hot()`
-    at 68.21 ms plus its body at 67.67 ms for one execution — which roughly halves every
+    Every PL/pgSQL call is counted twice under `track = all` — the call and its body are
+    recorded as separate rows with nearly identical durations — which roughly halves every
     `cost_share`. Unlike the `COPY` duplicate no predicate can fix it (the call carries the
     cost, the body carries the predicates), so disclosure is the only honest treatment, and
     the README documented only the smaller `COPY` half.
+
+    Deliberately does *not* assert the specific milliseconds the README quotes. Two runs of
+    the same fixture measured 68.21/67.67 and 46.44/46.37 — the shape reproduces, the numbers
+    are that machine's. Pinning them would make an honest re-measurement look like a
+    regression and train the next person to edit the test rather than read it.
     """
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert "PL/pgSQL function call is counted twice" in readme
-    assert "68.21" in readme and "67.67" in readme, (
-        "the measurement behind the claim is not recorded"
-    )
     assert "no predicate can fix it" in readme
 
 
@@ -974,6 +984,40 @@ def test_the_schema_statement_runs_once_per_run():
     adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
     schema_calls = [sql for sql, _ in querier.calls if "information_schema.columns" in sql]
     assert len(schema_calls) == 1
+
+
+def test_the_catalog_statements_are_given_the_relations_they_filter_on():
+    """Each `= ANY(%s)` gets the schema list *and* the table list, not just the schema list.
+
+    `FakeQuerier` keys its canned rows on a SQL substring and ignores the bind parameters, so
+    nothing read `params[1]` anywhere in the suite: replacing the table list with a bogus value
+    in all three relation-scoped statements left every test green. A real server would then be
+    asked about the wrong relations — returning nothing, which reads exactly like a table with
+    no statistics and no indexes, and suppresses proposals with no message.
+
+    Asserted per statement rather than in aggregate: one shared assertion would pass while two
+    of the three passed nothing, which is the shape of six separate findings on this branch.
+    """
+    querier = FakeQuerier(
+        {
+            "information_schema.columns": [("public", "orders", "id", "integer")],
+            "pg_total_relation_size": [("public", "orders", 50_000, 1024)],
+            "pg_stats": [],
+            "pg_get_indexdef": [],
+        }
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    relations = frozenset({Relation("public", "orders"), Relation("public", "order_items")})
+    adapter.fetch_table_facts(("public",), relations)
+    adapter.fetch_indexes(("public",), relations)
+
+    expected_tables = ["order_items", "orders"]
+    for marker in ("pg_total_relation_size", "pg_stats", "pg_get_indexdef"):
+        binds = [params for sql, params in querier.calls if marker in sql]
+        assert binds, f"{marker} statement never ran"
+        for params in binds:
+            assert params[0] == ["public"], f"{marker} lost its schema list"
+            assert params[1] == expected_tables, f"{marker} lost its table list: {params[1]!r}"
 
 
 def test_a_denied_schema_statement_is_reported_once_not_twice():

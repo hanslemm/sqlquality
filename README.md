@@ -860,8 +860,9 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   rises to 14, that is the predicate to add.
 - **Every PL/pgSQL function call is counted twice under `pg_stat_statements.track = all`,
   and no predicate can fix it.** That setting records both the calling statement and each
-  statement inside the function body: measured on PostgreSQL 16, one execution of
-  `SELECT lc.hot()` appears as the call at 68.21 ms *and* its body at 67.67 ms. Both land in
+  statement inside the function body: on one PostgreSQL 16 run, a single execution of
+  `SELECT lc.hot()` appeared as the call at 68.21 ms *and* its body at 67.67 ms — the two
+  durations track each other, so the absolute figures vary per machine. Both land in
   the whole-window denominator, so on a function-heavy workload every `cost_share` is
   roughly halved and `--min-cost-share` is correspondingly stricter than it looks. Unlike
   the `COPY` case above there is no filter that helps: the call carries the cost while the

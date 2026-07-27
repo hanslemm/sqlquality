@@ -652,12 +652,13 @@ def propose_grouping_indexes(
     nothing.
 
     Evidence carries `co_occurring_fingerprints` (the joint overlap size) rather than a plain
-    `fingerprints` count — deliberately unlike ADV001 and ADV007, which each propose an index
-    for one candidate, so a per-column count is the whole truth about it. This rule and ADV004
-    propose an index justified by columns appearing *together*, where the joint overlap is the
-    only number that actually supports the proposal; a per-column count sitting beside it in a
-    report that renders evidence as bare `k=v` pairs would read as corroborating support that
-    is not there. The split is by what the rule claims, not by which rule came first.
+    `fingerprints` count — unlike ADV007 and ADV005, which each speak for a single column, so a
+    per-column count is the whole truth about them. This rule, ADV004 and ADV001 all propose an
+    index justified by columns appearing *together*, where the joint overlap is the only number
+    that actually supports the proposal; a per-column count sitting beside it in a report that
+    renders evidence as bare `k=v` pairs would read as corroborating support that is not there.
+    The split is by what the rule claims, not by which rule came first — ADV001 joined this side
+    of it once it too required joint co-occurrence.
     """
     proposals: list[Proposal] = []
     for relation, items in sorted(_by_relation(usage).items()):
@@ -757,9 +758,9 @@ def propose_grouping_indexes(
                     "calls": max(i.calls for i in chosen),
                     #: How many query groups actually group by *every* chosen column
                     #: together — the running intersection, not a per-column count. Same
-                    #: name and same meaning as ADV004's identical field. Deliberately no
-                    #: plain `fingerprints` key here (unlike ADV001/ADV007, which propose an
-                    #: index for one candidate and so have only a per-column count to give):
+                    #: name and same meaning as ADV004's and ADV001's identical field.
+                    #: Deliberately no plain `fingerprints` key here (unlike ADV007, which
+                    #: speaks for a single column and so has only a per-column count to give):
                     #: this proposal is justified by columns appearing *together*, so a
                     #: per-column count sitting beside the joint one in a report that
                     #: renders evidence as bare `k=v` pairs, with no per-rule text, would
