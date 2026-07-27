@@ -5,6 +5,7 @@ import pytest
 
 from sqlquality.models import ConnectionParams
 from sqlquality.workload import get_workload_adapter
+from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.postgres import (
     CAP_INDEXES,
     CAP_NDV,
@@ -474,10 +475,17 @@ def test_the_denial_fixture_would_otherwise_have_returned_statistics():
 
 
 class _FakeCursor:
-    """Enough of a psycopg cursor for connect()'s two session-setup statements."""
+    """Enough of a psycopg cursor for connect()'s two session-setup statements.
 
-    def __init__(self) -> None:
+    `executed` records this cursor's own statements; `log` is the connection-wide
+    transcript, so the *relative* order of session setup and later queries is observable.
+    Ordering across cursors is the whole point of invariant 2 — a read-only setting applied
+    after the first query would be no protection at all.
+    """
+
+    def __init__(self, log: list[tuple] | None = None) -> None:
         self.executed: list[tuple] = []
+        self._log = log if log is not None else []
 
     def __enter__(self):
         return self
@@ -487,6 +495,7 @@ class _FakeCursor:
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
+        self._log.append((sql, params))
 
     def fetchall(self):
         return []
@@ -495,9 +504,10 @@ class _FakeCursor:
 class _FakeConnection:
     def __init__(self) -> None:
         self.cursors: list[_FakeCursor] = []
+        self.log: list[tuple] = []
 
     def cursor(self):
-        cursor = _FakeCursor()
+        cursor = _FakeCursor(self.log)
         self.cursors.append(cursor)
         return cursor
 
@@ -511,7 +521,8 @@ def _install_fake_psycopg(monkeypatch, seen: dict):
 
     def connect(conninfo, **kwargs):
         seen["conninfo"] = conninfo
-        return _FakeConnection()
+        seen["connection"] = _FakeConnection()
+        return seen["connection"]
 
     module.connect = connect  # type: ignore[attr-defined]
     module.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -589,6 +600,55 @@ def test_forwarded_and_mapped_keys_are_not_reported_as_dropped(monkeypatch, caps
     )
     PostgresWorkloadAdapter().connect(params, 30)
     assert capsys.readouterr().err == ""
+
+
+def test_connect_arms_read_only_and_a_statement_timeout_before_the_querier_is_usable(
+    monkeypatch,
+):
+    """Invariant 2, at unit level: neither session-setup statement had a unit guard.
+
+    Removing `SET default_transaction_read_only = on` left the whole default suite green —
+    the read-only claim rested solely on an integration test that is deselected by default
+    and needs Docker. The statement timeout was asserted nowhere at all, unit or live: a
+    session with no timeout can pin a production server on a catalog query, which is the
+    opposite of the "safe to point at production" promise.
+
+    `before the querier is usable` is asserted against the connection-wide transcript, not
+    just per-cursor: setup applied after the first query would protect nothing, and only the
+    relative order can tell the difference.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    adapter = PostgresWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="postgres", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+
+    setup = seen["connection"].log[:]
+    assert setup == [
+        ("SET default_transaction_read_only = on", None),
+        ("SELECT set_config('statement_timeout', %s, false)", ("30000ms",)),
+    ], setup
+
+    # Usable only now, and every later statement lands after both setup statements.
+    adapter._query("SELECT 1", ())
+    assert seen["connection"].log[:2] == setup
+    assert seen["connection"].log[2] == ("SELECT 1", ())
+
+
+def test_an_out_of_range_timeout_is_clamped_before_it_reaches_the_session(monkeypatch):
+    """The value is `clamp_timeout_ms`'s output in milliseconds, not the raw seconds.
+
+    Passing `7200` through unclamped would arm a two-hour statement timeout, and passing it
+    as `7200` rather than `7200ms` would be read by Postgres as milliseconds — a 7-second
+    ceiling. Both are silent.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    PostgresWorkloadAdapter().connect(
+        ConnectionParams(engine="postgres", dsn="postgresql:///x", fields={}, source="--dsn"), 7200
+    )
+    assert seen["connection"].log[1][1] == (f"{MAX_TIMEOUT_S * 1000}ms",)
 
 
 def test_a_conninfo_build_failure_is_scrubbed_like_a_connect_failure(monkeypatch):
