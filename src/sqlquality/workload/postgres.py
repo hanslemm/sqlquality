@@ -213,8 +213,18 @@ def _is_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
 
 
 def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | None:
-    """Name of an existing index whose leading columns already cover ``candidate``."""
+    """Name of a *plain* existing index whose leading columns already cover ``candidate``.
+
+    Partial and expression indexes are excluded, for opposite reasons that land in the same
+    place. A partial index does not serve an unfiltered lookup, so calling it coverage
+    silently withholds a real proposal. An expression index's `columns` tuple understates it
+    — the expression positions contribute no name — so a prefix match against it is not a
+    match at all. Neither can be *proven* irrelevant either, which is why `propose_indexes`
+    discloses them instead of dropping them on the floor.
+    """
     for index in existing:
+        if index.is_partial or index.has_expressions:
+            continue
         if _is_prefix(candidate, index.columns):
             return index.name
     return None
@@ -305,6 +315,21 @@ def propose_indexes(
         if covered_by is not None:
             continue
 
+        table_indexes = existing.get(table, ())
+        partial_skipped = tuple(
+            index.name
+            for index in table_indexes
+            if index.is_partial and _is_prefix(columns, index.columns)
+        )
+        # Only expression indexes whose definition mentions the leading column are worth
+        # naming. Proving `lower(status)` equivalent to `status` would need the expression
+        # parsed and matched; naming it lets the operator make that call in one glance.
+        expression_indexes = tuple(
+            index.name
+            for index in table_indexes
+            if index.has_expressions and columns[0] in (index.definition or "")
+        )
+
         ndv = table_facts.ndv if table_facts else {}
         leading_ndv = ndv.get(columns[0])
         if rows is None or not have_index_data:
@@ -337,6 +362,18 @@ def propose_indexes(
             )
         if rows is None:
             rationale += _UNKNOWN_ROWS_NOTE
+        if partial_skipped:
+            rationale += (
+                f" A partial index ({', '.join(partial_skipped)}) leads with these columns "
+                "but carries a WHERE predicate, so it does not serve an unfiltered lookup — "
+                "it is not treated as covering this proposal."
+            )
+        if expression_indexes:
+            rationale += (
+                f" An expression index ({', '.join(expression_indexes)}) mentions "
+                f"{columns[0]}; sqlquality cannot tell whether it already serves this "
+                "lookup, so confirm before applying."
+            )
 
         proposals.append(
             Proposal(
@@ -352,6 +389,8 @@ def propose_indexes(
                     "fingerprints": max(i.fingerprints for i in chosen),
                     "row_estimate": rows,
                     "leading_ndv": leading_ndv,
+                    "partial_indexes_skipped": partial_skipped,
+                    "expression_indexes": expression_indexes,
                 },
                 confidence=confidence,
                 ddl=(
