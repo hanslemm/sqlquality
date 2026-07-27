@@ -229,3 +229,87 @@ def test_check_old_schema_warns(tmp_path):
     # Warning only: no behavior change, still exits normally.
     assert result.exit_code == 0
     assert "v12" in result.stderr and "v9" in result.stderr
+
+
+def test_check_html_write_failure_exits_2_not_1(tmp_path):
+    """A bad --html path must not be mistaken for a failed gate.
+
+    `check` uses exit 1 legitimately, for a regression over the threshold, so an unwritable
+    output path escaping as exit 1 is indistinguishable from a real finding — CI would
+    report a healthy run as a blocked one.
+    """
+    proj, state = _project_with_baseline(tmp_path)
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--html",
+                str(tmp_path / "nope" / "missing.html"),
+            ],
+        )
+    assert result.exit_code == 2, result.output
+    assert "--html" in result.output
+
+
+def test_check_markdown_write_failure_exits_2_not_1(tmp_path):
+    proj, state = _project_with_baseline(tmp_path)
+    a_directory = tmp_path / "adir"
+    a_directory.mkdir()
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--markdown",
+                str(a_directory),
+            ],
+        )
+    assert result.exit_code == 2, result.output
+    assert "--markdown" in result.output
+
+
+def test_check_writes_reports_as_utf8(tmp_path, monkeypatch):
+    """Both report writes must name their encoding.
+
+    The verdict line carries an emoji, so a platform-encoded write is a guaranteed crash on
+    an ASCII locale — and UnicodeEncodeError is a ValueError, so it escapes the OSError
+    handler and exits 1, which `check` also uses for a failed gate. Asserting the argument
+    rather than emulating a locale, because this Python resolves the default encoding
+    somewhere the locale module cannot be patched from.
+    """
+    seen: list[str | None] = []
+    real = Path.write_text
+
+    def spy(self, data, encoding=None, *args, **kwargs):
+        seen.append(encoding)
+        return real(self, data, encoding=encoding or "utf-8", *args, **kwargs)
+
+    proj, state = _project_with_baseline(tmp_path)
+    monkeypatch.setattr(Path, "write_text", spy)
+    seen.clear()  # the fixture writes manifests of its own; only the reports matter here
+    with _mock_changed():
+        result = runner.invoke(
+            app,
+            [
+                "check",
+                "--project-dir",
+                str(proj),
+                "--state",
+                str(state),
+                "--markdown",
+                str(tmp_path / "r.md"),
+                "--html",
+                str(tmp_path / "r.html"),
+            ],
+        )
+    assert result.exit_code in (0, 1), result.output
+    assert seen == ["utf-8", "utf-8"], f"reports written without an explicit encoding: {seen}"
