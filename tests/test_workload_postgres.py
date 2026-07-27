@@ -236,8 +236,34 @@ def test_fetch_indexes_restores_column_order_from_ordinality():
     querier = FakeQuerier(
         {
             "pg_index": [
-                ("orders", "idx_status_created", "created_at", 2, False, False, 0, 8192),
-                ("orders", "idx_status_created", "status", 1, False, False, 0, 8192),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "created_at",
+                    2,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
             ]
         }
     )
@@ -286,9 +312,48 @@ def test_fetch_indexes_groups_columns_in_ordinal_order():
     querier = FakeQuerier(
         {
             "pg_index": [
-                ("orders", "orders_pkey", "id", 1, True, True, 900, 4096),
-                ("orders", "idx_status_created", "status", 1, False, False, 0, 8192),
-                ("orders", "idx_status_created", "created_at", 2, False, False, 0, 8192),
+                (
+                    "orders",
+                    "orders_pkey",
+                    "id",
+                    1,
+                    True,
+                    True,
+                    900,
+                    4096,
+                    False,
+                    None,
+                    False,
+                    "CREATE UNIQUE INDEX orders_pkey ON orders (id)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
+                (
+                    "orders",
+                    "idx_status_created",
+                    "created_at",
+                    2,
+                    False,
+                    False,
+                    0,
+                    8192,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status_created ON orders (status, created_at)",
+                ),
             ]
         }
     )
@@ -580,3 +645,104 @@ def test_the_timeout_bounds_have_a_single_definition():
         assert str(base.MAX_TIMEOUT_S) not in source, (
             f"{module.__name__} restates the --timeout ceiling as a literal"
         )
+
+
+def test_fetch_indexes_records_an_expression_index_rather_than_dropping_it():
+    """`indkey` holds 0 for an expression column and no pg_attribute row has attnum 0.
+
+    The old inner join therefore discarded those rows, so an index on `lower(status)`
+    arrived with an empty column tuple and could not be reasoned about at all.
+    """
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                # attname is NULL for the expression column, as a LEFT JOIN yields.
+                (
+                    "orders",
+                    "idx_lower_status",
+                    None,
+                    1,
+                    False,
+                    False,
+                    3,
+                    8192,
+                    False,
+                    None,
+                    True,
+                    "CREATE INDEX idx_lower_status ON orders (lower(status))",
+                ),
+            ]
+        }
+    )
+    indexes = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )
+    index = indexes["orders"][0]
+    assert index.has_expressions is True
+    assert index.columns == ()
+    assert "lower(status)" in (index.definition or "")
+
+
+def test_fetch_indexes_records_a_partial_index_predicate():
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                (
+                    "orders",
+                    "idx_open",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    7,
+                    4096,
+                    True,
+                    "(shipped_at IS NULL)",
+                    False,
+                    "CREATE INDEX idx_open ON orders (status) WHERE shipped_at IS NULL",
+                ),
+            ]
+        }
+    )
+    index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )["orders"][0]
+    assert index.is_partial is True
+    assert index.predicate == "(shipped_at IS NULL)"
+    assert index.columns == ("status",)
+
+
+def test_fetch_indexes_leaves_a_plain_index_unmarked():
+    querier = FakeQuerier(
+        {
+            "pg_index": [
+                (
+                    "orders",
+                    "idx_status",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    12,
+                    4096,
+                    False,
+                    None,
+                    False,
+                    "CREATE INDEX idx_status ON orders (status)",
+                ),
+            ]
+        }
+    )
+    index = PostgresWorkloadAdapter(querier=querier).fetch_indexes(
+        ("public",), frozenset({"orders"})
+    )["orders"][0]
+    assert (index.is_partial, index.predicate, index.has_expressions) == (False, None, False)
+
+
+def test_the_indexes_statement_reads_predicate_and_expression_metadata():
+    sql = PostgresWorkloadAdapter().SQL[CAP_INDEXES].lower()
+    assert "indpred" in sql, "the partial-index predicate must be selected"
+    assert "indexprs" in sql, "expression presence must be selected"
+    assert "left join pg_attribute" in sql, (
+        "an inner join drops expression columns, whose indkey entry is 0"
+    )
