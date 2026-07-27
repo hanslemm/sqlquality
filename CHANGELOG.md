@@ -11,8 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `sqlquality advise` — reads Postgres query history (`pg_stat_statements`) and catalog
   metadata over a read-only connection and proposes indexes, index removals, partial
-  indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV006), with a `--json`
+  indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV008), with a `--json`
   and `--markdown` report and a reviewable `--ddl` script.
+- `advise` supports multiple `--schema` flags: every catalog fact (table sizes, NDV,
+  index lists, generated DDL) is keyed by `schema.table`, so same-named tables in
+  different introspected schemas no longer alias into one another.
+- ADV007 proposes an index on a hot, unindexed join key; ADV008 proposes a composite
+  index for a hot `GROUP BY`.
+- `advise` unwraps `DECLARE ... CURSOR FOR` and `COPY (...) TO` reads to their inner
+  query before filtering, so server-side-cursor and `COPY`-based workloads (what
+  psycopg2, Django and SQLAlchemy emit for large result sets) reach the analysis
+  instead of being discarded as maintenance statements.
 - Connections resolve from `--dsn`, `SQLQUALITY_DSN`, or a dbt `profiles.yml`, in that
   order. dbt is optional throughout.
 - `advise --dry-run` prints every introspection statement without connecting.

@@ -1,10 +1,13 @@
 # Design: `sqlquality advise` — workload-driven database optimization
 
 Date: 2026-07-26
-Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`; Redshift, Snowflake and
-dbt enrichment (steps 5–7) remain design-only, not yet implemented. See
+Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`, now including ADV007
+(join keys), ADV008 (`GROUP BY`), multi-schema `(schema, table)` keying, and
+`DECLARE`/`COPY` unwrapping (Batch 2, 2026-07-27); Redshift, Snowflake and dbt enrichment
+(steps 5–7) remain design-only, not yet implemented. See
 `docs/superpowers/plans/2026-07-26-advise-postgres.md` for the implementation plan and its
-"Deviations from the spec" section, reconciled into this document below.
+"Deviations from the spec" section, reconciled into this document below, and "Deviations
+from the spec (Batch 2)" further down for what changed after the initial ship.
 
 ## Summary
 
@@ -356,6 +359,8 @@ Workload from `pg_stat_statements` (`queryid`, `query`, `calls`, `total_exec_tim
 | ADV004 | Partial index for a hot fingerprint carrying a constant structural predicate | fingerprint count, cost share |
 | ADV005 | Non-sargable hot predicate (`lower(col) =`, casts, leading wildcard) → rewrite or expression index | cost share |
 | ADV006 | Hot `SELECT *` on a wide table | column count, cost share |
+| ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
+| ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
 
 Proposals are suppressed entirely for tables below a row-count floor, where a sequential
 scan is the correct plan and an index would be pure overhead.
@@ -364,6 +369,47 @@ scan is the correct plan and an index would be pure overhead.
 per-statement timestamps before PostgreSQL 17 added `stats_since`. On earlier versions
 `--since` cannot be honored: the report states the window as "since stats reset at
 `<timestamp>`" rather than implying the requested window was applied.
+
+## Deviations from the spec (Batch 2)
+
+Found and agreed while implementing ADV007/ADV008, multi-schema support and wrapped-read
+handling, after the initial ship this document otherwise describes. The dataclass shapes
+above (`ColumnUsage.table: str`, `Aggregation.tables: frozenset[str]`, `TableFacts.name`,
+`fetch_schema`/`fetch_table_facts` keyed on bare strings) are what shipped first; every one
+of them changed as follows.
+
+1. **Every catalog fact is keyed by `Relation(schema, table)`, not a bare table name.** A
+   bare-name key aliased two same-named tables in different schemas: whichever catalog row
+   was read last won the row estimate, while `qualify()` resolved columns against the
+   union of both tables' columns. `ColumnUsage.table` becomes `ColumnUsage.relation`,
+   `Aggregation.tables` becomes `frozenset[Relation]`, `TableFacts.name` becomes
+   `TableFacts.relation`, and `fetch_schema`/`fetch_table_facts`/`fetch_indexes` are all
+   keyed and parameterized by `Relation`. `fetch_schema` also changes shape, from a flat
+   `{table: {column: type}}` to a nested `{schema: {table: {column: type}}}` — the nesting
+   is what lets `qualify()` tell two same-named tables apart at all; a flat map resolves a
+   column against the union of both column sets.
+2. **Schema resolution reads the introspected schema map, not `Table.db`.** The obvious
+   implementation attributes a query's table to `table.db`, the schema sqlglot's `qualify()`
+   already resolved. That is wrong for the common case: `qualify()` leaves `db` **empty**
+   for a bare table reference — `SELECT * FROM orders`, not `SELECT * FROM public.orders`
+   — because production SQL relies on `search_path`, not full qualification, and
+   `qualify()` has no schema to fill `db` in with. A `Table.db`-only implementation would
+   therefore key every search_path-reliant workload under `Relation(schema="", ...)`,
+   silently suppressing every proposal for it — exactly the shape-of-real-data failure
+   this batch's live suite exists to catch. The shipped resolver (`resolve_relation` in
+   `workload/extract.py`) instead trusts `table.db` only once it is checked against the
+   introspected schema map, and falls back to looking the bare table name up in that map:
+   exactly one introspected schema holding the name resolves unambiguously; more than one
+   is genuinely ambiguous and is counted (`Aggregation.skipped_ambiguous`) rather than
+   guessed at; none means the table lives outside the introspected schemas and the column
+   is dropped.
+3. **`advise` accepts repeated `--schema`.** Multiple schemas used to be rejected outright
+   because the bare-name key could not tell two schemas' same-named tables apart; the
+   `Relation` keying above is what makes accepting more than one safe.
+4. **`DECLARE ... CURSOR FOR` and `COPY (...) TO` reads are unwrapped to their inner query**
+   before the noise filter runs, rather than filtered as maintenance statements. Both are
+   ordinary reads with real predicates — `DECLARE` is what every psycopg2 server-side
+   cursor emits — but both begin with a keyword the noise filter otherwise drops.
 
 ### Redshift
 
