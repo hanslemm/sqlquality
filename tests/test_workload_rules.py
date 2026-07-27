@@ -2551,3 +2551,86 @@ def test_adv008_evidence_reports_the_bare_table_name_and_its_own_schema():
     proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
     assert proposals[0].evidence["schema"] == "staging"
     assert proposals[0].evidence["table"] == "events"
+
+
+def test_adv001_medium_discloses_that_the_selectivity_check_could_not_run():
+    """MEDIUM must say *why*, not just be a middling number.
+
+    The rung is reached when the row count and the index list are both known but the NDV
+    catalog has nothing for the leading column — so the selectivity check did not run. Saying
+    nothing reads as a considered judgement rather than an absence of evidence, and disclosing
+    a check that could not run is the discipline the whole rule set turns on. It was the one
+    confidence level that stayed silent about its own reason.
+    """
+    relation = Relation("public", "orders")
+    usage = (_usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.5),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={})}
+    proposals = propose_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.MEDIUM
+    assert "No distinct-value statistics for status" in proposals[0].rationale
+    assert "ANALYZE" in proposals[0].rationale
+
+
+def test_adv007_medium_discloses_the_same_gap_in_the_same_words():
+    """The two index-creating rules must not explain the same rung differently.
+
+    An operator reads the report, not the rule that produced the line; ADV001 explaining a
+    MEDIUM while ADV007 stayed silent for the identical reason is the asymmetry that made the
+    low-NDV caveat a finding in the first place.
+    """
+    relation = Relation("public", "order_items")
+    usage = (_usage(relation, "order_id", ColumnRole.JOIN, cost_share=0.4),)
+    facts = {relation: _facts(relation, rows=100_000, ndv={})}
+    adv007 = propose_join_keys(usage, facts, {}, min_cost_share=0.01)[0]
+
+    orders = Relation("public", "orders")
+    adv001 = propose_indexes(
+        (_usage(orders, "order_id", ColumnRole.EQUALITY, cost_share=0.4),),
+        {orders: _facts(orders, rows=100_000, ndv={})},
+        {},
+        min_cost_share=0.01,
+    )[0]
+
+    shared = "so how selective this index would be could not be checked"
+    assert shared in adv007.rationale
+    assert shared in adv001.rationale
+
+
+def test_adv001_says_nothing_about_selectivity_when_a_louder_gap_already_applies():
+    """The disclosure is for the MEDIUM rung only, not a blanket sentence.
+
+    With an unknown row count the proposal is LOW and already carries the small-table note; a
+    second "statistics were missing" sentence there would be noise, and would also be
+    misleading — the reason it is LOW is the row count, not the NDV.
+    """
+    relation = Relation("public", "orders")
+    usage = (_usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.5),)
+    facts = {relation: _facts(relation, rows=None, ndv={})}
+    proposals = propose_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].confidence is Confidence.LOW
+    assert "No distinct-value statistics" not in proposals[0].rationale
+
+
+def test_adv007_orders_equal_cost_join_keys_by_column_name():
+    """Two join keys tied on cost must come out in a fixed order.
+
+    The sort key is `(-cost_ms, column)`; without the column component two equally hot join
+    keys would order by whatever `_by_relation` happened to accumulate, and the report would
+    reshuffle between runs on identical input.
+    """
+    relation = Relation("public", "order_items")
+    facts = {relation: _facts(relation, rows=100_000)}
+    forward = (
+        _usage(relation, "zeta", ColumnRole.JOIN, cost_share=0.4, cost_ms=100.0),
+        _usage(relation, "alpha", ColumnRole.JOIN, cost_share=0.4, cost_ms=100.0),
+    )
+    columns = [
+        p.evidence["columns"] for p in propose_join_keys(forward, facts, {}, min_cost_share=0.01)
+    ]
+    assert columns == [("alpha",), ("zeta",)]
+    # Reversed input must give the same order, or the tiebreak is not doing the work.
+    reversed_columns = [
+        p.evidence["columns"]
+        for p in propose_join_keys(tuple(reversed(forward)), facts, {}, min_cost_share=0.01)
+    ]
+    assert reversed_columns == columns
