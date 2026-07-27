@@ -83,6 +83,20 @@ def unwrap(sql: str) -> str:
     Django and SQLAlchemy emit for large result sets) the hottest reads were counted as
     "filtered" and thrown away.
 
+    What this actually restores differs by form, measured on PostgreSQL 16. `COPY
+    (SELECT ...) TO ...` attributes correctly: `pg_stat_statements` charges the whole
+    execution's time and row count to the `COPY` statement itself, so cost-weighted rules
+    see the real number.
+
+    `DECLARE ... CURSOR FOR` does **not**: Postgres attributes the work of actually reading
+    rows to the `FETCH` statements that follow, which `is_noise` still filters (a `FETCH`
+    carries no query text, so it has no predicates to attribute and unfiltering it would
+    only inflate the denominator with uncounted cost). The `DECLARE` itself is recorded
+    with near-zero calls, time and rows — opening a cursor does no scanning. So a cursor
+    read recovered here contributes its predicate columns to `aggregate` and can still join
+    an index candidate, but it cannot earn a proposal on cost alone: the default
+    `--min-cost-share` can suppress it outright, and `WITH HOLD` does not change this.
+
     Text surgery rather than AST surgery, for a reason that is not a preference: sqlglot
     cannot parse `DECLARE` at all — it falls back to `exp.Command` and leaves the entire
     tail as a single string literal, so there is no inner tree to lift. `COPY` *does* parse

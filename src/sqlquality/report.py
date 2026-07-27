@@ -197,11 +197,16 @@ def render_advise_markdown(
         f"**Literals:** {'redacted' if redacted else 'retained (--keep-literals)'}",
         "",
         (
-            # "filtered", not "introspection/DDL": the noise filter matches on the leading
-            # keyword, so it also discards DECLARE ... CURSOR FOR SELECT and
-            # COPY (SELECT ...) — ordinary reads. See cli._coverage_line.
+            # "filtered", not "introspection/DDL": it covers session control, DDL,
+            # maintenance, introspection, a whole-table COPY, and a cursor statement
+            # carrying no query (FETCH, CLOSE). DECLARE ... CURSOR FOR SELECT and
+            # COPY (SELECT ...) TO — ordinary reads — are unwrapped to their inner query
+            # before this count is taken, so they land in "analyzed" instead.
+            # See cli._coverage_line and workload.fingerprint.unwrap.
             f"Skipped: {workload.skipped_unparseable} unparseable, "
-            f"{workload.skipped_noise} filtered as non-workload by statement prefix, "
+            f"{workload.skipped_noise} filtered as non-workload (session control, DDL, "
+            f"maintenance, introspection, whole-table COPY, or a cursor statement "
+            f"carrying no query), "
             f"{aggregation.skipped_unqualifiable} unresolvable against the schema, "
             f"{aggregation.skipped_ambiguous} ambiguous across the introspected schemas."
         ),
