@@ -212,10 +212,10 @@ _UNKNOWN_ROWS_NOTE = (
 )
 
 
-def _by_table(usage: Sequence[ColumnUsage]) -> dict[str, list[ColumnUsage]]:
-    grouped: dict[str, list[ColumnUsage]] = {}
+def _by_relation(usage: Sequence[ColumnUsage]) -> dict[Relation, list[ColumnUsage]]:
+    grouped: dict[Relation, list[ColumnUsage]] = {}
     for item in usage:
-        grouped.setdefault(item.table, []).append(item)
+        grouped.setdefault(item.relation, []).append(item)
     return grouped
 
 
@@ -247,9 +247,10 @@ def _covered(candidate: tuple[str, ...], existing: Sequence[PgIndex]) -> str | N
     return None
 
 
-#: Schema every rule qualifies its DDL with unless told otherwise. It matches the CLI's
-#: `--schema` default, so the default is truthful rather than merely convenient; the CLI
-#: always passes the resolved schema explicitly (see PostgresWorkloadAdapter.propose).
+#: The schema `WorkloadAdapter.schemas` defaults to before the CLI resolves `--schema`.
+#: Each rule now derives its DDL's schema from the `Relation` it is proposing for, since a
+#: single run-wide schema stopped being meaningful once more than one schema is in play —
+#: this constant only documents the adapter-level default, not a per-rule fallback.
 DEFAULT_SCHEMA = "public"
 
 
@@ -265,13 +266,12 @@ def _qualified(schema: str, name: str) -> str:
 
 def propose_indexes(
     usage: Sequence[ColumnUsage],
-    facts: Mapping[str, TableFacts],
-    existing: Mapping[str, Sequence[PgIndex]],
+    facts: Mapping[Relation, TableFacts],
+    existing: Mapping[Relation, Sequence[PgIndex]],
     *,
     min_cost_share: float,
     min_rows: int = MIN_ROWS_FOR_INDEX,
     max_arity: int = MAX_INDEX_ARITY,
-    schema: str = DEFAULT_SCHEMA,
     have_index_data: bool = True,
 ) -> list[Proposal]:
     """ADV001 — composite index candidates: equality columns first, one range column last.
@@ -286,8 +286,8 @@ def propose_indexes(
     conflation the row-estimate branch below exists to prevent.
     """
     proposals: list[Proposal] = []
-    for table, items in sorted(_by_table(usage).items()):
-        table_facts = facts.get(table)
+    for relation, items in sorted(_by_relation(usage).items()):
+        table_facts = facts.get(relation)
         rows = table_facts.row_estimate if table_facts else None
         if rows is not None and rows < min_rows:
             continue
@@ -328,11 +328,11 @@ def propose_indexes(
             continue
 
         columns = tuple(i.column for i in chosen)
-        covered_by = _covered(columns, existing.get(table, ()))
+        covered_by = _covered(columns, existing.get(relation, ()))
         if covered_by is not None:
             continue
 
-        table_indexes = existing.get(table, ())
+        table_indexes = existing.get(relation, ())
         partial_skipped = tuple(
             index.name
             for index in table_indexes
@@ -403,10 +403,11 @@ def propose_indexes(
         proposals.append(
             Proposal(
                 code="ADV001",
-                title=f"Add index on {table}({', '.join(columns)})",
+                title=f"Add index on {relation}({', '.join(columns)})",
                 rationale=rationale,
                 evidence={
-                    "table": table,
+                    "schema": relation.schema,
+                    "table": relation.table,
                     "columns": columns,
                     "roles": tuple(i.role.value for i in chosen),
                     "cost_share": cost_share,
@@ -419,7 +420,7 @@ def propose_indexes(
                 },
                 confidence=confidence,
                 ddl=(
-                    f"CREATE INDEX ON {_qualified(schema, table)} "
+                    f"CREATE INDEX ON {_qualified(relation.schema, relation.table)} "
                     f"({', '.join(_quote_ident(c) for c in columns)});"
                 ),
             )
@@ -428,10 +429,9 @@ def propose_indexes(
 
 
 def propose_unused_indexes(
-    existing: Mapping[str, Sequence[PgIndex]],
+    existing: Mapping[Relation, Sequence[PgIndex]],
     *,
-    hot_tables: frozenset[str],
-    schema: str = DEFAULT_SCHEMA,
+    hot_tables: frozenset[Relation],
 ) -> list[Proposal]:
     """ADV002 — indexes with zero recorded scans, excluding constraint-backing indexes.
 
@@ -439,36 +439,35 @@ def propose_unused_indexes(
     reset, so zero scans cannot prove an index is unused across a full business cycle.
     """
     proposals: list[Proposal] = []
-    for table in sorted(hot_tables):
-        for index in existing.get(table, ()):
+    for relation in sorted(hot_tables):
+        for index in existing.get(relation, ()):
             if index.scans != 0 or index.is_unique or index.is_primary:
                 continue
             proposals.append(
                 Proposal(
                     code="ADV002",
-                    title=f"Drop unused index {index.name} on {table}",
+                    title=f"Drop unused index {index.name} on {relation}",
                     rationale=(
                         "No recorded scans since the last statistics reset. Verify the "
                         "reset time covers a full business cycle before dropping."
                     ),
                     evidence={
-                        "table": table,
+                        "schema": relation.schema,
+                        "table": relation.table,
                         "index": index.name,
                         "columns": index.columns,
                         "scans": index.scans,
                         "size_bytes": index.size_bytes,
                     },
                     confidence=Confidence.MEDIUM,
-                    ddl=f"DROP INDEX {_qualified(schema, index.name)};",
+                    ddl=f"DROP INDEX {_qualified(relation.schema, index.name)};",
                 )
             )
     return proposals
 
 
 def propose_redundant_indexes(
-    existing: Mapping[str, Sequence[PgIndex]],
-    *,
-    schema: str = DEFAULT_SCHEMA,
+    existing: Mapping[Relation, Sequence[PgIndex]],
 ) -> list[Proposal]:
     """ADV003 — an index whose column list is a strict prefix of another's is redundant.
 
@@ -481,7 +480,7 @@ def propose_redundant_indexes(
     be advising a `DROP INDEX` with no basis: "probably wrong" is not a confidence level.
     """
     proposals: list[Proposal] = []
-    for table, indexes in sorted(existing.items()):
+    for relation, indexes in sorted(existing.items()):
         for narrow in indexes:
             # A partial or expression index is not comparable on column lists alone: the
             # predicate or the expression is the whole point of it. Skipping the pair is
@@ -507,7 +506,7 @@ def propose_redundant_indexes(
             proposals.append(
                 Proposal(
                     code="ADV003",
-                    title=f"Drop redundant index {narrow.name} on {table}",
+                    title=f"Drop redundant index {narrow.name} on {relation}",
                     rationale=(
                         f"Its columns are a leading prefix of {wider.name}, which can serve "
                         "the same lookups. Both indexes are plain — neither carries a WHERE "
@@ -515,7 +514,8 @@ def propose_redundant_indexes(
                         "whole comparison."
                     ),
                     evidence={
-                        "table": table,
+                        "schema": relation.schema,
+                        "table": relation.table,
                         "index": narrow.name,
                         "columns": narrow.columns,
                         "superseded_by": wider.name,
@@ -523,7 +523,7 @@ def propose_redundant_indexes(
                         "size_bytes": narrow.size_bytes,
                     },
                     confidence=Confidence.HIGH,
-                    ddl=f"DROP INDEX {_qualified(schema, narrow.name)};",
+                    ddl=f"DROP INDEX {_qualified(relation.schema, narrow.name)};",
                 )
             )
     return proposals
@@ -557,11 +557,10 @@ def _first_co_occurring(
 
 def propose_partial_indexes(
     usage: Sequence[ColumnUsage],
-    facts: Mapping[str, TableFacts],
+    facts: Mapping[Relation, TableFacts],
     *,
     min_cost_share: float,
     min_rows: int = MIN_ROWS_FOR_INDEX,
-    schema: str = DEFAULT_SCHEMA,
 ) -> list[Proposal]:
     """ADV004 — index the hot equality column, restricted by a hot null-check predicate.
 
@@ -573,8 +572,8 @@ def propose_partial_indexes(
     count caps confidence at LOW rather than being assumed large.
     """
     proposals: list[Proposal] = []
-    for table, items in sorted(_by_table(usage).items()):
-        table_facts = facts.get(table)
+    for relation, items in sorted(_by_relation(usage).items()):
+        table_facts = facts.get(relation)
         rows = table_facts.row_estimate if table_facts else None
         if rows is not None and rows < min_rows:
             continue
@@ -613,11 +612,13 @@ def propose_partial_indexes(
             Proposal(
                 code="ADV004",
                 title=(
-                    f"Partial index on {table}({leading.column}) WHERE {guard.column} {predicate}"
+                    f"Partial index on {relation}({leading.column}) "
+                    f"WHERE {guard.column} {predicate}"
                 ),
                 rationale=rationale,
                 evidence={
-                    "table": table,
+                    "schema": relation.schema,
+                    "table": relation.table,
                     "columns": (leading.column,),
                     "guard_column": guard.column,
                     "guard_predicate": predicate,
@@ -630,7 +631,7 @@ def propose_partial_indexes(
                 },
                 confidence=Confidence.LOW if rows is None else Confidence.MEDIUM,
                 ddl=(
-                    f"CREATE INDEX ON {_qualified(schema, table)} "
+                    f"CREATE INDEX ON {_qualified(relation.schema, relation.table)} "
                     f"({_quote_ident(leading.column)}) "
                     f"WHERE {_quote_ident(guard.column)} {predicate};"
                 ),
@@ -653,14 +654,15 @@ def propose_sargability(
         proposals.append(
             Proposal(
                 code="ADV005",
-                title=f"Non-sargable predicate on {item.table}.{item.column}",
+                title=f"Non-sargable predicate on {item.relation}.{item.column}",
                 rationale=(
                     "The column is wrapped in a cast or function inside a predicate, so a "
                     "plain B-tree index cannot be used. Rewrite the predicate to leave the "
                     "column bare, or add a matching expression index."
                 ),
                 evidence={
-                    "table": item.table,
+                    "schema": item.relation.schema,
+                    "table": item.relation.table,
                     "column": item.column,
                     "cost_share": item.cost_share,
                     "calls": item.calls,
@@ -702,13 +704,13 @@ def propose_sargability(
 
 def propose_select_star(
     workload: Workload,
-    facts: Mapping[str, TableFacts],
+    facts: Mapping[Relation, TableFacts],
     *,
     min_cost_share: float,
     min_columns: int = WIDE_TABLE_COLUMNS,
 ) -> list[Proposal]:
     """ADV006 — hot query groups projecting a star from a wide table."""
-    wide = {name for name, fact in facts.items() if len(fact.columns) >= min_columns}
+    wide = {relation: fact for relation, fact in facts.items() if len(fact.columns) >= min_columns}
     if not wide:
         return []
     total = workload.total_cost_ms
@@ -716,7 +718,12 @@ def propose_select_star(
     for stat in workload.stats:
         if FLAG_SELECT_STAR not in stat.flags:
             continue
-        touched = sorted(name for name in wide if mentions_table(name, stat.sql))
+        # Matched against statement text on the bare table name — that is what the SQL
+        # actually says. The relation is carried through separately so the evidence can
+        # still report the qualified name.
+        touched = sorted(
+            (relation for relation in wide if mentions_table(relation.table, stat.sql)),
+        )
         if not touched:
             continue
         share = (stat.total_time_ms / total) if total else 0.0
@@ -725,14 +732,19 @@ def propose_select_star(
         proposals.append(
             Proposal(
                 code="ADV006",
-                title=f"Hot SELECT * over wide table(s): {', '.join(touched)}",
+                title=(
+                    f"Hot SELECT * over wide table(s): "
+                    f"{', '.join(str(relation) for relation in touched)}"
+                ),
                 rationale=(
                     "Projecting every column of a wide table moves data no consumer asked "
                     "for. List the columns the query actually needs."
                 ),
                 evidence={
-                    "tables": tuple(touched),
-                    "column_counts": {name: len(facts[name].columns) for name in touched},
+                    "tables": tuple(str(relation) for relation in touched),
+                    "column_counts": {
+                        str(relation): len(facts[relation].columns) for relation in touched
+                    },
                     "cost_share": share,
                     "calls": stat.calls,
                     "fingerprint": _fingerprint_id(stat.fingerprint),
@@ -1140,16 +1152,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
     def propose(
         self,
         aggregation: Aggregation,
-        facts: dict[str, TableFacts],
+        facts: dict[Relation, TableFacts],
         workload: Workload,
         *,
         min_cost_share: float,
     ) -> list[Proposal]:
         existing = self.fetch_indexes(self.schemas, aggregation.tables)
-        # The rules are module-level and emit DDL, so they need the schema they are talking
-        # about. Only one schema is ever introspected (the CLI rejects more than one), so
-        # this is unambiguous rather than a guess about which one a proposal belongs to.
-        schema = self.schemas[0] if self.schemas else DEFAULT_SCHEMA
         # An empty `existing` means one of two very different things: this table genuinely
         # has no indexes, or the catalog query was denied. Only the adapter can tell, so it
         # is the adapter's job to say — ADV001 must not claim "no existing index leads with
@@ -1161,16 +1169,13 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 facts,
                 existing,
                 min_cost_share=min_cost_share,
-                schema=schema,
                 have_index_data=have_index_data,
             ),
-            *propose_partial_indexes(
-                aggregation.usage, facts, min_cost_share=min_cost_share, schema=schema
-            ),
+            *propose_partial_indexes(aggregation.usage, facts, min_cost_share=min_cost_share),
             *propose_sargability(aggregation.usage, workload, min_cost_share=min_cost_share),
             *propose_select_star(workload, facts, min_cost_share=min_cost_share),
-            *propose_unused_indexes(existing, hot_tables=aggregation.tables, schema=schema),
-            *propose_redundant_indexes(existing, schema=schema),
+            *propose_unused_indexes(existing, hot_tables=aggregation.tables),
+            *propose_redundant_indexes(existing),
         ]
         return sorted(self._dedupe_by_ddl(proposals), key=self._ranking_key)
 

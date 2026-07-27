@@ -5,6 +5,7 @@ from sqlquality.models import (
     Confidence,
     Proposal,
     QueryStat,
+    Relation,
     TableFacts,
     Workload,
 )
@@ -21,12 +22,16 @@ from sqlquality.workload.postgres import (
     propose_unused_indexes,
 )
 
+#: The relation nearly every test in this file talks about, so each test only has to name
+#: a different relation when the point of the test *is* the relation.
+_ORDERS = Relation("public", "orders")
 
-def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1",)):
+
+def _usage(relation, column, role, cost_share=0.5, cost_ms=50.0, fps=("fp1",)):
     """`fps` defaults to a single shared fingerprint, so usages co-occur unless a test
     deliberately gives them disjoint sets."""
     return ColumnUsage(
-        table=table,
+        relation=relation,
         column=column,
         role=role,
         calls=10,
@@ -36,12 +41,17 @@ def usage(column, role, cost_share=0.5, cost_ms=50.0, table="orders", fps=("fp1"
     )
 
 
-def facts(rows=1_000_000, ndv=None, columns=("id", "status", "created_at", "customer_id")):
-    return {
-        "orders": TableFacts(
-            name="orders", row_estimate=rows, size_bytes=10**8, columns=columns, ndv=ndv or {}
-        )
-    }
+def _facts(
+    relation, rows=1_000_000, ndv=None, columns=("id", "status", "created_at", "customer_id")
+):
+    return TableFacts(
+        relation=relation, row_estimate=rows, size_bytes=10**8, columns=columns, ndv=ndv or {}
+    )
+
+
+def _facts_map(relation=_ORDERS, **kwargs):
+    """The common case: one relation's facts, as the `facts` mapping every rule expects."""
+    return {relation: _facts(relation, **kwargs)}
 
 
 def codes(proposals):
@@ -51,10 +61,10 @@ def codes(proposals):
 def test_equality_then_range_ordering_in_the_candidate_index():
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_ms=80.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=80.0),
         ],
-        facts(),
+        _facts_map(),
         {},
         min_cost_share=0.01,
     )
@@ -65,11 +75,11 @@ def test_equality_then_range_ordering_in_the_candidate_index():
 def test_only_one_range_column_is_included():
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_ms=80.0),
-            usage("shipped_at", ColumnRole.RANGE, cost_ms=70.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=80.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.RANGE, cost_ms=70.0),
         ],
-        facts(columns=("status", "created_at", "shipped_at")),
+        _facts_map(columns=("status", "created_at", "shipped_at")),
         {},
         min_cost_share=0.01,
     )
@@ -79,12 +89,12 @@ def test_only_one_range_column_is_included():
 def test_arity_is_capped():
     proposals = propose_indexes(
         [
-            usage("a", ColumnRole.EQUALITY, cost_ms=99.0),
-            usage("b", ColumnRole.EQUALITY, cost_ms=98.0),
-            usage("c", ColumnRole.EQUALITY, cost_ms=97.0),
-            usage("d", ColumnRole.EQUALITY, cost_ms=96.0),
+            _usage(_ORDERS, "a", ColumnRole.EQUALITY, cost_ms=99.0),
+            _usage(_ORDERS, "b", ColumnRole.EQUALITY, cost_ms=98.0),
+            _usage(_ORDERS, "c", ColumnRole.EQUALITY, cost_ms=97.0),
+            _usage(_ORDERS, "d", ColumnRole.EQUALITY, cost_ms=96.0),
         ],
-        facts(columns=("a", "b", "c", "d")),
+        _facts_map(columns=("a", "b", "c", "d")),
         {},
         min_cost_share=0.01,
     )
@@ -93,8 +103,8 @@ def test_arity_is_capped():
 
 def test_small_tables_are_suppressed_entirely():
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(rows=500),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(rows=500),
         {},
         min_cost_share=0.01,
     )
@@ -103,8 +113,8 @@ def test_small_tables_are_suppressed_entirely():
 
 def test_below_min_cost_share_is_suppressed():
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY, cost_share=0.001)],
-        facts(),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.001)],
+        _facts_map(),
         {},
         min_cost_share=0.01,
     )
@@ -112,13 +122,13 @@ def test_below_min_cost_share_is_suppressed():
 
 
 def test_existing_index_with_the_same_leading_prefix_is_not_reproposed():
-    existing = {"orders": (PgIndex("idx", ("status", "created_at"), False, False, 10, 8192),)}
+    existing = {_ORDERS: (PgIndex("idx", ("status", "created_at"), False, False, 10, 8192),)}
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_ms=80.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=80.0),
         ],
-        facts(),
+        _facts_map(),
         existing,
         min_cost_share=0.01,
     )
@@ -126,10 +136,10 @@ def test_existing_index_with_the_same_leading_prefix_is_not_reproposed():
 
 
 def test_a_wider_existing_index_still_covers_a_narrower_candidate():
-    existing = {"orders": (PgIndex("idx", ("status", "created_at", "id"), False, False, 5, 1),)}
+    existing = {_ORDERS: (PgIndex("idx", ("status", "created_at", "id"), False, False, 5, 1),)}
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY, cost_ms=90.0)],
-        facts(),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0)],
+        _facts_map(),
         existing,
         min_cost_share=0.01,
     )
@@ -143,13 +153,13 @@ def test_a_narrower_existing_index_does_not_cover_a_wider_candidate():
     wider-covers-narrower test existed, so `candidate[:len(existing)] == existing` would
     have shipped silently.
     """
-    existing = {"orders": (PgIndex("idx_status", ("status",), False, False, 5, 1),)}
+    existing = {_ORDERS: (PgIndex("idx_status", ("status",), False, False, 5, 1),)}
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_ms=80.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=80.0),
         ],
-        facts(),
+        _facts_map(),
         existing,
         min_cost_share=0.01,
     )
@@ -164,7 +174,7 @@ def test_a_partial_index_does_not_suppress_a_candidate():
     confidently-wrong failures, and just as invisible.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_open",
                 ("status",),
@@ -178,7 +188,10 @@ def test_a_partial_index_does_not_suppress_a_candidate():
         )
     }
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(),
+        existing,
+        min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV001"]
     assert proposals[0].evidence["partial_indexes_skipped"] == ("idx_open",)
@@ -187,9 +200,12 @@ def test_a_partial_index_does_not_suppress_a_candidate():
 
 def test_a_plain_index_still_suppresses_a_candidate():
     """The control. Task 2's new fields default to False, so this must not have changed."""
-    existing = {"orders": (PgIndex("idx_status", ("status",), False, False, 5, 4096),)}
+    existing = {_ORDERS: (PgIndex("idx_status", ("status",), False, False, 5, 4096),)}
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(),
+        existing,
+        min_cost_share=0.01,
     )
     assert proposals == []
 
@@ -198,7 +214,7 @@ def test_an_expression_index_is_disclosed_not_silently_ignored():
     """We cannot prove `lower(status)` makes an index on `status` redundant — or that it
     doesn't. Saying so beats both suppressing and pretending it isn't there."""
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_lower_status",
                 (),
@@ -212,7 +228,10 @@ def test_an_expression_index_is_disclosed_not_silently_ignored():
         )
     }
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(),
+        existing,
+        min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV001"]
     assert proposals[0].evidence["expression_indexes"] == ("idx_lower_status",)
@@ -235,7 +254,7 @@ def test_a_mixed_expression_index_sharing_a_prefix_does_not_count_as_coverage():
     with `lower(note)` and cannot serve a bare `status` lookup.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_mixed",
                 # Non-empty on purpose: the reconstructed tuple from a mixed index, with the
@@ -251,8 +270,8 @@ def test_a_mixed_expression_index_sharing_a_prefix_does_not_count_as_coverage():
         )
     }
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 500.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 500.0}),
         existing,
         min_cost_share=0.01,
     )
@@ -265,7 +284,7 @@ def test_a_mixed_expression_index_sharing_a_prefix_does_not_count_as_coverage():
 def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
     """Only expression indexes that plausibly relate to the candidate are worth naming."""
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_lower_note",
                 (),
@@ -279,7 +298,10 @@ def test_an_expression_index_not_mentioning_the_column_is_not_disclosed():
         )
     }
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(),
+        existing,
+        min_cost_share=0.01,
     )
     assert proposals[0].evidence["expression_indexes"] == ()
     assert "expression index" not in proposals[0].rationale.lower()
@@ -292,7 +314,7 @@ def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
     `lower(guid)` — a false claim in the text someone reads before running DDL.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_lower_guid",
                 (),
@@ -306,8 +328,8 @@ def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
         )
     }
     proposals = propose_indexes(
-        [usage("id", ColumnRole.EQUALITY)],
-        facts(columns=("id", "guid")),
+        [_usage(_ORDERS, "id", ColumnRole.EQUALITY)],
+        _facts_map(columns=("id", "guid")),
         existing,
         min_cost_share=0.01,
     )
@@ -317,7 +339,7 @@ def test_a_column_name_inside_a_longer_identifier_is_not_disclosed():
 def test_an_expression_index_on_a_cast_of_the_column_is_still_disclosed():
     """The control for the fix: word boundaries must not cost a true positive."""
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_status_cast",
                 (),
@@ -331,7 +353,10 @@ def test_an_expression_index_on_a_cast_of_the_column_is_still_disclosed():
         )
     }
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)], facts(), existing, min_cost_share=0.01
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(),
+        existing,
+        min_cost_share=0.01,
     )
     assert proposals[0].evidence["expression_indexes"] == ("idx_status_cast",)
 
@@ -345,13 +370,13 @@ def test_arity_cap_keeps_the_range_column_last_when_it_bites():
     """
     proposals = propose_indexes(
         [
-            usage("a", ColumnRole.EQUALITY, cost_ms=99.0),
-            usage("b", ColumnRole.EQUALITY, cost_ms=98.0),
-            usage("c", ColumnRole.EQUALITY, cost_ms=97.0),
-            usage("d", ColumnRole.EQUALITY, cost_ms=96.0),
-            usage("e", ColumnRole.RANGE, cost_ms=50.0),
+            _usage(_ORDERS, "a", ColumnRole.EQUALITY, cost_ms=99.0),
+            _usage(_ORDERS, "b", ColumnRole.EQUALITY, cost_ms=98.0),
+            _usage(_ORDERS, "c", ColumnRole.EQUALITY, cost_ms=97.0),
+            _usage(_ORDERS, "d", ColumnRole.EQUALITY, cost_ms=96.0),
+            _usage(_ORDERS, "e", ColumnRole.RANGE, cost_ms=50.0),
         ],
-        facts(columns=("a", "b", "c", "d", "e")),
+        _facts_map(columns=("a", "b", "c", "d", "e")),
         {},
         min_cost_share=0.01,
     )
@@ -369,10 +394,10 @@ def test_a_column_used_in_two_roles_is_not_proposed_twice():
     """
     proposals = propose_indexes(
         [
-            usage("id", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("id", ColumnRole.SORT, cost_ms=80.0),
+            _usage(_ORDERS, "id", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "id", ColumnRole.SORT, cost_ms=80.0),
         ],
-        facts(ndv={"id": 5000.0}),
+        _facts_map(ndv={"id": 5000.0}),
         {},
         min_cost_share=0.01,
     )
@@ -388,13 +413,13 @@ def test_the_existing_primary_key_suppresses_the_deduplicated_candidate():
     Once `(id, id)` collapses to `(id,)`, `orders_pkey(id)` covers it and there is no
     proposal at all — which is the correct answer for this workload.
     """
-    existing = {"orders": (PgIndex("orders_pkey", ("id",), True, True, 900, 4096),)}
+    existing = {_ORDERS: (PgIndex("orders_pkey", ("id",), True, True, 900, 4096),)}
     proposals = propose_indexes(
         [
-            usage("id", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("id", ColumnRole.SORT, cost_ms=80.0),
+            _usage(_ORDERS, "id", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "id", ColumnRole.SORT, cost_ms=80.0),
         ],
-        facts(ndv={"id": 5000.0}),
+        _facts_map(ndv={"id": 5000.0}),
         existing,
         min_cost_share=0.01,
     )
@@ -409,11 +434,11 @@ def test_dedupe_prefers_the_equality_occurrence_of_a_two_role_column():
     """
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=99.0),
-            usage("created_at", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_ms=95.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=99.0),
+            _usage(_ORDERS, "created_at", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_ms=95.0),
         ],
-        facts(ndv={"status": 5000.0}),
+        _facts_map(ndv={"status": 5000.0}),
         {},
         min_cost_share=0.01,
     )
@@ -429,8 +454,8 @@ def test_unknown_row_count_is_low_confidence_and_says_why():
     ordinarily-trustworthy, so it is LOW and the rationale states the gap.
     """
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(rows=None, ndv={"status": 9999.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(rows=None, ndv={"status": 9999.0}),
         {},
         min_cost_share=0.01,
     )
@@ -447,8 +472,8 @@ def test_a_denied_index_list_caps_confidence_at_low_and_stops_claiming_coverage(
     exists to prevent, three lines away.
     """
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 5000.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 5000.0}),
         {},
         min_cost_share=0.01,
         have_index_data=False,
@@ -463,8 +488,8 @@ def test_a_denied_index_list_caps_confidence_at_low_and_stops_claiming_coverage(
 def test_a_readable_index_list_still_reaches_high():
     """The other half of the branch: the cap must not fire when the evidence is there."""
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 5000.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 5000.0}),
         {},
         min_cost_share=0.01,
         have_index_data=True,
@@ -482,14 +507,14 @@ def test_propose_lowers_confidence_when_the_indexes_capability_degraded():
         return []
 
     aggregation = Aggregation(
-        usage=(usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
+        usage=(_usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
         total_cost_ms=100.0,
         skipped_unqualifiable=0,
-        tables=frozenset({"orders"}),
+        tables=frozenset({_ORDERS}),
     )
     adapter = PostgresWorkloadAdapter(querier=denied)
     proposals = adapter.propose(
-        aggregation, facts(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
+        aggregation, _facts_map(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
     )
     adv001 = [p for p in proposals if p.code == "ADV001"]
     assert adv001, "the proposal must survive a missing grant, just at lower confidence"
@@ -500,10 +525,10 @@ def test_propose_lowers_confidence_when_the_indexes_capability_degraded():
 def test_cost_share_is_the_max_never_the_sum():
     proposals = propose_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=90.0),
-            usage("created_at", ColumnRole.RANGE, cost_share=0.6, cost_ms=80.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=90.0),
+            _usage(_ORDERS, "created_at", ColumnRole.RANGE, cost_share=0.6, cost_ms=80.0),
         ],
-        facts(),
+        _facts_map(),
         {},
         min_cost_share=0.01,
     )
@@ -512,24 +537,24 @@ def test_cost_share_is_the_max_never_the_sum():
 
 def test_confidence_is_high_only_with_stats_and_a_selective_leading_column():
     high = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 5000.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 5000.0}),
         {},
         min_cost_share=0.01,
     )
     assert high[0].confidence is Confidence.HIGH
 
     no_stats = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={}),
         {},
         min_cost_share=0.01,
     )
     assert no_stats[0].confidence is Confidence.MEDIUM
 
     unselective = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 3.0}),
+        [_usage(_ORDERS, "status", ColumnRole.EQUALITY)],
+        _facts_map(ndv={"status": 3.0}),
         {},
         min_cost_share=0.01,
     )
@@ -538,27 +563,83 @@ def test_confidence_is_high_only_with_stats_and_a_selective_leading_column():
 
 def test_unused_index_proposed_for_drop_but_never_a_constraint_index():
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("idx_cold", ("note",), False, False, 0, 4096),
             PgIndex("orders_pkey", ("id",), True, True, 0, 4096),
             PgIndex("uq_email", ("email",), True, False, 0, 4096),
             PgIndex("idx_warm", ("status",), False, False, 42, 4096),
         )
     }
-    proposals = propose_unused_indexes(existing, hot_tables=frozenset({"orders"}))
+    proposals = propose_unused_indexes(existing, hot_tables=frozenset({_ORDERS}))
     assert codes(proposals) == ["ADV002"]
     assert proposals[0].evidence["index"] == "idx_cold"
     assert proposals[0].confidence is Confidence.MEDIUM
 
 
 def test_unused_index_rule_ignores_tables_outside_the_workload():
-    existing = {"archive": (PgIndex("idx_cold", ("a",), False, False, 0, 1),)}
-    assert propose_unused_indexes(existing, hot_tables=frozenset({"orders"})) == []
+    existing = {Relation("public", "archive"): (PgIndex("idx_cold", ("a",), False, False, 0, 1),)}
+    assert propose_unused_indexes(existing, hot_tables=frozenset({_ORDERS})) == []
+
+
+def test_adv002_drop_ddl_qualifies_the_index_with_its_relations_schema():
+    existing = {
+        Relation("staging", "orders"): (
+            PgIndex(
+                name="idx_cold",
+                columns=("note",),
+                is_unique=False,
+                is_primary=False,
+                scans=0,
+                size_bytes=1,
+            ),
+        )
+    }
+    proposals = propose_unused_indexes(
+        existing, hot_tables=frozenset({Relation("staging", "orders")})
+    )
+    assert proposals[0].ddl == 'DROP INDEX "staging"."idx_cold";'
+
+
+def test_unused_index_ddl_uses_its_own_relations_schema_not_the_others():
+    """`orders_pkey`/any index name can exist identically in two schemas at once (proven
+    live: `orders_pkey` exists under both `public` and `staging`). Grouping by relation must
+    not let one schema's index bleed into the other's DROP statement."""
+    existing = {
+        Relation("sales", "orders"): (
+            PgIndex(
+                name="idx_cold",
+                columns=("note",),
+                is_unique=False,
+                is_primary=False,
+                scans=0,
+                size_bytes=1,
+            ),
+        ),
+        Relation("staging", "orders"): (
+            PgIndex(
+                name="idx_cold",
+                columns=("note",),
+                is_unique=False,
+                is_primary=False,
+                scans=0,
+                size_bytes=1,
+            ),
+        ),
+    }
+    proposals = propose_unused_indexes(
+        existing,
+        hot_tables=frozenset({Relation("sales", "orders"), Relation("staging", "orders")}),
+    )
+    ddls = {p.ddl for p in proposals}
+    assert ddls == {
+        'DROP INDEX "sales"."idx_cold";',
+        'DROP INDEX "staging"."idx_cold";',
+    }
 
 
 def test_a_plain_redundant_pair_is_high_confidence():
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
@@ -578,7 +659,7 @@ def test_a_partial_narrow_index_is_never_called_redundant():
     """The partial index exists to serve a subset; the wider full index serves it
     differently. Dropping it is not less certain, it is probably wrong."""
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_open",
                 ("status",),
@@ -597,7 +678,7 @@ def test_a_partial_narrow_index_is_never_called_redundant():
 
 def test_a_partial_wider_index_does_not_supersede_a_plain_one():
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
             PgIndex(
                 "idx_wide_open",
@@ -622,7 +703,7 @@ def test_a_wider_expression_index_does_not_supersede_a_plain_one():
     not the has_expressions filter existed at all.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
             PgIndex(
                 "idx_expr",
@@ -647,7 +728,7 @@ def test_a_narrow_expression_index_is_never_called_redundant():
     column-list comparison would discard an index nothing else provides.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex(
                 "idx_narrow_expr",
                 ("status",),
@@ -666,12 +747,33 @@ def test_a_narrow_expression_index_is_never_called_redundant():
 
 def test_a_unique_prefix_index_is_never_called_redundant():
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("uq_status", ("status",), True, False, 5, 1),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
     assert propose_redundant_indexes(existing) == []
+
+
+def test_redundant_index_ddl_uses_its_own_relations_schema_not_the_others():
+    """Same collision as ADV002's, for ADV003: `idx_narrow`/`idx_wide` named identically in
+    two schemas must each produce a DROP scoped to their own schema."""
+    existing = {
+        Relation("sales", "orders"): (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        ),
+        Relation("staging", "orders"): (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        ),
+    }
+    proposals = propose_redundant_indexes(existing)
+    ddls = {p.ddl for p in proposals}
+    assert ddls == {
+        'DROP INDEX "sales"."idx_narrow";',
+        'DROP INDEX "staging"."idx_narrow";',
+    }
 
 
 def _workload(*stats):
@@ -681,10 +783,10 @@ def _workload(*stats):
 def test_partial_index_proposed_for_a_hot_not_null_check():
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
-        facts(),
+        _facts_map(),
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -694,10 +796,10 @@ def test_partial_index_proposed_for_a_hot_not_null_check():
 def test_partial_index_polarity_follows_the_predicate():
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("shipped_at", ColumnRole.NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
-        facts(),
+        _facts_map(),
         min_cost_share=0.01,
     )
     assert "IS NULL" in proposals[0].ddl
@@ -713,8 +815,9 @@ def test_no_partial_index_when_the_columns_never_co_occur():
     """
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a",)),
-            usage(
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a",)),
+            _usage(
+                _ORDERS,
                 "shipped_at",
                 ColumnRole.NOT_NULL_CHECK,
                 cost_share=0.4,
@@ -722,7 +825,7 @@ def test_no_partial_index_when_the_columns_never_co_occur():
                 fps=("fp_b",),
             ),
         ],
-        facts(),
+        _facts_map(),
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -731,8 +834,9 @@ def test_no_partial_index_when_the_columns_never_co_occur():
 def test_partial_index_reports_the_co_occurrence_that_justifies_it():
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a", "fp_b")),
-            usage(
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0, fps=("fp_a", "fp_b")),
+            _usage(
+                _ORDERS,
                 "shipped_at",
                 ColumnRole.NOT_NULL_CHECK,
                 cost_share=0.4,
@@ -740,7 +844,7 @@ def test_partial_index_reports_the_co_occurrence_that_justifies_it():
                 fps=("fp_b", "fp_c"),
             ),
         ],
-        facts(),
+        _facts_map(),
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -751,9 +855,10 @@ def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
     """A cheaper pair that co-occurs beats a hotter pair that does not."""
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp_lonely",)),
-            usage("region", ColumnRole.EQUALITY, cost_ms=50.0, fps=("fp_shared",)),
-            usage(
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=99.0, fps=("fp_lonely",)),
+            _usage(_ORDERS, "region", ColumnRole.EQUALITY, cost_ms=50.0, fps=("fp_shared",)),
+            _usage(
+                _ORDERS,
                 "shipped_at",
                 ColumnRole.NOT_NULL_CHECK,
                 cost_share=0.4,
@@ -761,7 +866,7 @@ def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
                 fps=("fp_shared",),
             ),
         ],
-        facts(columns=("status", "region", "shipped_at")),
+        _facts_map(columns=("status", "region", "shipped_at")),
         min_cost_share=0.01,
     )
     assert proposals[0].evidence["columns"] == ("region",)
@@ -776,10 +881,10 @@ def test_partial_index_is_suppressed_on_a_small_table():
     """
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
-        facts(rows=50),
+        _facts_map(rows=50),
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -789,10 +894,10 @@ def test_partial_index_with_an_unknown_row_count_is_low_and_says_why():
     """Same treatment ADV001 gives an unknown row count: keep the advice, lower the claim."""
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
-        facts(rows=None),
+        _facts_map(rows=None),
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -803,8 +908,8 @@ def test_partial_index_with_an_unknown_row_count_is_low_and_says_why():
 
 def test_no_partial_index_without_an_equality_column_to_index():
     proposals = propose_partial_indexes(
-        [usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4)],
-        facts(),
+        [_usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4)],
+        _facts_map(),
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -812,12 +917,14 @@ def test_no_partial_index_without_an_equality_column_to_index():
 
 def test_non_sargable_column_gets_an_attributed_proposal():
     proposals = propose_sargability(
-        [usage("status", ColumnRole.NON_SARGABLE, cost_share=0.3)],
+        [_usage(_ORDERS, "status", ColumnRole.NON_SARGABLE, cost_share=0.3)],
         _workload(),
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV005"]
     assert proposals[0].evidence["column"] == "status"
+    assert proposals[0].evidence["schema"] == "public"
+    assert proposals[0].evidence["table"] == "orders"
     assert proposals[0].confidence is Confidence.HIGH
 
 
@@ -845,8 +952,8 @@ def test_hot_select_star_on_a_wide_table():
         flags=frozenset({FLAG_SELECT_STAR}),
     )
     wide = {
-        "orders": TableFacts(
-            name="orders",
+        _ORDERS: TableFacts(
+            relation=_ORDERS,
             row_estimate=10**6,
             size_bytes=10**8,
             columns=tuple(f"c{i}" for i in range(30)),
@@ -865,7 +972,7 @@ def test_select_star_ignored_on_a_narrow_table():
         flags=frozenset({FLAG_SELECT_STAR}),
     )
     narrow = {
-        "orders": TableFacts(name="orders", row_estimate=10**6, size_bytes=1, columns=("a", "b"))
+        _ORDERS: TableFacts(relation=_ORDERS, row_estimate=10**6, size_bytes=1, columns=("a", "b"))
     }
     assert propose_select_star(_workload(stat), narrow, min_cost_share=0.01) == []
 
@@ -885,24 +992,55 @@ def test_select_star_table_matching_ignores_substring_false_positives():
         total_time_ms=100.0,
         flags=frozenset({FLAG_SELECT_STAR}),
     )
+    order = Relation("public", "order")
+    orders = Relation("public", "orders")
+    cart = Relation("public", "cart")
     wide = {
-        "order": TableFacts(
-            name="order",
+        order: TableFacts(
+            relation=order,
             row_estimate=10**6,
             size_bytes=1,
             columns=tuple(f"c{i}" for i in range(30)),
         ),
-        "orders": TableFacts(
-            name="orders",
+        orders: TableFacts(
+            relation=orders,
             row_estimate=10**6,
             size_bytes=1,
             columns=tuple(f"c{i}" for i in range(30)),
         ),
-        "cart": TableFacts(
-            name="cart", row_estimate=10**6, size_bytes=1, columns=tuple(f"c{i}" for i in range(30))
+        cart: TableFacts(
+            relation=cart,
+            row_estimate=10**6,
+            size_bytes=1,
+            columns=tuple(f"c{i}" for i in range(30)),
         ),
     }
     assert propose_select_star(_workload(stat), wide, min_cost_share=0.01) == []
+
+
+def test_select_star_evidence_reports_the_qualified_relation():
+    """`touched` is matched against the bare name in the SQL text, but the evidence must
+    still surface the schema-qualified name — the bare match is an implementation detail of
+    text-matching, not what should be shown to an operator."""
+    stat = QueryStat(
+        fingerprint="fp",
+        sql="select * from orders",
+        calls=5,
+        total_time_ms=100.0,
+        flags=frozenset({FLAG_SELECT_STAR}),
+    )
+    staging_orders = Relation("staging", "orders")
+    wide = {
+        staging_orders: TableFacts(
+            relation=staging_orders,
+            row_estimate=10**6,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(30)),
+        )
+    }
+    proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
+    assert proposals[0].evidence["tables"] == ("staging.orders",)
+    assert "staging.orders" in proposals[0].title
 
 
 def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
@@ -912,14 +1050,14 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
     ADV002 rests on a scan counter covering only the window since the last stats reset.
     """
     existing = {
-        "orders": (
+        _ORDERS: (
             PgIndex("idx_narrow", ("status",), False, False, 0, 4096),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 8192),
         )
     }
     adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
     aggregation = Aggregation(
-        usage=(), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({"orders"})
+        usage=(), total_cost_ms=100.0, skipped_unqualifiable=0, tables=frozenset({_ORDERS})
     )
     adapter.fetch_indexes = lambda schemas, tables: existing  # type: ignore[method-assign]
     proposals = adapter.propose(aggregation, {}, _workload(), min_cost_share=0.01)
@@ -932,17 +1070,17 @@ def test_propose_collapses_an_index_flagged_both_unused_and_redundant():
 def test_propose_composes_all_rules_and_ranks_high_confidence_first():
     aggregation = Aggregation(
         usage=(
-            usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
-            usage("note", ColumnRole.NON_SARGABLE, cost_share=0.2, cost_ms=20.0),
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),
+            _usage(_ORDERS, "note", ColumnRole.NON_SARGABLE, cost_share=0.2, cost_ms=20.0),
         ),
         total_cost_ms=100.0,
         skipped_unqualifiable=0,
-        tables=frozenset({"orders"}),
+        tables=frozenset({_ORDERS}),
     )
     adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
     proposals = adapter.propose(
         aggregation,
-        facts(ndv={"status": 9999.0}),
+        _facts_map(ndv={"status": 9999.0}),
         _workload(),
         min_cost_share=0.01,
     )
@@ -1045,11 +1183,12 @@ def test_render_ddl_recommends_concurrently_for_index_creation():
 
 def test_generated_ddl_quotes_identifiers():
     """Unquoted identifiers break on anything needing quotes — mixed case, reserved words."""
+    relation = Relation("public", "Order")
     proposals = propose_indexes(
-        [usage("Status", ColumnRole.EQUALITY, table="Order")],
+        [_usage(relation, "Status", ColumnRole.EQUALITY)],
         {
-            "Order": TableFacts(
-                name="Order",
+            relation: TableFacts(
+                relation=relation,
                 row_estimate=10**6,
                 size_bytes=10**8,
                 columns=("Status",),
@@ -1073,11 +1212,12 @@ def test_a_newline_in_an_identifier_is_not_rendered_as_a_statement():
     DDL against an object that does not exist. So the statement is commented out whole.
     """
     hostile = "orders\nDROP TABLE users; --"
+    relation = Relation("public", hostile)
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY, table=hostile)],
+        [_usage(relation, "status", ColumnRole.EQUALITY)],
         {
-            hostile: TableFacts(
-                name=hostile,
+            relation: TableFacts(
+                relation=relation,
                 row_estimate=10**6,
                 size_bytes=10**8,
                 columns=("status",),
@@ -1104,65 +1244,103 @@ def test_quote_ident_doubles_an_embedded_quote():
     assert _quote_ident('we"ird') == '"we""ird"'
 
 
+def test_adv001_ddl_is_qualified_with_the_relations_own_schema():
+    usage = (_usage(Relation("sales", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5),)
+    facts = {Relation("sales", "orders"): _facts(Relation("sales", "orders"), rows=50_000)}
+    proposals = propose_indexes(usage, facts, {}, min_cost_share=0.01)
+    assert proposals[0].ddl == 'CREATE INDEX ON "sales"."orders" ("status");'
+    assert proposals[0].evidence["schema"] == "sales"
+    assert proposals[0].evidence["table"] == "orders"
+    assert "sales.orders" in proposals[0].title
+
+
+def test_two_same_named_relations_get_two_independent_proposals():
+    """One proposal per relation, each stamped with its own schema."""
+    usage = (
+        _usage(Relation("sales", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+        _usage(Relation("staging", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+    )
+    facts = {
+        Relation("sales", "orders"): _facts(Relation("sales", "orders"), rows=50_000),
+        Relation("staging", "orders"): _facts(Relation("staging", "orders"), rows=50_000),
+    }
+    ddls = {p.ddl for p in propose_indexes(usage, facts, {}, min_cost_share=0.01)}
+    assert ddls == {
+        'CREATE INDEX ON "sales"."orders" ("status");',
+        'CREATE INDEX ON "staging"."orders" ("status");',
+    }
+
+
+def test_an_index_in_one_schema_does_not_cover_the_other_schemas_candidate():
+    """The coverage check must not reach across schemas."""
+    usage = (
+        _usage(Relation("sales", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+        _usage(Relation("staging", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+    )
+    facts = {
+        Relation("sales", "orders"): _facts(Relation("sales", "orders"), rows=50_000),
+        Relation("staging", "orders"): _facts(Relation("staging", "orders"), rows=50_000),
+    }
+    existing = {
+        Relation("sales", "orders"): (
+            PgIndex(
+                name="idx_status",
+                columns=("status",),
+                is_unique=False,
+                is_primary=False,
+                scans=1,
+                size_bytes=1,
+            ),
+        )
+    }
+    proposals = propose_indexes(usage, facts, existing, min_cost_share=0.01)
+    assert [p.evidence["schema"] for p in proposals] == ["staging"]
+
+
 def test_created_index_ddl_is_schema_qualified():
     """An unqualified name resolves against the *operator's* search_path, not ours.
 
-    With `--schema analytics`, `CREATE INDEX ON "orders"` run by someone whose search_path
-    is `public` targets the wrong table entirely.
+    `CREATE INDEX ON "orders"` run by someone whose search_path is `public` targets the
+    wrong table entirely when the relation actually lives in `analytics`.
     """
+    relation = Relation("analytics", "orders")
     proposals = propose_indexes(
-        [usage("status", ColumnRole.EQUALITY)],
-        facts(ndv={"status": 5000.0}),
+        [_usage(relation, "status", ColumnRole.EQUALITY)],
+        _facts_map(relation, ndv={"status": 5000.0}),
         {},
         min_cost_share=0.01,
-        schema="analytics",
     )
     assert proposals[0].ddl == 'CREATE INDEX ON "analytics"."orders" ("status");'
 
 
 def test_partial_index_ddl_is_schema_qualified():
+    relation = Relation("analytics", "orders")
     proposals = propose_partial_indexes(
         [
-            usage("status", ColumnRole.EQUALITY, cost_ms=90.0),
-            usage("shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+            _usage(relation, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+            _usage(relation, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
-        facts(),
+        _facts_map(relation),
         min_cost_share=0.01,
-        schema="analytics",
     )
     assert proposals[0].ddl.startswith('CREATE INDEX ON "analytics"."orders" ("status")')
 
 
 def test_dropped_index_ddl_is_schema_qualified():
     """A bare `DROP INDEX idx_cold` drops whichever idx_cold the search_path finds first."""
-    unused = {"orders": (PgIndex("idx_cold", ("note",), False, False, 0, 4096),)}
-    proposals = propose_unused_indexes(unused, hot_tables=frozenset({"orders"}), schema="analytics")
+    relation = Relation("analytics", "orders")
+    unused = {relation: (PgIndex("idx_cold", ("note",), False, False, 0, 4096),)}
+    proposals = propose_unused_indexes(unused, hot_tables=frozenset({relation}))
     assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_cold";'
 
     redundant = {
-        "orders": (
+        relation: (
             PgIndex("idx_narrow", ("status",), False, False, 5, 1),
             PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
         )
     }
-    proposals = propose_redundant_indexes(redundant, schema="analytics")
+    proposals = propose_redundant_indexes(redundant)
     assert proposals[0].ddl == 'DROP INDEX "analytics"."idx_narrow";'
-
-
-def test_propose_passes_the_adapters_schema_into_the_ddl():
-    """The rules are module-level, so the adapter is the only thing that knows the schema."""
-    aggregation = Aggregation(
-        usage=(usage("status", ColumnRole.EQUALITY, cost_share=0.6, cost_ms=60.0),),
-        total_cost_ms=100.0,
-        skipped_unqualifiable=0,
-        tables=frozenset({"orders"}),
-    )
-    adapter = PostgresWorkloadAdapter(querier=lambda sql, params: [])
-    adapter.schemas = ("analytics",)
-    proposals = adapter.propose(
-        aggregation, facts(ndv={"status": 9999.0}), _workload(), min_cost_share=0.01
-    )
-    assert any('"analytics"."orders"' in (p.ddl or "") for p in proposals)
 
 
 def test_adv005_reports_a_short_fingerprint_id_and_keeps_the_sql_separately():
@@ -1207,8 +1385,8 @@ def test_adv006_also_reports_the_short_id_without_losing_the_query():
         flags=frozenset({FLAG_SELECT_STAR}),
     )
     wide = {
-        "orders": TableFacts(
-            name="orders",
+        _ORDERS: TableFacts(
+            relation=_ORDERS,
             row_estimate=10**6,
             size_bytes=10**8,
             columns=tuple(f"c{i}" for i in range(30)),
