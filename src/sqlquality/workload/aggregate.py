@@ -25,11 +25,16 @@ _Key = tuple[Relation, str, ColumnRole]
 def _identifier_pattern(name: str) -> re.Pattern[str]:
     """Compiled whole-identifier matcher for one name, compiled once per name.
 
-    Callers such as ADV006's wide-table detection and the expression-index disclosure in
-    `postgres.py` test one name against many statements (or vice versa), and a schema with
-    many tables was recompiling the same handful of name patterns over and over, thrashing
-    `re`'s own pattern cache. Caching by name here means each identifier is compiled once
-    regardless of how many times it is checked.
+    The callers are the expression-index disclosures in ADV001, ADV007 and ADV008, which test
+    one column name against every expression index on a relation. A relation with several
+    expression indexes was recompiling the same name pattern once per index, thrashing `re`'s
+    own pattern cache; caching by name means each identifier is compiled once regardless of how
+    many times it is checked.
+
+    ADV006's wide-table detection used to be the main caller and no longer is: it parses each
+    statement and resolves its tables through `resolve_relation` instead, because text matching
+    cannot see a schema qualifier and so attributed `select * from public.orders` to a
+    same-named table in another schema.
     """
     return re.compile(rf"\b{re.escape(name)}\b")
 
