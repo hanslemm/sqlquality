@@ -1,16 +1,50 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from sqlquality.dbtproject import DbtProject
-from sqlquality.models import Relation
-from sqlquality.workload.dbt import DbtContext, load_dbt_context, parse_relation_name
+from sqlquality.models import Confidence, Proposal, Relation
+from sqlquality.workload.dbt import (
+    DbtContext,
+    enrich_proposals,
+    load_dbt_context,
+    parse_relation_name,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
 
 
 def _project() -> DbtProject:
     return DbtProject.from_path(FIXTURE)
+
+
+def _project_with_materialization(uid: str, materialized: str) -> DbtProject:
+    """The fixture manifest with one model's materialization changed.
+
+    Edits a deep copy rather than a second fixture file: the point of variation is one field,
+    and a whole extra manifest would drift from the real one.
+    """
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["nodes"][uid]["config"]["materialized"] = materialized
+    return DbtProject.from_manifest(raw)
+
+
+def _index_proposal(relation, columns=("status",), code="ADV001"):
+    quoted = ", ".join(f'"{c}"' for c in columns)
+    return Proposal(
+        code=code,
+        title=f"Add index on {relation}({', '.join(columns)})",
+        rationale="hot predicate.",
+        evidence={
+            "schema": relation.schema,
+            "table": relation.table,
+            "columns": tuple(columns),
+            "cost_share": 0.5,
+        },
+        confidence=Confidence.HIGH,
+        ddl=f'CREATE INDEX ON "{relation.schema}"."{relation.table}" ({quoted});',
+    )
 
 
 @pytest.mark.parametrize(
@@ -196,3 +230,140 @@ def test_load_survives_a_wrong_shaped_manifest_without_raising(tmp_path, manifes
     context, disclosure = load_dbt_context(None, bad)
     assert context is None
     assert disclosure is not None
+
+
+def test_adv302_replaces_raw_ddl_for_a_table_model_with_a_dbt_config_block():
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    [out] = enrich_proposals([_index_proposal(relation)], context)
+    assert out.ddl is not None
+    assert "CREATE INDEX" not in out.ddl
+    assert "indexes" in out.ddl
+    assert "columns" in out.ddl and "status" in out.ddl
+    assert "dbt run" in out.rationale
+
+
+def test_adv302_keeps_the_relation_and_columns_it_was_given():
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    [out] = enrich_proposals([_index_proposal(relation, ("status", "created_at"))], context)
+    assert "status" in out.ddl and "created_at" in out.ddl
+    assert out.evidence["dbt_model"] == "model.demo.orders"
+    assert out.evidence["dbt_materialized"] == "table"
+
+
+def test_adv302_says_a_view_cannot_be_indexed_at_all():
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "stg_orders")  # materialized: view
+    [out] = enrich_proposals([_index_proposal(relation)], context)
+    assert out.ddl is None, "a view has no storage to index, so there is no DDL to run"
+    assert "view" in out.rationale
+    assert out.confidence is Confidence.LOW
+
+
+def test_adv302_distinguishes_incremental_from_table():
+    """An index survives a normal incremental run and is lost on --full-refresh. Saying
+    'every dbt run drops it' would be false, and false in the direction that makes an
+    operator distrust a correct proposal."""
+    project = _project_with_materialization("model.demo.orders", "incremental")
+    context = DbtContext.from_project(project)
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"))], context)
+    assert "full-refresh" in out.rationale or "full refresh" in out.rationale
+    assert "every dbt run" not in out.rationale
+
+
+def test_adv302_leaves_an_unrecognised_materialization_alone_and_says_so():
+    project = _project_with_materialization("model.demo.orders", "exotic")
+    context = DbtContext.from_project(project)
+    original = _index_proposal(Relation("main", "orders"))
+    [out] = enrich_proposals([original], context)
+    assert out.ddl == original.ddl, "unknown materialization must not have its DDL rewritten"
+    assert "exotic" in out.rationale
+
+
+def test_adv302_does_not_touch_a_relation_dbt_does_not_manage():
+    context = DbtContext.from_project(_project())
+    original = _index_proposal(Relation("public", "orders"))
+    assert enrich_proposals([original], context) == [original]
+
+
+def test_adv302_does_not_rewrite_a_drop_index_proposal():
+    """Dropping an index dbt never created is a perfectly ordinary thing to do, and there is
+    no `indexes` config that expresses a removal."""
+    context = DbtContext.from_project(_project())
+    drop = Proposal(
+        code="ADV002",
+        title="Drop unused index idx_cold on main.orders",
+        rationale="no scans.",
+        evidence={"schema": "main", "table": "orders", "index": "idx_cold"},
+        confidence=Confidence.MEDIUM,
+        ddl='DROP INDEX "main"."idx_cold";',
+    )
+    [out] = enrich_proposals([drop], context)
+    assert out.ddl == drop.ddl
+
+
+def test_adv302_does_not_rewrite_an_advisory_proposal_with_no_ddl():
+    context = DbtContext.from_project(_project())
+    advisory = Proposal(
+        code="ADV005",
+        title="Non-sargable predicate on main.orders.status",
+        rationale="wrapped in a function.",
+        evidence={"schema": "main", "table": "orders", "column": "status"},
+        confidence=Confidence.HIGH,
+        ddl=None,
+    )
+    [out] = enrich_proposals([advisory], context)
+    assert out.ddl is None
+    # It should still be attributed to the model, so the reader knows where to fix it.
+    assert out.evidence["dbt_model"] == "model.demo.orders"
+
+
+def test_adv302_discloses_a_partial_index_as_not_expressible_rather_than_dropping_the_where():
+    """ADV004's partial index has a WHERE clause dbt's `indexes` config has no field for.
+    Silently emitting a config block would lose the predicate and turn a correct proposal
+    into a wrong one, so it must keep its raw DDL and say dbt will drop it instead."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    partial = Proposal(
+        code="ADV004",
+        title=f"Partial index on {relation}(status) WHERE deleted_at IS NULL",
+        rationale="hot predicate, restricted by a null check.",
+        evidence={
+            "schema": relation.schema,
+            "table": relation.table,
+            "columns": ("status",),
+            "guard_column": "deleted_at",
+            "guard_predicate": "IS NULL",
+            "cost_share": 0.5,
+        },
+        confidence=Confidence.MEDIUM,
+        ddl=(
+            f'CREATE INDEX ON "{relation.schema}"."{relation.table}" '
+            '("status") WHERE "deleted_at" IS NULL;'
+        ),
+    )
+    [out] = enrich_proposals([partial], context)
+    assert out.ddl == partial.ddl, "the WHERE clause must survive, not be silently dropped"
+    assert "WHERE" in out.ddl
+    assert "dbt" in out.rationale and "drop" in out.rationale.lower()
+
+
+def test_adv302_config_block_survives_a_newline_in_a_column_name():
+    """A newline inside a quoted identifier parses successfully (parse_relation_name
+    accepts one in a relation name), and a column introspected from a live catalog can
+    carry the same thing. The generated config block goes straight into the --ddl file as
+    `--`-commented lines, so an embedded raw newline there must not let the second half of
+    the line break out of the comment — the same hazard render_ddl already defends against
+    for raw DDL, reproduced for enrich_proposals' own generated block.
+    """
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    hostile_columns = ("sta\ntus -- DROP TABLE users;",)
+    [out] = enrich_proposals([_index_proposal(relation, hostile_columns)], context)
+    assert out.ddl is not None
+    for line in out.ddl.splitlines():
+        assert line.startswith("--"), f"bare line outside comment mode: {line!r}"
+    # The hostile text must not appear as a live, uncommented statement anywhere.
+    executable = [ln for ln in out.ddl.splitlines() if not ln.startswith("--")]
+    assert not any("DROP TABLE users" in ln for ln in executable)

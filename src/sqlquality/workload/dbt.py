@@ -8,11 +8,12 @@ additive by construction rather than by discipline.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlquality.dbtproject import DbtProject, DbtProjectError, ModelNode
-from sqlquality.models import Relation
+from sqlquality.models import Confidence, Proposal, Relation
 
 
 def _split_relation_parts(text: str) -> list[str] | None:
@@ -188,3 +189,167 @@ def load_dbt_context(
         disclosure += f", {context.dropped_collisions} cross-database collision(s) dropped"
     disclosure += ")"
     return context, disclosure
+
+
+#: dbt materializations whose relation is rebuilt out from under a raw `CREATE INDEX`, and
+#: what that rebuild does to it. `view` and anything unrecognised are handled separately —
+#: a view has no relation to index at all, and an unrecognised materialization is unknown
+#: rather than known-safe, so neither belongs in a table keyed by "known to be rebuilt."
+_REBUILD = {
+    "table": "every `dbt run` drops and recreates this relation, so a raw CREATE INDEX is lost",
+    "incremental": (
+        "a normal `dbt run` keeps this relation, but `dbt run --full-refresh` rebuilds it and a "
+        "raw CREATE INDEX is lost"
+    ),
+}
+
+
+def _is_index_creating(ddl: str | None) -> bool:
+    """An index-creating proposal, detected by its DDL prefix rather than its rule code.
+
+    ADV001, ADV007 and ADV008 all emit `CREATE INDEX` today and Batch 3b adds more; a
+    hardcoded set of codes would silently stop matching the day a new rule ships.
+    """
+    return ddl is not None and ddl.lstrip().upper().startswith("CREATE INDEX")
+
+
+def _relation_of(proposal: Proposal) -> Relation | None:
+    """The relation a proposal is about, from its own evidence — every rule stores one."""
+    schema = proposal.evidence.get("schema")
+    table = proposal.evidence.get("table")
+    if isinstance(schema, str) and isinstance(table, str):
+        return Relation(schema, table)
+    return None
+
+
+def _comment_block(lines: list[str]) -> str:
+    """Render `lines` as a `--`-commented block, safe even if a line's *content* smuggles
+    a raw newline.
+
+    `parse_relation_name` accepts a newline inside a quoted identifier — dbt's own
+    `relation_name` field can carry one — and the column/table names this module
+    interpolates ultimately come from a live catalog, which permits the same thing. This
+    function's caller already `repr()`s any identifier it embeds, which itself escapes an
+    embedded `\\n` into the two literal characters `\\` `n` rather than a real line break;
+    this splits each logical line again regardless, so nothing reaching here can produce
+    an output line lacking a leading `--` even if a future caller forgets to `repr()`
+    first. `render_ddl` defends the same hazard the same way for raw DDL; this is that
+    defense's equivalent for a generated config block.
+    """
+    out: list[str] = []
+    for line in lines:
+        physical = line.splitlines() or [""]
+        out.extend(f"-- {p}" for p in physical)
+    return "\n".join(out)
+
+
+def _dbt_attribution(model: ModelNode) -> str:
+    return f"`{model.unique_id}` (materialized as `{model.materialized}`)"
+
+
+def enrich_proposals(proposals: list[Proposal], context: DbtContext) -> list[Proposal]:
+    """Rewrite index-creating proposals whose relation dbt manages; attribute the rest.
+
+    A `CREATE INDEX` proposal on a `table`- or `incremental`-materialized dbt model is
+    expressed instead as a config block a human can paste into that model's `.yml`, since
+    the raw DDL is destroyed the next time dbt rebuilds the relation. A `view` cannot carry
+    an index at all, so the proposal is dropped and explained rather than rewritten. An
+    unrecognised (or absent) materialization is left alone — unknown is not the same as
+    known-safe, so the DDL is not touched on a guess.
+
+    Everything else passes through with only its evidence enriched: a `DROP INDEX`
+    proposal is ordinary regardless of dbt (dbt never created the index, so there is
+    nothing for its `indexes` config to un-express), and an advisory proposal with no DDL
+    has nothing to rewrite either. Both are still attributed to the model they concern, so
+    a reader knows where to make the fix.
+
+    A proposal whose relation dbt does not manage — or that carries no `(schema, table)`
+    evidence at all — is returned completely unchanged.
+    """
+    out: list[Proposal] = []
+    for proposal in proposals:
+        relation = _relation_of(proposal)
+        model = context.model_for(relation) if relation is not None else None
+        if model is None:
+            out.append(proposal)
+            continue
+        out.append(_enrich_one(proposal, model))
+    return out
+
+
+def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
+    evidence = dict(proposal.evidence)
+    evidence["dbt_model"] = model.unique_id
+    evidence["dbt_materialized"] = model.materialized
+
+    if not _is_index_creating(proposal.ddl):
+        # DROP INDEX, and any advisory proposal with no DDL at all: attributed, not
+        # rewritten. Dropping an index dbt never created is ordinary, and there is no
+        # `indexes` config entry that expresses a removal.
+        return dataclasses.replace(proposal, evidence=evidence)
+
+    ddl = proposal.ddl
+    assert ddl is not None  # _is_index_creating(None) is False, so this branch guarantees it
+    materialized = model.materialized
+
+    if materialized == "view":
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt view ({_dbt_attribution(model)}): "
+            "a view has no storage of its own to index, so this proposal does not apply."
+        )
+        return dataclasses.replace(
+            proposal,
+            ddl=None,
+            rationale=rationale,
+            confidence=Confidence.LOW,
+            evidence=evidence,
+        )
+
+    if materialized not in _REBUILD:
+        label = materialized if materialized else "(absent)"
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}), "
+            f"but materialization '{label}' is unrecognised, so the DDL below is left as-is "
+            "rather than rewritten on a guess."
+        )
+        return dataclasses.replace(proposal, rationale=rationale, evidence=evidence)
+
+    # `table` or `incremental`: the relation genuinely gets rebuilt, so a raw CREATE INDEX
+    # is lost sooner or later. A partial index (ADV004's WHERE-restricted proposal) has no
+    # dbt `indexes`-config equivalent — that config has no predicate field — so it must be
+    # disclosed as not expressible rather than silently rewritten into a config block that
+    # quietly drops the WHERE clause and turns a correct proposal into a wrong one.
+    if "WHERE" in ddl:
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
+            f"{_REBUILD[materialized]}. dbt's `indexes` config has no predicate field, so this "
+            "partial index cannot be expressed as config — it will be dropped on the next "
+            "rebuild unless you reapply the DDL above by hand afterward."
+        )
+        return dataclasses.replace(proposal, rationale=rationale, evidence=evidence)
+
+    columns = proposal.evidence.get("columns")
+    if (
+        not isinstance(columns, (tuple, list))
+        or not columns
+        or not all(isinstance(c, str) for c in columns)
+    ):
+        # No plain column list to express as config — leave the DDL untouched rather than
+        # invent one.
+        return dataclasses.replace(proposal, evidence=evidence)
+
+    config_ddl = _comment_block(
+        [
+            "ADV302: express this as dbt config, not DDL. Add to the model's config block:",
+            "  indexes:",
+            f"    - columns: {list(columns)!r}",
+            "      type: btree",
+        ]
+    )
+    evidence["dbt_index_config"] = config_ddl
+    rationale = (
+        f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
+        f"{_REBUILD[materialized]}. Add the config block above to the model instead of running "
+        "this DDL directly; `dbt run` applies it."
+    )
+    return dataclasses.replace(proposal, ddl=config_ddl, rationale=rationale, evidence=evidence)
