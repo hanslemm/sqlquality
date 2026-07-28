@@ -11,11 +11,11 @@ from __future__ import annotations
 import dataclasses
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlquality.dbtproject import DbtProject, DbtProjectError, ModelNode
-from sqlquality.models import Aggregation, ColumnUsage, Confidence, Proposal, Relation
+from sqlquality.models import Aggregation, ColumnUsage, Confidence, Proposal, Relation, Workload
 
 
 def _split_relation_parts(text: str) -> list[str] | None:
@@ -103,6 +103,14 @@ class DbtContext:
     #: see `from_project`. Surfaced so the CLI disclosure can tell a user "we found nothing"
     #: apart from "we found two candidates and refused to guess."
     dropped_collisions: int = 0
+    #: How many other *models* depend on the model building this relation, keyed the same
+    #: way as `models`. ADV303 needs this to exclude a model that only looks unused because
+    #: nothing but another model reads it — but holding the whole `DbtProject` just to ask
+    #: `model_children` on demand would let dbt-shaped knowledge (unique_ids, the child map)
+    #: leak past this module's boundary into whatever calls `DbtContext.model_for` today.
+    #: Carrying only the count keeps `DbtContext` a plain fact about relations, the same
+    #: shape `model_for` already promises.
+    child_count: dict[Relation, int] = field(default_factory=dict)
 
     @classmethod
     def from_project(cls, project: DbtProject) -> DbtContext:
@@ -139,7 +147,8 @@ class DbtContext:
                 continue
             candidates[relation] = node
         models = {r: n for r, n in candidates.items() if r not in collided}
-        return cls(models=models, dropped_collisions=len(collided))
+        child_count = {r: len(project.model_children(n.unique_id)) for r, n in models.items()}
+        return cls(models=models, dropped_collisions=len(collided), child_count=child_count)
 
     def model_for(self, relation: Relation) -> ModelNode | None:
         """The model building this exact relation, matching schema *and* table.
@@ -468,6 +477,61 @@ def propose_materialization(
                     "cost_share": cost_share,
                 },
                 confidence=Confidence.MEDIUM,
+                ddl=None,
+            )
+        )
+    return proposals
+
+
+def propose_unused_models(
+    aggregation: Aggregation, context: DbtContext, workload: Workload
+) -> list[Proposal]:
+    """ADV303 — a dbt model within reach of the manifest that the analyzed workload never
+    touched.
+
+    A model that costs a build every night and that nothing queries is worth knowing about,
+    but the evidence here is *absence*, which is far weaker than presence, so this carries
+    the loudest caveat in this module and a hard confidence cap of LOW rather than a
+    downgrade for each individual caveat:
+
+    * the analyzed window may simply not cover this model's reader — a monthly report, a
+      BI tool with its own cache, an ad-hoc job that only runs quarterly;
+    * `--limit` truncates the query history handed to `advise`, so a cold-but-genuinely-used
+      model can look exactly like an unused one within the slice this tool actually saw.
+
+    A model with dbt children is excluded outright — not merely downgraded — because that
+    is a correctness gate, not a caveat: a staging model consumed only by another model *is*
+    used, just not by an ad-hoc query, and without this exclusion the rule would propose
+    deleting every staging model in a well-formed project.
+    """
+    proposals: list[Proposal] = []
+    for relation in sorted(context.models):
+        if relation in aggregation.tables:
+            continue
+        if context.child_count.get(relation, 0) > 0:
+            continue
+        model = context.models[relation]
+        rationale = (
+            f"No query in the analyzed workload ({workload.window_description}) referenced "
+            f"this dbt model ({_dbt_attribution(model)}). This is evidence of absence, not "
+            "proof of it: the window may simply not cover this model's reader — a monthly "
+            "report, a BI tool with its own cache, a quarterly job — and `--limit` truncates "
+            "the query history this tool actually saw, so a cold-but-used model can look "
+            "unused within that slice. A model with dbt children is excluded from this rule "
+            "outright rather than merely downgraded, because a model consumed only by "
+            "another model is used, just not by an ad-hoc query."
+        )
+        proposals.append(
+            Proposal(
+                code="ADV303",
+                title=f"{relation} is a dbt model the analyzed workload never touched",
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "dbt_model": model.unique_id,
+                },
+                confidence=Confidence.LOW,
                 ddl=None,
             )
         )

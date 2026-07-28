@@ -4,7 +4,15 @@ from pathlib import Path
 import pytest
 
 from sqlquality.dbtproject import DbtProject
-from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Confidence, Proposal, Relation
+from sqlquality.models import (
+    Aggregation,
+    ColumnRole,
+    ColumnUsage,
+    Confidence,
+    Proposal,
+    Relation,
+    Workload,
+)
 from sqlquality.workload.dbt import (
     DbtContext,
     _comment_block,
@@ -12,6 +20,7 @@ from sqlquality.workload.dbt import (
     load_dbt_context,
     parse_relation_name,
     propose_materialization,
+    propose_unused_models,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
@@ -585,3 +594,63 @@ def test_adv301_reports_one_proposal_per_relation_not_per_column():
     )
     assert len(proposals) == 1
     assert proposals[0].evidence["cost_share"] == 0.4, "the max, not the sum"
+
+
+def _workload() -> Workload:
+    """A minimal Workload, in the style of `tests/test_workload_aggregate.py`'s `_workload`
+    helper (not imported across test modules — see that file's own helper). ADV303 only
+    reads `window_description` off it, so an empty `stats` tuple is enough."""
+    return Workload(stats=(), window_description="the last 7 days")
+
+
+def test_adv303_flags_a_model_no_query_touched():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    proposals = propose_unused_models(_aggregation(usage), context, _workload())
+    codes = {p.code for p in proposals}
+    assert codes == {"ADV303"}
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.customer_orders" in flagged
+
+
+def test_adv303_excludes_a_model_that_other_models_depend_on():
+    """A staging model consumed by a downstream model is used. Without this gate the rule
+    proposes deleting every staging model in the project."""
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    proposals = propose_unused_models(_aggregation(usage), context, _workload())
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.stg_orders" not in flagged, "stg_orders feeds orders"
+
+
+def test_adv303_is_capped_at_low_confidence():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    for proposal in propose_unused_models(_aggregation(usage), context, _workload()):
+        assert proposal.confidence is Confidence.LOW
+
+
+def test_adv303_states_the_window_caveat_and_the_limit_caveat():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    [first, *_] = propose_unused_models(_aggregation(usage), context, _workload())
+    assert "window" in first.rationale
+    assert "--limit" in first.rationale
+
+
+def test_adv303_emits_nothing_when_every_model_was_touched():
+    context = DbtContext.from_project(_project())
+    usages = [
+        _usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.1)
+        for relation in context.models
+    ]
+    assert propose_unused_models(_aggregation(*usages), context, _workload()) == []
+
+
+def test_adv303_carries_no_ddl():
+    """Deleting a model is a repository change with review implications; the tool must not
+    hand over a statement that does it."""
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    for proposal in propose_unused_models(_aggregation(usage), context, _workload()):
+        assert proposal.ddl is None
