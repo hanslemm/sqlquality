@@ -1809,6 +1809,40 @@ def test_render_ddl_recommends_concurrently_for_index_creation():
     assert "CONCURRENTLY" in script
 
 
+def test_render_ddl_emits_a_pre_commented_multiline_block_verbatim_with_its_header():
+    """A proposal can arrive with `ddl` already a `--`-commented, multi-line disclosure
+    rather than raw executable DDL — dbt enrichment's ADV302 rewrite is exactly this
+    shape. Before this test, the line-break guard treated *any* multi-line `ddl` as the
+    identifier-with-an-embedded-break hazard: it double-commented every line, printed a
+    false "an identifier ... contains a line break", and — because that whole branch
+    `continue`s before the header is appended — dropped the `-- ADV001 [confidence]` line
+    a reader needs to know which rule this is and how confident it was. A `ddl` value that
+    is already fully commented is not that hazard and must be emitted verbatim, with its
+    usual header.
+    """
+    config_block = (
+        "-- ADV302: express this as dbt config, not DDL. Add to the model's config block:\n"
+        "--   indexes:\n"
+        "--     - columns: ['status']\n"
+        "--       type: btree"
+    )
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="Add index on orders(status)",
+            rationale="hot predicate.",
+            evidence={"cost_share": 0.5},
+            confidence=Confidence.HIGH,
+            ddl=config_block,
+        ),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "-- ADV001 [high, 50.0% of workload cost]" in script
+    assert "NOT RENDERED" not in script
+    assert "-- --   indexes:" not in script, "must not be double-commented"
+    assert script.count("- columns: ['status']") == 1
+
+
 def test_generated_ddl_quotes_identifiers():
     """Unquoted identifiers break on anything needing quotes — mixed case, reserved words."""
     relation = Relation("public", "Order")

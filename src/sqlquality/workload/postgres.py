@@ -1218,6 +1218,25 @@ def _comment_lines(text: str) -> list[str]:
     return [f"-- {line}" for line in text.splitlines()]
 
 
+def _is_fully_commented(ddl: str) -> bool:
+    """True when every physical line of `ddl` already begins with `--`.
+
+    `render_ddl`'s line-break guard exists to catch an *identifier* whose embedded newline
+    would otherwise leave part of a raw statement looking like a bare, executable line. A
+    `ddl` value that is already a `--`-commented disclosure on every line — for instance, a
+    config-block proposal something upstream of this adapter generated instead of raw
+    DDL — is categorically not that hazard: it is already inert on every line, so it can be
+    emitted verbatim (with the usual code/confidence header) rather than routed through the
+    NOT-RENDERED fallback, which would double-comment every line and print a reason ("an
+    identifier contains a line break") that is simply false for this kind of proposal. This
+    check is about the *shape* of the text alone, so it names nothing about dbt or any
+    other specific caller — any adapter-agnostic multi-line, pre-commented `ddl` gets the
+    same treatment.
+    """
+    lines = ddl.splitlines()
+    return bool(lines) and all(line.startswith("--") for line in lines)
+
+
 class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
@@ -2006,7 +2025,9 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         for proposal in proposals:
             if not proposal.ddl:
                 continue
-            if "\n" in proposal.ddl or "\r" in proposal.ddl:
+            if ("\n" in proposal.ddl or "\r" in proposal.ddl) and not _is_fully_commented(
+                proposal.ddl
+            ):
                 # An identifier containing a line break cannot be emitted as a single-line
                 # statement. Quoting already makes it *semantically* safe — psql parses the
                 # whole thing as one quoted identifier, so nothing extra executes — but the
@@ -2015,6 +2036,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 # instead would emit DDL targeting an object that does not exist. So it is
                 # commented out in full with the reason, rather than rendered wrong or
                 # silently dropped.
+                #
+                # This is skipped when `_is_fully_commented` already holds: a `ddl` that is
+                # every-line-`--`-commented is not an identifier smuggling a line break, it
+                # is an intentional multi-line disclosure, and running it through this
+                # fallback would double-comment it and print a reason that is false for it.
                 body.append("-- NOT RENDERED: an identifier in this proposal contains a line")
                 body.append("-- break, so it cannot be emitted as a single-line statement.")
                 body.append("-- Verify the name and apply this by hand:")

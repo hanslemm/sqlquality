@@ -7,6 +7,7 @@ from sqlquality.dbtproject import DbtProject
 from sqlquality.models import Confidence, Proposal, Relation
 from sqlquality.workload.dbt import (
     DbtContext,
+    _comment_block,
     enrich_proposals,
     load_dbt_context,
     parse_relation_name,
@@ -240,6 +241,7 @@ def test_adv302_replaces_raw_ddl_for_a_table_model_with_a_dbt_config_block():
     assert "CREATE INDEX" not in out.ddl
     assert "indexes" in out.ddl
     assert "columns" in out.ddl and "status" in out.ddl
+    assert "type: btree" in out.ddl
     assert "dbt run" in out.rationale
 
 
@@ -257,7 +259,10 @@ def test_adv302_says_a_view_cannot_be_indexed_at_all():
     relation = Relation("main", "stg_orders")  # materialized: view
     [out] = enrich_proposals([_index_proposal(relation)], context)
     assert out.ddl is None, "a view has no storage to index, so there is no DDL to run"
-    assert "view" in out.rationale
+    # The substantive claim, not just the word "view" — the generic attribution string
+    # `(materialized as `view`)` alone would already satisfy a bare `"view" in rationale`
+    # even if this sentence were stripped or replaced with something generic.
+    assert "has no storage of its own to index" in out.rationale
     assert out.confidence is Confidence.LOW
 
 
@@ -289,13 +294,25 @@ def test_adv302_does_not_touch_a_relation_dbt_does_not_manage():
 
 def test_adv302_does_not_rewrite_a_drop_index_proposal():
     """Dropping an index dbt never created is a perfectly ordinary thing to do, and there is
-    no `indexes` config that expresses a removal."""
+    no `indexes` config that expresses a removal.
+
+    `evidence` deliberately includes a `columns` tuple, the same shape ADV001/007/008
+    carry: without it, a broken `_is_index_creating` that wrongly called this DROP
+    "index-creating" would still slip through the *separate* "no columns to express as
+    config" bail-out and leave `ddl` untouched by accident — passing this test for the
+    wrong reason instead of actually exercising the DDL-prefix guard it claims to pin.
+    """
     context = DbtContext.from_project(_project())
     drop = Proposal(
         code="ADV002",
         title="Drop unused index idx_cold on main.orders",
         rationale="no scans.",
-        evidence={"schema": "main", "table": "orders", "index": "idx_cold"},
+        evidence={
+            "schema": "main",
+            "table": "orders",
+            "index": "idx_cold",
+            "columns": ("status",),
+        },
         confidence=Confidence.MEDIUM,
         ddl='DROP INDEX "main"."idx_cold";',
     )
@@ -349,6 +366,106 @@ def test_adv302_discloses_a_partial_index_as_not_expressible_rather_than_droppin
     assert "dbt" in out.rationale and "drop" in out.rationale.lower()
 
 
+def test_adv302_does_not_mistake_a_column_named_where_for_a_partial_index():
+    """A substring search for "WHERE" in the DDL is foolable by a column literally named
+    `WHERE`: quoted, it is a perfectly ordinary identifier, but `CREATE INDEX ON t
+    ("WHERE")` contains the substring anyway. Detection keys on ADV004's own
+    `guard_column`/`guard_predicate` evidence instead, which this proposal does not carry,
+    so it must be rewritten normally rather than disclosed as an inexpressible partial
+    index."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    [out] = enrich_proposals([_index_proposal(relation, ("WHERE",))], context)
+    assert out.ddl is not None
+    assert "CREATE INDEX" not in out.ddl, "a column named WHERE must not block the rewrite"
+    assert "indexes" in out.ddl
+
+
+def test_adv302_detects_a_lowercase_where_partial_index_via_evidence_not_text():
+    """Every rule in this codebase emits an uppercase `WHERE` today, but detection must not
+    depend on that: keying on ADV004's `guard_column`/`guard_predicate` evidence catches a
+    lowercase `where` (plausible from a future engine's rule) exactly the same as an
+    uppercase one, whereas a text search for `"WHERE"` would silently miss it and drop the
+    predicate into a config block that has nowhere to put it."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    partial = Proposal(
+        code="ADV004",
+        title=f"Partial index on {relation}(status) where deleted_at is null",
+        rationale="hot predicate, restricted by a null check.",
+        evidence={
+            "schema": relation.schema,
+            "table": relation.table,
+            "columns": ("status",),
+            "guard_column": "deleted_at",
+            "guard_predicate": "is null",
+            "cost_share": 0.5,
+        },
+        confidence=Confidence.MEDIUM,
+        ddl=(
+            f'CREATE INDEX ON "{relation.schema}"."{relation.table}" '
+            '("status") where "deleted_at" is null;'
+        ),
+    )
+    [out] = enrich_proposals([partial], context)
+    assert out.ddl == partial.ddl, "a lowercase predicate must still be disclosed, not dropped"
+
+
+def test_adv302_expresses_a_unique_index_with_dbts_unique_config_field():
+    """`CREATE UNIQUE INDEX` is still index-creating DDL a table rebuild destroys, and
+    dbt's `indexes` config has a `unique` field for exactly this — so it must be rewritten
+    (not silently skipped) and the uniqueness preserved rather than dropped."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    unique = Proposal(
+        code="ADV001",
+        title=f"Add unique index on {relation}(email)",
+        rationale="hot predicate.",
+        evidence={"schema": relation.schema, "table": relation.table, "columns": ("email",)},
+        confidence=Confidence.HIGH,
+        ddl=f'CREATE UNIQUE INDEX ON "{relation.schema}"."{relation.table}" ("email");',
+    )
+    [out] = enrich_proposals([unique], context)
+    assert out.ddl is not None
+    assert "CREATE UNIQUE INDEX" not in out.ddl
+    assert "unique: true" in out.ddl
+
+
+def test_adv302_recognises_create_index_concurrently_as_index_creating():
+    """The DDL script's own header recommends CONCURRENTLY for a live table, so a
+    proposal that used it must not silently stop being detected as index-creating —
+    that is exactly the silent-skip the DDL-prefix requirement exists to prevent."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")  # materialized: table
+    concurrent = Proposal(
+        code="ADV001",
+        title=f"Add index on {relation}(status)",
+        rationale="hot predicate.",
+        evidence={"schema": relation.schema, "table": relation.table, "columns": ("status",)},
+        confidence=Confidence.HIGH,
+        ddl=f'CREATE INDEX CONCURRENTLY ON "{relation.schema}"."{relation.table}" ("status");',
+    )
+    [out] = enrich_proposals([concurrent], context)
+    assert out.ddl is not None
+    assert "CREATE INDEX" not in out.ddl
+    assert "indexes" in out.ddl
+
+
+def test_adv302_rewrites_a_materialized_view_instead_of_calling_it_unrecognised():
+    """`materialized_view` has been a real dbt materialization since dbt-core 1.6 and
+    supports an `indexes` config exactly like `table`/`incremental` — calling it
+    "unrecognised" is safe but wrong, since the operator is left with DDL a rebuild or
+    full refresh destroys."""
+    project = _project_with_materialization("model.demo.orders", "materialized_view")
+    context = DbtContext.from_project(project)
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"))], context)
+    assert out.ddl is not None
+    assert "CREATE INDEX" not in out.ddl
+    assert "indexes" in out.ddl
+    assert "unrecognised" not in out.rationale
+    assert "materialized view" in out.rationale
+
+
 def test_adv302_config_block_survives_a_newline_in_a_column_name():
     """A newline inside a quoted identifier parses successfully (parse_relation_name
     accepts one in a relation name), and a column introspected from a live catalog can
@@ -367,3 +484,23 @@ def test_adv302_config_block_survives_a_newline_in_a_column_name():
     # The hostile text must not appear as a live, uncommented statement anywhere.
     executable = [ln for ln in out.ddl.splitlines() if not ln.startswith("--")]
     assert not any("DROP TABLE users" in ln for ln in executable)
+    # Pins the specific mechanism: `list(columns)` formatting escapes the embedded
+    # newline into the two literal characters `\` and `n` — this is what actually
+    # neutralizes the hazard here, not `_comment_block`'s resplitting (see
+    # `test_comment_block_defends_a_raw_newline_smuggled_past_the_repr_escaping` for
+    # that defense pinned in isolation).
+    assert "\\n" in out.ddl
+
+
+def test_comment_block_defends_a_raw_newline_smuggled_past_the_repr_escaping():
+    """`_comment_block` is `enrich_proposals`' own equivalent of `render_ddl`'s per-line
+    comment guard. The end-to-end hazard test above never actually exercises this
+    function's own resplitting, because `list(columns)` formatting already escapes an
+    embedded newline before `_comment_block` ever sees it — so this pins the second,
+    independent defense directly: a raw `\\n` inside one logical line, bypassing any
+    repr-based escaping entirely, must still not produce a bare physical line."""
+    rendered = _comment_block(["safe line", "unsafe\nline -- DROP TABLE users;", "also safe"])
+    lines = rendered.splitlines()
+    assert len(lines) == 4  # three logical lines, one of which splits into two physical ones
+    for line in lines:
+        assert line.startswith("--"), f"bare line outside comment mode: {line!r}"
