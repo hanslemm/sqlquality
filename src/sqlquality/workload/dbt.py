@@ -471,6 +471,15 @@ def propose_materialization(
     not the sum — `ColumnUsage.cost_share` is deliberately not a partition (see its own
     docstring), so a query hot on two columns of the same view would otherwise be counted
     twice, exactly the double-count ADV001 and ADV008 already avoid the same way.
+
+    Only `materialized == "view"` qualifies, and excluding `materialized_view` needs no
+    separate branch: the equality check already excludes it by construction, and correctly
+    so — unlike a plain view, a materialized view refreshes its *stored* result rather than
+    re-executing its query on every read, so it has already made the build-time-for-read-time
+    trade this rule proposes; recommending it again would be pointless. Contrast ADV302,
+    which *does* need an explicit `materialized_view` branch, because it answers a different
+    question (does a rebuild destroy an index) that a materialized view answers the same way
+    a table does.
     """
     by_relation: dict[Relation, list[ColumnUsage]] = defaultdict(list)
     for item in aggregation.usage:
