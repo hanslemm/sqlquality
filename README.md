@@ -318,7 +318,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 — the last only with `--project-dir`/`--manifest`); the index-hygiene rules **ADV002 and ADV003**, and **ADV303** (its evidence is absence, not cost, so there is no share to threshold), carry no cost evidence and are always reported. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 — the last only with `--project-dir`/`--manifest`); the index-hygiene rules **ADV002 and ADV003**, and **ADV303** (its evidence is absence, not cost, so there is no share to threshold), carry no cost evidence and are reported whatever the threshold. ADV303 has its own non-threshold suppression: it emits nothing at all when no query usage could be extracted, since then every model would look untouched by definition. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -389,11 +389,19 @@ statement is not valid SQL to copy out and run.
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
 | ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
 | ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
-| ADV301¹ | Materialize a `view`-backed dbt model that carries a hot share of workload cost, capped at MEDIUM | cost share, dbt materialization |
-| ADV302¹ | Rewrite an index-creating proposal for a dbt-managed relation into a config block, or drop it, instead of DDL that does not survive `dbt run` | dbt materialization, columns |
-| ADV303¹ | A dbt model within reach of the manifest that the analyzed workload never touched and no other model, snapshot or exposure declares as a consumer, capped at LOW | dbt model graph |
+| ADV301¹ | Materialize a `view`-backed dbt model that carries a hot share of workload cost, capped at MEDIUM | cost share, dbt model |
+| ADV303¹ | A dbt model within reach of the manifest that the analyzed workload never touched and no other model, snapshot or exposure declares as a consumer, capped at LOW | dbt model |
 
 ¹ Only fires with `--project-dir` or `--manifest` loaded — see [dbt enrichment](#dbt-enrichment-optional).
+
+**ADV302 is not in that table, because it is not a proposal code.** It is a *rewrite*
+applied to another rule's proposal — ADV001, ADV004, ADV007 or ADV008 keeps its own code,
+confidence and cost share, and only its `ddl` and `rationale` change. So no proposal ever
+carries `code: "ADV302"`, and a `--json` consumer filtering on that code sees zero rows on
+every run; filter on `evidence.dbt_index_config == true` instead (present, and `true`, only
+on a proposal whose DDL was replaced by a dbt config block). The terminal table shows the
+original rule's row unchanged, so `advise` prints a line on stderr saying how many proposals
+ADV302 rewrote. See [dbt enrichment](#dbt-enrichment-optional).
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -463,7 +471,8 @@ DROP INDEX "public"."idx_orders_customer_ref";
 ```
 
 `--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
-`engine`, `proposals`, `redacted`, `skipped`, `window`). This is the first proposal from
+`engine`, `proposals`, `redacted`, `skipped`, `window`, plus `dbt` when — and only when — a
+manifest was loaded). This is the first proposal from
 the run above — the real payload lists all five under `proposals`:
 
 ```console
@@ -573,11 +582,38 @@ worse than advising nothing, which is what **ADV302** exists to prevent: with a 
 loaded, an index-creating proposal for a `table`-, `incremental`- or
 `materialized_view`-materialized relation is rewritten into a commented dbt `indexes:`
 config block you paste into that model's own config instead of DDL you'd apply once and
-lose; on a `view` the proposal is dropped and explained instead (there is no relation to
-index); on any other or absent materialization the DDL is left untouched, since
+lose; on a `view` the **DDL** is dropped and explained instead (there is no relation to
+index) while the proposal itself stays, downgraded to LOW — "this index cannot apply here"
+is the finding; on any other or absent materialization the DDL is left untouched, since
 unrecognised is not the same as known-safe. A partial (`WHERE`-restricted) index has no
 config-block equivalent — dbt's `indexes` config carries no predicate — so that proposal is
 disclosed as not expressible rather than silently dropping the predicate.
+
+**One model, one `indexes:` block.** dbt reads a single `indexes` key per model config, so
+when a run recommends several indexes for the same model they are merged into one block,
+carried by the highest-ranked of those proposals; each of the others points at it by code
+instead of emitting a block of its own. Two standalone blocks pasted under one `config:` are
+a duplicate YAML mapping key, and PyYAML — dbt's own parser — resolves that by silently
+keeping one and discarding the other recommended index, with no error.
+
+**Whenever a statement is left executable for a dbt-managed relation** — the partial-index,
+unrecognised-materialization, no-column-list and non-btree paths above — the warning is
+written into the `--ddl` script itself, as comment lines directly above the statement, not
+only into the `rationale`. The DDL script carries no rationales, and it is the artifact a
+human actually applies.
+
+**The `indexes:` config is a postgres/redshift dbt feature**, and the rewrite is only
+correct where it exists — Snowflake, BigQuery and Databricks have no such config key. If the
+manifest's `adapter_type` is anything else, `advise` says so on stderr and still emits the
+rewrite (its alternative is raw DDL the same rebuild destroys, so declining would inform you
+less), and it warns when the manifest is not a v12 schema, the same check `check` makes.
+
+**The block is rebuilt from the proposal's column list, not from its DDL**, and always as
+`type: btree`. That is faithful for every rule shipping today — each emits a plain btree over
+a column list with no `USING`, expression, `DESC`/`NULLS` or opclass — and a proposal naming a
+non-btree access method declines the rewrite rather than being flattened into a btree.
+Ordering, opclasses and expression indexes are *not* detected: a future rule emitting one
+would need this reconstruction extended alongside it.
 
 Two more proposals only fire with a manifest loaded — see the proposal table above for
 ADV301 and ADV303. Both are capped below HIGH, for the same reason ADV302's rewrite trusts
@@ -973,3 +1009,16 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   without a fresh `dbt compile` produces a stale — but traceable, since the disclosed
   materialization names its own source — rewrite. Nothing verifies the manifest against
   the live relation.
+- **ADV302's config shape is postgres-specific.** dbt's `indexes` model config is
+  implemented by the postgres and redshift adapters only. A manifest whose `adapter_type` is
+  something else gets a stderr warning and the rewrite anyway; the rewrite's *shape* is not
+  translated per adapter. `advise` connects only to Postgres today, so this matters mainly
+  for a project whose manifest and target database disagree.
+- **ADV302 reconstructs the index from the proposal's column list.** The emitted block is
+  always `type: btree` over that column list; column *ordering* is preserved but opclasses,
+  `DESC`/`NULLS` and expression indexes are not expressible, and a non-btree access method
+  declines the rewrite rather than being silently flattened.
+- **ADV303 only looks at a model's immediate consumers.** A dead model feeding another dead
+  model is not reported until the downstream one is gone, so a fully dead chain unwinds one
+  model per run, from its leaf. Conservative by construction: it never flags a model that
+  something declares a dependency on.

@@ -339,8 +339,42 @@ def test_adv302_rewrites_a_real_index_proposal_into_dbt_config(seeded, tmp_path)
     enriched = _adv001_for(payload, schema="public", table="orders")
     assert enriched is not None, "the dbt-managed public.orders proposal disappeared entirely"
     assert not (enriched["ddl"] or "").upper().lstrip().startswith("CREATE INDEX"), enriched
-    assert "indexes:" in (enriched["ddl"] or ""), enriched
     assert enriched["evidence"]["dbt_model"] == "model.live_it.orders"
     assert enriched["evidence"]["dbt_materialized"] == "table"
-    assert "dbt_index_config" in enriched["evidence"], enriched
-    assert enriched["ddl"] == enriched["evidence"]["dbt_index_config"]
+
+    # This live workload really does produce more than one index proposal for `public.orders`
+    # -- a hot predicate and a hot join key -- which is the ordinary case, not an edge one.
+    # dbt reads one `indexes` key per model config, so the whole run must contain exactly one
+    # `indexes:` block for the model: two standalone blocks pasted into one config are a
+    # duplicate YAML mapping key, and PyYAML (dbt's own parser) silently keeps just one of
+    # them, discarding the other recommended index with no error at all.
+    for_model = [
+        p for p in payload["proposals"] if p["evidence"].get("dbt_model") == "model.live_it.orders"
+    ]
+    assert len(for_model) >= 2, (
+        "this test's whole point is multiple proposals for one dbt model; got "
+        f"{[(p['code'], p['title']) for p in for_model]}"
+    )
+    owners = [p for p in for_model if p["evidence"].get("dbt_index_config") is True]
+    assert len(owners) == 1, [p["code"] for p in owners]
+    blocks = [
+        line
+        for p in for_model
+        for line in (p["ddl"] or "").splitlines()
+        if line.removeprefix("--").strip() == "indexes:"
+    ]
+    assert len(blocks) == 1, f"one model, one `indexes:` block, got {len(blocks)}"
+
+    [owner] = owners
+    assert "indexes:" in owner["ddl"], owner
+    assert "model.live_it.orders" in owner["ddl"], "the block names the model to paste it into"
+    # Every index recommended for the model is inside that one block, this ADV001's included.
+    columns = [p["evidence"]["columns"] for p in for_model if p["evidence"].get("columns")]
+    assert columns, for_model
+    for column_list in columns:
+        assert str(list(column_list)) in owner["ddl"], (column_list, owner["ddl"])
+    for other in for_model:
+        if other is owner:
+            continue
+        assert other["evidence"]["dbt_index_config_reported_with"] == owner["code"]
+        assert "already included in the single dbt config block" in other["ddl"]

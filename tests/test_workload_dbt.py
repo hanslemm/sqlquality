@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -16,11 +17,14 @@ from sqlquality.models import (
 from sqlquality.workload.dbt import (
     DbtContext,
     _comment_block,
+    _manifest_warnings,
+    describe_rewrites,
     enrich_proposals,
     load_dbt_context,
     parse_relation_name,
     propose_materialization,
     propose_unused_models,
+    resolve_manifest_path,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
@@ -93,6 +97,12 @@ def test_parse_relation_name_unescapes_a_doubled_quote():
         '"db".""."t"',  # an empty quoted segment can't be a schema
         '"db"."sch".',  # trailing dot: something was supposed to follow and didn't
         '"a"."b',  # unterminated quote on the last segment
+        # Garbage immediately after a closing quote, with no dot between. This is the shape
+        # the scanner's own docstring is about and the one the parametrization was missing:
+        # without the "the char after a quoted segment must be a dot" reject, this parses as
+        # three parts `a`, `b`, `y` -- the `x` vanishes and every later part shifts one slot,
+        # so `Relation("b", "y")` is returned for a name that names neither.
+        '"a"."b"xy',
     ],
 )
 def test_parse_relation_name_declines_a_malformed_segment_rather_than_shifting(raw):
@@ -120,11 +130,19 @@ def test_context_excludes_non_model_resources():
     `resource_type == "model"` before `DbtContext.from_project` ever sees a unique_id, so
     there is no reachable guard left in this module to pin. This asserts the guarantee
     itself: no seed or test unique_id ever reaches `models`.
+
+    The exact set, not just the two negatives: with only negative assertions this test passed
+    against an empty model index, so it could not distinguish "seeds and tests are excluded"
+    from "nothing is indexed at all" — and it read as coverage for the former.
     """
     context = DbtContext.from_project(_project())
-    assert context.model_for(Relation("main", "raw_orders")) is None  # the seed's relation
     unique_ids = {node.unique_id for node in context.models.values()}
-    assert not any(uid.startswith(("seed.", "test.")) for uid in unique_ids)
+    assert unique_ids == {
+        "model.demo.stg_orders",
+        "model.demo.orders",
+        "model.demo.customer_orders",
+    }, "the three models, and only them — the fixture also carries a seed and a test"
+    assert context.model_for(Relation("main", "raw_orders")) is None  # the seed's relation
 
 
 def test_context_skips_a_model_with_no_relation_name():
@@ -681,7 +699,12 @@ def test_adv303_excludes_a_model_with_exactly_one_model_child():
     """`> 0` and `> 1` both leave every other test green if the only fixture with children
     happens to have two of them (`stg_orders` feeds both `orders` and `customer_orders`).
     This is the commonest real shape — one staging model feeding one downstream model — so
-    it needs its own fixture to be pinned at all."""
+    it needs its own fixture to be pinned at all.
+
+    `orphan` is in the fixture so the assertion discriminates: with only `parent` and `child`
+    the expected result is the empty set, which is also what a rule that flagged *nothing*
+    produces — so the test passed without the exclusion it claims to pin ever being reached.
+    """
     manifest = {
         "nodes": {
             "model.demo.parent": {
@@ -694,30 +717,46 @@ def test_adv303_excludes_a_model_with_exactly_one_model_child():
                 "config": {"materialized": "table"},
                 "relation_name": '"dev"."main"."child"',
             },
+            "model.demo.orphan": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."orphan"',
+            },
         },
         "child_map": {
             "model.demo.parent": ["model.demo.child"],
             "model.demo.child": [],
+            "model.demo.orphan": [],
         },
     }
     context = DbtContext.from_project(DbtProject.from_manifest(manifest))
     usage = _usage(Relation("main", "child"), "status", ColumnRole.EQUALITY, cost_share=0.5)
     proposals = propose_unused_models(_aggregation(usage), context, _workload())
     flagged = {p.evidence["dbt_model"] for p in proposals}
-    assert "model.demo.parent" not in flagged, "parent has exactly one model child"
+    assert flagged == {"model.demo.orphan"}, "parent has exactly one model child; orphan has none"
 
 
 def test_adv303_excludes_a_model_whose_only_child_is_a_snapshot():
     """An exposure/snapshot is a real, dbt-declared consumer that `model_children` cannot
     see because it filters to `resource_type == 'model'`. ADV303 must read the manifest's
     raw child_map (via `DbtProject.child_ids`) instead, or it would propose deleting a model
-    dbt itself documents as being snapshotted."""
+    dbt itself documents as being snapshotted.
+
+    `orphan` is in the fixture for the same reason as in the one-model-child test: without a
+    model this rule *does* flag, the expected result is the empty set and the test passes
+    against a rule that flags nothing at all.
+    """
     manifest = {
         "nodes": {
             "model.demo.raw": {
                 "resource_type": "model",
                 "config": {"materialized": "table"},
                 "relation_name": '"dev"."main"."raw"',
+            },
+            "model.demo.orphan": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."orphan"',
             },
             "snapshot.demo.raw_snapshot": {
                 "resource_type": "snapshot",
@@ -727,13 +766,14 @@ def test_adv303_excludes_a_model_whose_only_child_is_a_snapshot():
         },
         "child_map": {
             "model.demo.raw": ["snapshot.demo.raw_snapshot"],
+            "model.demo.orphan": [],
             "snapshot.demo.raw_snapshot": [],
         },
     }
     context = DbtContext.from_project(DbtProject.from_manifest(manifest))
     proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
     flagged = {p.evidence["dbt_model"] for p in proposals}
-    assert "model.demo.raw" not in flagged
+    assert flagged == {"model.demo.orphan"}, "a snapshot is a declared consumer; orphan has none"
 
 
 def test_adv303_excludes_a_model_whose_only_child_is_an_exposure():
@@ -741,7 +781,11 @@ def test_adv303_excludes_a_model_whose_only_child_is_an_exposure():
     tool reads this" — a mart whose only declared consumer is an exposure is exactly the
     case this rule must not flag. Exposures live outside `nodes` in a real manifest, so
     this only works because `child_ids` reads `child_map` directly rather than resolving
-    each child through `DbtProject.node`."""
+    each child through `DbtProject.node`.
+
+    `orphan` is in the fixture so the expected result is a non-empty set: as an
+    absence-only assertion this passed against a rule that flagged nothing.
+    """
     manifest = {
         "nodes": {
             "model.demo.mart": {
@@ -749,13 +793,21 @@ def test_adv303_excludes_a_model_whose_only_child_is_an_exposure():
                 "config": {"materialized": "table"},
                 "relation_name": '"dev"."main"."mart"',
             },
+            "model.demo.orphan": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."orphan"',
+            },
         },
-        "child_map": {"model.demo.mart": ["exposure.demo.dashboard"]},
+        "child_map": {
+            "model.demo.mart": ["exposure.demo.dashboard"],
+            "model.demo.orphan": [],
+        },
     }
     context = DbtContext.from_project(DbtProject.from_manifest(manifest))
     proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
     flagged = {p.evidence["dbt_model"] for p in proposals}
-    assert "model.demo.mart" not in flagged
+    assert flagged == {"model.demo.orphan"}, "an exposure is a declared consumer; orphan has none"
 
 
 def test_adv303_does_not_count_a_test_as_a_consumer():
@@ -781,7 +833,7 @@ def test_adv303_does_not_count_a_test_as_a_consumer():
     context = DbtContext.from_project(DbtProject.from_manifest(manifest))
     proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
     flagged = {p.evidence["dbt_model"] for p in proposals}
-    assert "model.demo.mart" in flagged
+    assert flagged == {"model.demo.mart"}
 
 
 def test_adv303_orders_proposals_canonically_by_relation():
@@ -837,3 +889,508 @@ def test_adv301_orders_proposals_canonically_by_relation():
         min_cost_share=0.01,
     )
     assert [p.evidence["table"] for p in proposals] == ["a_model", "z_model"]
+
+
+# --- ADV302: the generated config block -----------------------------------------------
+
+
+def _config_mapping(ddl: str) -> dict:
+    """The `indexes:` mapping inside a generated ADV302 block, parsed as YAML.
+
+    The block exists to be pasted into a dbt model's `.yml`, and nothing asserted it was
+    valid YAML at all — so `list(columns)` → `tuple(columns)` survived mutation, emitting
+    `columns: ('status',)`, which PyYAML (dbt's own parser) rejects outright. Stripping the
+    `--` comment prefixes and dropping the prose above `indexes:` is exactly what a human
+    copying the block into a model config does.
+    """
+    import yaml
+
+    lines = [ln[3:] if ln.startswith("-- ") else ln[2:] for ln in ddl.splitlines()]
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "indexes:")
+    parsed = yaml.safe_load("\n".join(lines[start:]))
+    assert isinstance(parsed, dict), parsed
+    return parsed
+
+
+def _indexes_key_lines(proposals) -> list[str]:
+    """Every emitted line that opens an `indexes:` mapping, across a whole run.
+
+    Counting this is the direct form of the property: dbt reads one `indexes` key per model
+    config, so a second one for the same model is a duplicate YAML key and is silently
+    dropped.
+    """
+    return [
+        ln
+        for p in proposals
+        for ln in (p.ddl or "").splitlines()
+        if ln.removeprefix("--").strip() == "indexes:"
+    ]
+
+
+def test_adv302_config_block_is_valid_yaml():
+    """The block's only purpose is to be pasted into a `.yml`, and no test parsed it."""
+    context = DbtContext.from_project(_project())
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"), ("status",))], context)
+    assert _config_mapping(out.ddl) == {"indexes": [{"columns": ["status"], "type": "btree"}]}
+
+
+def test_adv302_merges_every_index_for_one_model_into_a_single_config_block():
+    """Two proposals on one dbt model must produce ONE `indexes:` block, not two.
+
+    Two standalone blocks pasted under a single model's `config:` are a duplicate YAML
+    mapping key, and PyYAML — dbt's parser — keeps only the last, silently discarding the
+    other recommended index with no error. Two survivors per relation is the *normal* case:
+    the adapter's collapse layer never folds non-prefix column lists, and deliberately
+    preserves same-set-different-order pairs.
+    """
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    first = _index_proposal(relation, ("status", "created_at"), code="ADV001")
+    second = _index_proposal(relation, ("customer_id",), code="ADV007")
+
+    out = enrich_proposals([first, second], context)
+
+    assert [p.code for p in out] == ["ADV001", "ADV007"], "input order must be preserved"
+    assert len(_indexes_key_lines(out)) == 1, (
+        "one model, one `indexes:` block — a second one is a duplicate YAML key that dbt "
+        "silently resolves by keeping only one of them"
+    )
+    [owner] = [p for p in out if p.evidence.get("dbt_index_config") is True]
+    assert _config_mapping(owner.ddl) == {
+        "indexes": [
+            {"columns": ["status", "created_at"], "type": "btree"},
+            {"columns": ["customer_id"], "type": "btree"},
+        ]
+    }, "both recommended indexes, in input (ranked) order, in one block"
+    [deferred] = [p for p in out if "dbt_index_config_reported_with" in p.evidence]
+    assert deferred.code == "ADV007"
+    assert deferred.evidence["dbt_index_config_reported_with"] == "ADV001"
+    assert deferred.ddl is not None
+    assert "CREATE INDEX" not in deferred.ddl, "still not doomed DDL"
+    assert "customer_id" in deferred.ddl, "must say which index it is"
+    assert "ADV001" in deferred.ddl, "and where the block carrying it is"
+    assert "ADV001" in deferred.rationale
+
+
+def test_adv302_merges_three_indexes_and_keeps_a_unique_one_distinct():
+    """A merged block must not flatten the per-entry fields: three entries, one unique."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    plain_a = _index_proposal(relation, ("status",), code="ADV001")
+    plain_b = _index_proposal(relation, ("customer_id",), code="ADV007")
+    unique = _index_proposal(relation, ("order_key",), code="ADV008")
+    unique = dataclasses.replace(
+        unique, ddl='CREATE UNIQUE INDEX ON "main"."orders" ("order_key");'
+    )
+
+    out = enrich_proposals([plain_a, plain_b, unique], context)
+
+    assert len(_indexes_key_lines(out)) == 1
+    [owner] = [p for p in out if p.evidence.get("dbt_index_config") is True]
+    assert _config_mapping(owner.ddl) == {
+        "indexes": [
+            {"columns": ["status"], "type": "btree"},
+            {"columns": ["customer_id"], "type": "btree"},
+            {"columns": ["order_key"], "type": "btree", "unique": True},
+        ]
+    }
+
+
+def test_adv302_does_not_repeat_an_identical_entry_in_the_merged_block():
+    """Two proposals reducing to the same index contribute one entry, not two identical ones."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    out = enrich_proposals(
+        [
+            _index_proposal(relation, ("status",), code="ADV001"),
+            _index_proposal(relation, ("status",), code="ADV008"),
+        ],
+        context,
+    )
+    [owner] = [p for p in out if p.evidence.get("dbt_index_config") is True]
+    assert _config_mapping(owner.ddl) == {"indexes": [{"columns": ["status"], "type": "btree"}]}
+
+
+def test_adv302_keeps_one_block_per_model_when_two_models_are_involved():
+    """Merging is per model, not per run: two dbt models get one block each."""
+    context = DbtContext.from_project(_project())
+    out = enrich_proposals(
+        [
+            _index_proposal(Relation("main", "orders"), ("status",), code="ADV001"),
+            _index_proposal(Relation("main", "customer_orders"), ("status",), code="ADV007"),
+        ],
+        context,
+    )
+    assert len(_indexes_key_lines(out)) == 2, "two models, two blocks — neither collides"
+    assert all(p.evidence.get("dbt_index_config") is True for p in out)
+
+
+def test_adv302_config_block_names_its_model_so_two_relations_never_render_the_same_text():
+    """Two relations recommending the same column list used to render byte-identical `ddl`
+    *and* identical evidence — distinguishable in the DDL file only by the title comment
+    above them, and in the JSON payload by nothing at all. The block says which model to
+    paste it into, so it has to name that model."""
+    context = DbtContext.from_project(_project())
+    [orders] = enrich_proposals(
+        [_index_proposal(Relation("main", "orders"), ("customer_id",))], context
+    )
+    [customer_orders] = enrich_proposals(
+        [_index_proposal(Relation("main", "customer_orders"), ("customer_id",))], context
+    )
+    assert orders.ddl != customer_orders.ddl
+    assert "model.demo.orders" in orders.ddl
+    assert "model.demo.customer_orders" in customer_orders.ddl
+
+
+def test_adv302_never_claims_the_config_block_is_above_anything():
+    """ "Add the config block above" was wrong in every surface: in markdown the fenced DDL is
+    *below* the rationale, in the DDL file the rationale is absent entirely, and in JSON there
+    is no spatial relation at all. The block replaces the DDL, so it is never "above" it."""
+    context = DbtContext.from_project(_project())
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"))], context)
+    assert "block above" not in out.rationale
+    assert "above" not in out.ddl
+
+
+def test_adv302_evidence_carries_a_flag_not_a_copy_of_the_ddl():
+    """`dbt_index_config` used to hold a byte-identical copy of `ddl`. It earned nothing and
+    smeared the markdown Evidence line, which renders evidence as flat `k=v` pairs — so a
+    multi-line value landed inline with literal `\\n` escapes mid-sentence. As a flag it is
+    the one thing a consumer cannot get elsewhere: ADV302 is never a proposal `code`, so
+    `code == "ADV302"` matches nothing and this is the only way to filter for it."""
+    context = DbtContext.from_project(_project())
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"))], context)
+    assert out.evidence["dbt_index_config"] is True
+    assert "\n" not in str(out.evidence["dbt_index_config"])
+
+
+def test_adv302_does_not_mark_a_plain_index_as_unique():
+    """`_is_unique_index` → `return True` survived: every block would gain `unique: true`,
+    recommending a uniqueness *constraint* on a column with no evidence of being unique.
+    `"unique: true"` was asserted once, only for a genuinely unique index; nothing asserted
+    its absence."""
+    context = DbtContext.from_project(_project())
+    [out] = enrich_proposals([_index_proposal(Relation("main", "orders"))], context)
+    assert "unique" not in out.ddl
+    assert "unique" not in _config_mapping(out.ddl)["indexes"][0]
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        # A future `CREATE TABLE`/`CREATE VIEW` rule must not be rewritten into an
+        # `indexes:` block: narrowing the regex to `^CREATE\\b` survived mutation, and the
+        # only negatives tested were `DROP INDEX` and `ddl=None`.
+        'CREATE TABLE "main"."orders_new" AS SELECT * FROM "main"."orders";',
+        'CREATE VIEW "main"."orders_v" AS SELECT * FROM "main"."orders";',
+        # `INDEX` must be a whole word: dropping the `\\b` accepted this.
+        'CREATE INDEXES ON "main"."orders" ("status");',
+        # `.match()` → `.search()` survived: an index-creating phrase anywhere in a
+        # statement that is not itself index-creating must not qualify it.
+        'CREATE TABLE "main"."t" AS SELECT 1; -- next step: CREATE INDEX ON "main"."t" (a)',
+    ],
+)
+def test_adv302_only_rewrites_a_statement_that_starts_by_creating_an_index(ddl):
+    """`evidence` deliberately carries a valid `columns` tuple, so a broken prefix check
+    cannot be caught by the separate "no columns to express" bail-out instead — the same
+    reasoning as the DROP INDEX test above."""
+    context = DbtContext.from_project(_project())
+    proposal = Proposal(
+        code="ADV999",
+        title="something other than an index",
+        rationale="r.",
+        evidence={"schema": "main", "table": "orders", "columns": ("status",)},
+        confidence=Confidence.MEDIUM,
+        ddl=ddl,
+    )
+    [out] = enrich_proposals([proposal], context)
+    assert out.ddl == ddl, "only index creation becomes an `indexes:` config block"
+    assert "indexes" not in (out.ddl or "")
+    assert out.evidence["dbt_model"] == "model.demo.orders", "still attributed, just not rewritten"
+
+
+@pytest.mark.parametrize("guard", ["guard_column", "guard_predicate"])
+def test_adv302_treats_either_guard_fact_alone_as_a_partial_index(guard):
+    """`_is_partial_index` is a disjunction and every fixture supplied *both* facts, so
+    dropping either alternative survived. A partial index rewritten into a config block that
+    has no predicate field silently drops the WHERE clause and turns a correct proposal into
+    a wrong one, so each alternative has to hold on its own."""
+    context = DbtContext.from_project(_project())
+    proposal = _index_proposal(Relation("main", "orders"), ("region",), code="ADV004")
+    proposal = dataclasses.replace(
+        proposal,
+        evidence={**proposal.evidence, guard: "deleted" if guard == "guard_column" else "IS NULL"},
+        ddl='CREATE INDEX ON "main"."orders" ("region") WHERE "deleted" IS NULL;',
+    )
+    [out] = enrich_proposals([proposal], context)
+    assert out.ddl == proposal.ddl, "a partial index must keep its DDL, not lose its WHERE"
+    assert "no predicate field" in out.rationale
+    assert out.note is not None and "dbt WARNING" in out.note
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        None,  # the key is absent entirely
+        (),  # present but empty
+        ("status", 3),  # present but not all strings
+        "status",  # a bare string is iterable, and `list("status")` would emit characters
+    ],
+)
+def test_adv302_declines_and_discloses_when_there_is_no_plain_column_list(columns):
+    """The whole `columns` validation was unpinned — replacing it with `if False:` survived.
+
+    Unreachable from today's rules, all of which populate `columns`; reachable *by design*,
+    because `_is_index_creating` matches on the DDL prefix precisely so a future
+    index-creating rule is covered without being enumerated. It used to decline in complete
+    silence: DDL left executable, rationale entirely unamended, only `evidence` quietly
+    gaining the dbt keys — the one outcome this module exists to prevent.
+    """
+    context = DbtContext.from_project(_project())
+    proposal = _index_proposal(Relation("main", "orders"))
+    evidence = dict(proposal.evidence)
+    if columns is None:
+        del evidence["columns"]
+    else:
+        evidence["columns"] = columns
+    proposal = dataclasses.replace(proposal, evidence=evidence)
+
+    [out] = enrich_proposals([proposal], context)
+
+    assert out.ddl == proposal.ddl, "no invented column list"
+    assert "indexes" not in out.ddl
+    assert "no plain column list" in out.rationale, "the decline must be disclosed"
+    assert out.note is not None and "dbt WARNING" in out.note
+
+
+def test_adv302_declines_a_non_btree_access_method_rather_than_calling_it_btree():
+    """The block is rebuilt from `evidence["columns"]` and hardcodes `type: btree`, throwing
+    the DDL away. Faithful for every rule today, all of which emit a plain btree over a
+    column list — but a `USING gin` proposal rewritten to `type: btree` hands back a
+    different index than the evidence justified."""
+    context = DbtContext.from_project(_project())
+    proposal = dataclasses.replace(
+        _index_proposal(Relation("main", "orders"), ("payload",)),
+        ddl='CREATE INDEX ON "main"."orders" USING gin ("payload");',
+    )
+    [out] = enrich_proposals([proposal], context)
+    assert out.ddl == proposal.ddl
+    assert "non-btree access method" in out.rationale
+    assert out.note is not None and "dbt WARNING" in out.note
+
+
+def test_adv302_still_rewrites_an_explicit_using_btree():
+    """`USING btree` *is* btree, so it must not trip the non-btree guard. Two spaces
+    deliberately: a lookahead without the trailing `\\S` lets `\\s+` backtrack one space in and
+    refuse a plain btree index."""
+    context = DbtContext.from_project(_project())
+    proposal = dataclasses.replace(
+        _index_proposal(Relation("main", "orders"), ("status",)),
+        ddl='CREATE INDEX ON "main"."orders" USING  btree ("status");',
+    )
+    [out] = enrich_proposals([proposal], context)
+    assert _config_mapping(out.ddl) == {"indexes": [{"columns": ["status"], "type": "btree"}]}
+
+
+def test_enrich_proposals_preserves_input_order():
+    """`return out[::-1]` survived: every test passed a one-element list. The caller re-sorts
+    by the adapter's ranking key afterwards, and this function must not pre-empt that."""
+    context = DbtContext.from_project(_project())
+    proposals = [
+        _index_proposal(Relation("main", "orders"), ("status",), code="ADV001"),
+        _index_proposal(Relation("public", "unmanaged"), ("id",), code="ADV007"),
+        _index_proposal(Relation("main", "stg_orders"), ("id",), code="ADV008"),
+    ]
+    out = enrich_proposals(proposals, context)
+    assert [p.code for p in out] == ["ADV001", "ADV007", "ADV008"]
+
+
+def test_enrich_proposals_does_not_mutate_the_evidence_it_was_given():
+    """`dict(proposal.evidence)` → `proposal.evidence` survived: nothing pinned that the
+    input proposals come back unchanged. `Proposal` is frozen but `evidence` is a plain dict,
+    so the freeze does not cover this."""
+    context = DbtContext.from_project(_project())
+    original = _index_proposal(Relation("main", "orders"))
+    before = dict(original.evidence)
+    out = enrich_proposals([original], context)
+    assert original.evidence == before, "the caller's proposal must be untouched"
+    assert "dbt_model" not in original.evidence
+    assert out[0].evidence["dbt_model"] == "model.demo.orders"
+
+
+def test_adv302_view_branch_keeps_the_proposal_and_only_drops_the_ddl():
+    """Documented for a while as "the proposal is dropped", which it is not: the finding
+    ("this index cannot apply here") is worth reporting, so the proposal survives at LOW with
+    its title and cost share and only its DDL goes."""
+    context = DbtContext.from_project(_project())
+    original = _index_proposal(Relation("main", "stg_orders"))
+    [out] = enrich_proposals([original], context)
+    assert out.ddl is None
+    assert out.title == original.title
+    assert out.evidence["cost_share"] == original.evidence["cost_share"]
+    assert out.confidence is Confidence.LOW
+    assert out.note is None, "no statement is emitted, so there is nothing to warn beside"
+
+
+@pytest.mark.parametrize("absent", [None, ""])
+def test_adv302_states_an_absent_materialization_once_and_without_a_python_literal(absent):
+    """It used to say both "materialized as `None`" — a Python literal in an operator-facing
+    string — and "materialization '(absent)'", two spellings of one fact; `materialized=""`
+    rendered "materialized as ``", an empty code span, beside the same duplicate."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["nodes"]["model.demo.orders"]["config"]["materialized"] = absent
+    context = DbtContext.from_project(DbtProject.from_manifest(raw))
+    original = _index_proposal(Relation("main", "orders"))
+    [out] = enrich_proposals([original], context)
+
+    assert out.ddl == original.ddl, "unknown is not known-safe: the DDL is not rewritten"
+    assert "None" not in out.rationale
+    assert "``" not in out.rationale
+    assert "(absent)" not in out.rationale
+    assert out.rationale.count("materializ") == 2, (
+        f"one statement of the fact plus one reason, not two spellings: {out.rationale}"
+    )
+    assert "no materialization recorded in the manifest" in out.rationale
+    assert out.note is not None and "dbt WARNING" in out.note
+
+
+def test_adv303_discloses_that_dead_chains_unwind_one_model_per_run():
+    """The transitive-deadness caveat landed as a docstring only, reaching no user: a fully
+    dead chain surfaces one model per run and nothing explained why the parent was not
+    flagged the first time."""
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    [first, *_] = propose_unused_models(_aggregation(usage), context, _workload())
+    assert "not transitive" in first.rationale
+    assert "leaf" in first.rationale
+
+
+def test_describe_rewrites_is_silent_when_nothing_was_rewritten():
+    """The terminal line must not appear on a run where ADV302 did not fire — including a
+    run with a manifest that simply matched nothing."""
+    assert describe_rewrites([]) is None
+    assert describe_rewrites([_index_proposal(Relation("public", "unmanaged"))]) is None
+
+
+def test_describe_rewrites_reports_both_rewritten_and_folded_proposals():
+    """ADV302 is never a proposal `code`, and the terminal never prints `rationale`, so an
+    enriched row is byte-identical to the same proposal from a dbt-free run. This line is the
+    only signal a terminal-only user gets that enrichment fired."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    out = enrich_proposals(
+        [
+            _index_proposal(relation, ("status",), code="ADV001"),
+            _index_proposal(relation, ("customer_id",), code="ADV007"),
+        ],
+        context,
+    )
+    line = describe_rewrites(out)
+    assert line is not None
+    assert "ADV302" in line
+    assert "2 index proposal(s)" in line
+    assert "1 folded" in line
+    assert "\n" not in line, "one stderr line"
+
+
+def test_resolve_manifest_path_prefers_an_explicit_manifest_over_a_project_dir():
+    """One function, because this precedence used to exist twice — in `load_dbt_context` and
+    again in the CLI's payload builder — and swapping it in either copy alone left the whole
+    suite green, so the payload could name a manifest that was never read."""
+    project_dir = Path("/tmp/proj")
+    explicit = Path("/tmp/elsewhere/manifest.json")
+    assert resolve_manifest_path(project_dir, explicit) == explicit
+    assert resolve_manifest_path(project_dir, None) == project_dir / "target" / "manifest.json"
+    assert resolve_manifest_path(None, explicit) == explicit
+    assert resolve_manifest_path(None, None) is None
+
+
+def test_load_warns_when_the_manifest_is_not_a_v12_schema(tmp_path):
+    """`check` warns on this and the dbt `advise` path checked nothing, so it silently
+    accepted a v10/v11 manifest whose node shapes it reads as if they were v12."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["metadata"]["dbt_schema_version"] = "https://schemas.getdbt.com/dbt/manifest/v10.json"
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    context, disclosure = load_dbt_context(None, path)
+    assert context is not None, "a wrong schema version degrades to a warning, not a refusal"
+    assert "dbt_schema_version" in disclosure
+    assert "v10" in disclosure
+
+
+def test_load_warns_that_the_indexes_config_is_postgres_specific_on_another_adapter(tmp_path):
+    """ADV302 rewrites index DDL into dbt's `indexes` model config, which only the postgres
+    and redshift adapters implement. Against a Snowflake or BigQuery project the rewrite is
+    advice for a config key that does not exist, presented as a correctness fix — and no
+    document said so."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["metadata"]["adapter_type"] = "snowflake"
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    context, disclosure = load_dbt_context(None, path)
+    assert context is not None
+    assert "snowflake" in disclosure
+    assert "ADV302" in disclosure
+
+
+@pytest.mark.parametrize("adapter_type", ["postgres", "redshift"])
+def test_load_is_quiet_for_an_adapter_that_has_the_indexes_config(adapter_type):
+    """The warning must discriminate: firing for postgres too would make it noise, and a
+    warning nobody can act on is worse than none."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["metadata"]["adapter_type"] = adapter_type
+    project = DbtProject.from_manifest(raw)
+    assert _manifest_warnings(project) == []
+
+
+@pytest.mark.parametrize("metadata", [{}, {"adapter_type": 12, "dbt_schema_version": None}])
+def test_load_survives_metadata_of_the_wrong_shape(tmp_path, metadata):
+    """`metadata` is a section some other tool wrote, and this runs after the whole catalog
+    analysis: a non-string version raising from an `in` test would discard real work over an
+    optional input."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["metadata"] = metadata
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    context, disclosure = load_dbt_context(None, path)
+    assert context is not None
+    assert disclosure is not None
+    assert "3 model(s)" in disclosure
+
+
+def test_the_merged_block_and_its_cross_reference_stay_fully_commented():
+    """Invariant 1, over the two texts this rewrite newly interpolates raw values into.
+
+    The deferred block interpolates the *owner proposal's title* and the model's `unique_id`,
+    both of which can carry a raw newline — a title is built from live catalog identifiers,
+    and dbt's `relation_name`/`unique_id` permit one too. Neither may produce an output line
+    without a leading `--`, or the DDL script shows something that reads like a statement.
+    """
+    hostile = 'evil";\nDROP TABLE users; --'
+    # A newline in the *unique_id* too: a manifest is a file some other tool wrote, this key
+    # is interpolated raw into both texts, and unlike a column list it does not pass through
+    # `repr()` escaping on the way. `_comment_block`'s own re-split is the only thing
+    # standing between it and an uncommented output line.
+    uid = f"model.demo.{hostile}"
+    manifest = {
+        "nodes": {
+            uid: {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."orders"',
+            }
+        }
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    relation = Relation("main", "orders")
+    first = _index_proposal(relation, (hostile,), code="ADV001")
+    second = _index_proposal(relation, ("customer_id",), code="ADV007")
+
+    out = enrich_proposals([first, second], context)
+
+    assert out[0].evidence["dbt_index_config"] is True, "the owner block must be exercised"
+    assert "dbt_index_config_reported_with" in out[1].evidence, "and the deferred one too"
+    for proposal in out:
+        lines = [ln for ln in (proposal.ddl or "").splitlines() if ln.strip()]
+        assert lines, proposal
+        assert all(ln.startswith("--") for ln in lines), lines
