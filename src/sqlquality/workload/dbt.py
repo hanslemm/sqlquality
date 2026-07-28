@@ -206,30 +206,47 @@ def resolve_manifest_path(project_dir: Path | None, manifest: Path | None) -> Pa
     return None
 
 
-#: dbt adapters whose `indexes` model config exists at all. It is implemented by the
-#: relational adapters that have CREATE INDEX — postgres and its redshift derivative — and
-#: has no counterpart on Snowflake, BigQuery or Databricks, where ADV302's rewrite would be
-#: advice for a config key the project cannot use.
-_INDEX_CONFIG_ADAPTERS = frozenset({"postgres", "redshift"})
+#: dbt adapters that could plausibly be building the relations `advise` introspects. `advise`
+#: connects to Postgres only, and redshift is its derivative (same `CREATE INDEX`, same
+#: `indexes` model config), so a manifest naming either is consistent with the connection.
+#: Anything else names a different warehouse entirely — see `_manifest_warnings`.
+_CONSISTENT_ADAPTERS = frozenset({"postgres", "redshift"})
 
 
 def _manifest_warnings(project: DbtProject) -> list[str]:
     """The two manifest checks `check` makes and the dbt `advise` path did not.
 
     `check` warns on a non-v12 `dbt_schema_version` and resolves its dialect from
-    `adapter_type`; `advise` read neither, so it silently accepted a v10/v11 manifest, and
-    silently offered ADV302's `indexes` config rewrite for a Snowflake or BigQuery project —
-    where that config key does not exist at all, which turns unusable advice into something
-    presented as a correctness fix. Two commands reading the same file and disagreeing about
-    whether it is even the right shape is exactly what a user of both would not expect.
+    `adapter_type`; `advise` read neither, so it silently accepted a v10/v11 manifest whose
+    node shapes it reads as if they were v12, and said nothing at all when the manifest
+    described a different warehouse from the one it had just connected to.
 
-    Warn rather than suppress the rewrite. ADV302's alternative to a config block is raw DDL
-    that the same rebuild destroys, so declining would leave the operator *less* informed,
-    not more; and `advise` connects only to Postgres today, so a Snowflake manifest paired
-    with a Postgres connection is a mismatch the user needs told about rather than silently
-    worked around. Both values are `isinstance`-guarded because `metadata` is a section some
-    other tool wrote: a non-string version would otherwise raise from the `in` test, and this
-    function runs where a raise degrades the whole enrichment.
+    **What a foreign `adapter_type` actually means.** Not merely "ADV302 might emit a config
+    key that adapter lacks" — the deeper problem is that dbt is then not building the Postgres
+    relations `advise` just introspected *at all*. A Snowflake manifest paired with a Postgres
+    connection means every `(schema, table)` match is a coincidence of naming: ADV302's
+    premise (a `dbt run` rebuilds this relation, so raw DDL does not survive) is false,
+    ADV301 attributes Postgres cost to a model that builds a Snowflake table, and ADV303 calls
+    a Postgres relation an unused dbt model. So the warning is about the pairing, not about one
+    config key.
+
+    Warn rather than suppress. Two commands reading the same file and disagreeing about
+    whether it is even the right shape is what a user of both would not expect, and the
+    mismatch is something the user has to fix in their invocation — silently dropping all dbt
+    output would hide the very thing they need told. For ADV302 specifically, its alternative
+    to a config block is raw DDL that a rebuild destroys, so declining the rewrite would leave
+    the operator *less* informed, not more.
+
+    **An absent `adapter_type` warns too, deliberately.** `dbt compile` always writes one, so
+    absence means a hand-written or truncated manifest, and the honest statement is that the
+    pairing cannot be checked rather than that it is fine. Warning on "different" while
+    staying silent on "unknown" would make silence mean two different things. `check` makes
+    the same distinction, disclosing "manifest adapter_type absent or unrecognized" rather
+    than assuming.
+
+    Both values are `isinstance`-guarded because `metadata` is a section some other tool
+    wrote: a non-string version would otherwise raise from the `in` test, and this function
+    runs where a raise degrades the whole enrichment.
     """
     warnings: list[str] = []
     schema_version = project.schema_version()
@@ -240,13 +257,17 @@ def _manifest_warnings(project: DbtProject) -> list[str]:
             "dbt enrichment may be unreliable"
         )
     adapter_type = project.adapter_type()
-    if isinstance(adapter_type, str) and adapter_type:
-        if adapter_type not in _INDEX_CONFIG_ADAPTERS:
-            warnings.append(
-                f"warning: manifest adapter_type is {adapter_type}; ADV302 expresses index "
-                "proposals as dbt's `indexes` model config, which only the postgres and "
-                "redshift adapters implement — treat that rewrite as postgres-specific"
-            )
+    if not isinstance(adapter_type, str) or not adapter_type:
+        warnings.append(
+            "warning: manifest records no adapter_type, so it cannot be confirmed that these "
+            "models build the relations being introspected — dbt enrichment assumes they do"
+        )
+    elif adapter_type not in _CONSISTENT_ADAPTERS:
+        warnings.append(
+            f"warning: manifest adapter_type is {adapter_type} but advise connects to "
+            "postgres, so these models do not build the relations being introspected — every "
+            "dbt match is a name coincidence and ADV301/ADV302/ADV303 will be wrong"
+        )
     return warnings
 
 
@@ -320,6 +341,10 @@ _REBUILD = {
 #: as a prefix, so whatever comes after (`CONCURRENTLY`, `ON`, ...) is irrelevant here.
 _INDEX_CREATE_RE = re.compile(r"(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\b")
 _UNIQUE_INDEX_RE = re.compile(r"(?i)^CREATE\s+UNIQUE\s+INDEX\b")
+#: `DROP INDEX`, optionally `CONCURRENTLY` / `IF EXISTS` — matched as a prefix, so whatever
+#: follows is irrelevant. The DDL script's own header recommends `CONCURRENTLY` for a live
+#: table, so a proposal that used it must not stop being recognised as index-dropping.
+_INDEX_DROP_RE = re.compile(r"(?i)^DROP\s+INDEX\b")
 
 #: A `USING <method>` clause naming anything but btree. `\S` after the lookahead is load
 #: bearing: without it, `\s+` backtracks so that `USING  btree` (two spaces) satisfies a
@@ -340,6 +365,17 @@ def _is_index_creating(ddl: str | None) -> bool:
     return ddl is not None and _INDEX_CREATE_RE.match(ddl.lstrip()) is not None
 
 
+def _is_index_dropping(ddl: str) -> bool:
+    """A `DROP INDEX` proposal (ADV002, ADV003), detected by prefix like its create-side twin.
+
+    Kept separate from `_is_index_creating` rather than folded into one "touches an index"
+    check: the two need opposite advice. A create is *replaced* by dbt config; a drop cannot
+    be — dbt's `indexes` config has no way to express a removal — so a drop keeps its DDL and
+    gains a warning that the config entry has to go too.
+    """
+    return _INDEX_DROP_RE.match(ddl.lstrip()) is not None
+
+
 def _is_unique_index(ddl: str) -> bool:
     """Whether `ddl` is a `CREATE UNIQUE INDEX`, which dbt's config expresses as `unique: true`."""
     return _UNIQUE_INDEX_RE.match(ddl.lstrip()) is not None
@@ -355,13 +391,15 @@ def _names_a_non_btree_method(ddl: str) -> bool:
     `type: btree` would hand back a *different index* than the one the evidence justified.
     So a non-btree access method declines the rewrite and discloses instead.
 
-    Textual, unlike `_is_partial_index`, and that asymmetry is deliberate: a column literally
-    named `USING` (quoted, so `\\bUSING` still matches it) makes this over-trigger, which
-    declines a rewrite that would have been fine — the conservative direction. A missed
-    detection would go the other way and quietly change the recommendation, so a false
-    positive here is the cheaper error. Ordering, opclasses and expression indexes are *not*
-    detectable this way and remain a documented limitation of the reconstruction rather than
-    a guard.
+    Textual, unlike `_is_partial_index`, which keys on `guard_column`/`guard_predicate` in
+    evidence. That asymmetry is forced rather than chosen: no rule records an access method in
+    its evidence, so there is nothing structural to key on here today. The cost is a possible
+    over-trigger — **not** on a column merely named `USING`, since quoting puts a `"` where
+    `\\s+` needs whitespace and `"USING"` therefore does not match, but on one whose name
+    *contains* the whole clause, like `"USING gin"`. That declines a rewrite which would have
+    been fine — the conservative direction, since a missed detection instead quietly changes
+    the recommended index. Ordering, opclasses and expression indexes are *not* detectable
+    this way and remain a documented limitation of the reconstruction rather than a guard.
     """
     return _NON_BTREE_RE.search(ddl) is not None
 
@@ -444,11 +482,32 @@ def _dbt_ddl_note(model: ModelNode, reason: str) -> str:
     where markdown emphasis is noise. Pre-wrapped rather than one long line for the same
     reason — `_comment_lines` prefixes each physical line and wraps nothing.
     """
-    built_as = model.materialized if model.materialized else "materialization not recorded"
     return (
         f"dbt WARNING: this relation is built by dbt model {model.unique_id}\n"
-        f"({built_as}), so the statement below is not durable. {reason}\n"
+        f"({_built_as(model)}), so the statement below is not durable. {reason}\n"
         "Reapply it by hand after any rebuild, or it silently disappears."
+    )
+
+
+def _built_as(model: ModelNode) -> str:
+    return model.materialized if model.materialized else "materialization not recorded"
+
+
+def _dbt_drop_note(model: ModelNode) -> str:
+    """A `Proposal.note` for a `DROP INDEX` on a relation dbt manages.
+
+    The mirror image of the bug ADV302 exists to fix. A dropped index that the model's
+    `indexes:` config still declares is put straight back by the next `dbt run`, so the
+    statement below silently reverts and this tool proposes the same drop again next time —
+    unless the config entry goes too. Conditional on the config declaring it, which is why it
+    is worded as a condition rather than a verdict: nothing here can read the model's `.yml`,
+    only the manifest's materialization.
+    """
+    return (
+        f"dbt WARNING: this relation is built by dbt model {model.unique_id}\n"
+        f"({_built_as(model)}). If this index is declared in that model's indexes\n"
+        "config, the next dbt run recreates it: remove the config entry as well,\n"
+        "or the drop below does not stick and will be proposed again next run."
     )
 
 
@@ -579,10 +638,52 @@ def _classify(proposal: Proposal, model: ModelNode) -> tuple[Proposal | None, _I
     evidence = _dbt_evidence(proposal, model)
 
     if not _is_index_creating(proposal.ddl):
-        # DROP INDEX, and any advisory proposal with no DDL at all: attributed, not
-        # rewritten. Dropping an index dbt never created is ordinary, and there is no
-        # `indexes` config entry that expresses a removal.
-        return dataclasses.replace(proposal, evidence=evidence), None
+        # Not rewritten: there is no `indexes` config entry that expresses a *removal*, and
+        # an advisory proposal has no DDL to rewrite. But "dbt never created this index, so a
+        # drop is ordinary" — the original reasoning here — is false in exactly the case this
+        # module exists for. If the index *is* declared in the model's `indexes:` config, the
+        # next `dbt run` recreates it: the operator drops it, dbt puts it back, and the next
+        # run of this tool proposes dropping it again. That is the same silently-reverting
+        # advice ADV302 was built to eliminate, pointing the other way, so it is disclosed —
+        # in the rationale *and*, since `render_ddl` never emits a rationale, in a note beside
+        # the statement itself.
+        #
+        # Not suppressed: dropping a genuinely unused index is still the right call, and the
+        # operator needs both halves of the instruction, not neither.
+        if proposal.ddl is None:
+            # Nothing is emitted into the DDL script, so there is no statement to warn
+            # beside, and `rationale` already reaches every surface that shows this proposal.
+            return dataclasses.replace(proposal, evidence=evidence), None
+        if _is_index_dropping(proposal.ddl):
+            rationale = (
+                f"{proposal.rationale} This relation is a dbt model "
+                f"({_dbt_attribution(model)}): if this index is declared in that model's "
+                "`indexes:` config, `dbt run` recreates it, so the config entry has to be "
+                "removed as well or the drop will not stick — and this proposal will come "
+                "back on the next run."
+            )
+            return (
+                dataclasses.replace(
+                    proposal, rationale=rationale, evidence=evidence, note=_dbt_drop_note(model)
+                ),
+                None,
+            )
+        # Some other statement for a relation dbt owns — no rule emits one today, and
+        # `_is_index_creating` matches by DDL prefix specifically so this stays covered when
+        # one does. Unknown shape, so the note claims only what is certainly true.
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}), "
+            "which dbt rebuilds on its own schedule, so this statement is not expressed as "
+            "dbt config and may not outlive the next rebuild."
+        )
+        note = _dbt_ddl_note(
+            model,
+            "dbt rebuilds this relation on its own schedule, and this statement is not\n"
+            "expressed as dbt config.",
+        )
+        return dataclasses.replace(
+            proposal, rationale=rationale, evidence=evidence, note=note
+        ), None
 
     ddl = proposal.ddl
     assert ddl is not None  # _is_index_creating(None) is False, so this branch guarantees it

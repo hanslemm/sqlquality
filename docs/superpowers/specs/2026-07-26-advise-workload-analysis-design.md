@@ -624,6 +624,28 @@ subsection above originally specified.
    comment lines above the statement; it is deliberately absent from the JSON payload and the
    markdown report, both of which already carry `rationale`, so the pre-dbt payload shape is
    unchanged.
+9. **A `DROP INDEX` for a dbt-managed relation is disclosed, not exempted.** The rewrite
+   branch originally exempted drops outright, reasoning that "dbt never created this index, so
+   dropping it is ordinary." That is false in exactly the case ADV302 exists for: if the index
+   *is* declared in the model's `indexes:` config, the next `dbt run` recreates it — the
+   operator drops it, dbt puts it back, and ADV002/ADV003 propose the same drop again next run.
+   The same silently-reverting advice, pointing the other way, and reachable through the
+   ordinary rules rather than only in principle. The proposal is kept (dropping a genuinely
+   unused index is still right, and dbt's `indexes` config cannot express a removal) and gains
+   the warning in both `rationale` and `note`, so the operator gets both halves of the
+   instruction. The property the DDL script now holds is stated statement-wise, not
+   relation-wise: no executable line for a dbt-managed relation without an adjacent warning.
+   The test that first checked this filtered blocks on the *table* name and so skipped every
+   drop, since a `DROP INDEX` names an index.
+10. **A manifest inconsistent with the connection is warned about, and "absent" warns too.**
+    `advise` connects to Postgres; an `adapter_type` outside `{postgres, redshift}` means dbt
+    is not building the relations just introspected at all, so every `(schema, table)` match is
+    a name coincidence and ADV301/ADV302/ADV303 are all wrong — a stronger statement than
+    "ADV302's `indexes` config key may not exist there," which was the first wording. A
+    manifest recording *no* `adapter_type` warns as well, deliberately: `dbt compile` always
+    writes one, and warning on "different" while staying silent on "unknown" would make silence
+    mean either "consistent" or "unchecked". Warned rather than suppressed, since the fix is in
+    the user's invocation and dropping all dbt output would hide it.
 
 ## Confidence model
 

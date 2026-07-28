@@ -602,11 +602,24 @@ written into the `--ddl` script itself, as comment lines directly above the stat
 only into the `rationale`. The DDL script carries no rationales, and it is the artifact a
 human actually applies.
 
-**The `indexes:` config is a postgres/redshift dbt feature**, and the rewrite is only
-correct where it exists — Snowflake, BigQuery and Databricks have no such config key. If the
-manifest's `adapter_type` is anything else, `advise` says so on stderr and still emits the
-rewrite (its alternative is raw DDL the same rebuild destroys, so declining would inform you
-less), and it warns when the manifest is not a v12 schema, the same check `check` makes.
+**A `DROP INDEX` proposal on a dbt-managed relation is the same hazard pointing the other
+way.** ADV002 and ADV003 read the catalog, not the manifest, so they will propose dropping an
+index that the model's `indexes:` config still declares — and the next `dbt run` puts it
+straight back, after which the tool proposes the same drop again. Those proposals keep their
+DDL (dropping a genuinely unused index is still right, and dbt's `indexes` config cannot
+express a removal) and gain a warning, in the rationale *and* in the `--ddl` file, that the
+config entry has to be removed as well or the drop will not stick.
+
+**`advise` checks the manifest against the connection**, the same two checks `check` makes on
+the same file: it warns when the manifest is not a v12 schema, and when its `adapter_type` is
+neither `postgres` nor `redshift`. The second matters more than the missing `indexes:` config
+key would suggest: a Snowflake or BigQuery manifest paired with a Postgres connection means
+dbt is not building the relations `advise` just introspected *at all*, so every match is a
+name coincidence and all three dbt rules are wrong — ADV302's premise that a `dbt run`
+rebuilds the relation included. A manifest recording **no** `adapter_type` warns too, since
+`dbt compile` always writes one and the honest statement is that the pairing could not be
+checked. `advise` warns rather than suppressing: the mismatch is something to fix in your
+invocation, and dropping all dbt output silently would hide it.
 
 **The block is rebuilt from the proposal's column list, not from its DDL**, and always as
 `type: btree`. That is faithful for every rule shipping today — each emits a plain btree over
@@ -1009,15 +1022,18 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   without a fresh `dbt compile` produces a stale — but traceable, since the disclosed
   materialization names its own source — rewrite. Nothing verifies the manifest against
   the live relation.
-- **ADV302's config shape is postgres-specific.** dbt's `indexes` model config is
-  implemented by the postgres and redshift adapters only. A manifest whose `adapter_type` is
-  something else gets a stderr warning and the rewrite anyway; the rewrite's *shape* is not
-  translated per adapter. `advise` connects only to Postgres today, so this matters mainly
-  for a project whose manifest and target database disagree.
+- **A manifest for another warehouse is warned about, not rejected.** `advise` connects to
+  Postgres; a manifest whose `adapter_type` is something else (or absent) gets a stderr
+  warning and enrichment still runs, so a project whose manifest and target database disagree
+  gets dbt proposals built on `(schema, table)` name coincidences. dbt's `indexes` model
+  config is likewise implemented by the postgres and redshift adapters only, and ADV302's
+  rewrite is not translated per adapter.
 - **ADV302 reconstructs the index from the proposal's column list.** The emitted block is
   always `type: btree` over that column list; column *ordering* is preserved but opclasses,
   `DESC`/`NULLS` and expression indexes are not expressible, and a non-btree access method
-  declines the rewrite rather than being silently flattened.
+  declines the rewrite rather than being silently flattened. That last check is textual (no
+  rule records an access method in evidence), so a column whose *name* contains a `USING`
+  clause declines a rewrite that would have been fine — the safe direction.
 - **ADV303 only looks at a model's immediate consumers.** A dead model feeding another dead
   model is not reported until the downstream one is gone, so a fully dead chain unwinds one
   model per run, from its leaf. Conservative by construction: it never flags a model that
