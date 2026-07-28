@@ -9,6 +9,7 @@ additive by construction rather than by discipline.
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -195,22 +196,64 @@ def load_dbt_context(
 #: what that rebuild does to it. `view` and anything unrecognised are handled separately —
 #: a view has no relation to index at all, and an unrecognised materialization is unknown
 #: rather than known-safe, so neither belongs in a table keyed by "known to be rebuilt."
+#: `ephemeral` never reaches this table either, but for a different reason: an ephemeral
+#: model is inlined as a CTE and so has no `relation_name`, which means it never gets far
+#: enough through `DbtContext.from_project`/`model_for` to reach a proposal at all.
 _REBUILD = {
     "table": "every `dbt run` drops and recreates this relation, so a raw CREATE INDEX is lost",
     "incremental": (
         "a normal `dbt run` keeps this relation, but `dbt run --full-refresh` rebuilds it and a "
         "raw CREATE INDEX is lost"
     ),
+    #: A dbt `materialized_view` model (dbt-core 1.6+) also accepts an `indexes` config, and
+    #: like `incremental` it is not rebuilt on *every* run: a normal `dbt run` refreshes it
+    #: in place. It is rebuilt when `dbt run --full-refresh` runs, or when a configuration
+    #: change forces dbt to drop and recreate it rather than refresh in place — either way a
+    #: raw CREATE INDEX outside dbt's config does not survive that path.
+    "materialized_view": (
+        "a normal `dbt run` refreshes this materialized view in place, but `dbt run "
+        "--full-refresh` (or a config change dbt can't apply in place) drops and recreates "
+        "it, and a raw CREATE INDEX is lost"
+    ),
 }
+
+#: `CREATE INDEX` or `CREATE UNIQUE INDEX`, optionally followed by `CONCURRENTLY` — matched
+#: as a prefix, so whatever comes after (`CONCURRENTLY`, `ON`, ...) is irrelevant here.
+_INDEX_CREATE_RE = re.compile(r"(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\b")
+_UNIQUE_INDEX_RE = re.compile(r"(?i)^CREATE\s+UNIQUE\s+INDEX\b")
 
 
 def _is_index_creating(ddl: str | None) -> bool:
     """An index-creating proposal, detected by its DDL prefix rather than its rule code.
 
     ADV001, ADV007 and ADV008 all emit `CREATE INDEX` today and Batch 3b adds more; a
-    hardcoded set of codes would silently stop matching the day a new rule ships.
+    hardcoded set of codes would silently stop matching the day a new rule ships. Also
+    matches `CREATE UNIQUE INDEX` (dbt's `indexes` config has a `unique` field for exactly
+    this) and tolerates an operator-facing `CONCURRENTLY` in between — the DDL script's own
+    header recommends `CONCURRENTLY` for a live table, so a proposal that used it must not
+    silently stop being recognised as index-creating.
     """
-    return ddl is not None and ddl.lstrip().upper().startswith("CREATE INDEX")
+    return ddl is not None and _INDEX_CREATE_RE.match(ddl.lstrip()) is not None
+
+
+def _is_unique_index(ddl: str) -> bool:
+    """Whether `ddl` is a `CREATE UNIQUE INDEX`, which dbt's config expresses as `unique: true`."""
+    return _UNIQUE_INDEX_RE.match(ddl.lstrip()) is not None
+
+
+def _is_partial_index(proposal: Proposal) -> bool:
+    """A WHERE-restricted proposal (ADV004's partial index), detected structurally.
+
+    A substring search for `"WHERE"` in the DDL is foolable two ways: a column genuinely
+    named `WHERE` (quoted, so syntactically a plain identifier) makes an ordinary index
+    proposal look partial, and a lowercase `where` — plausible from a future engine's rule,
+    even though every rule here emits uppercase today — would not match at all, silently
+    dropping a real predicate into a config block that has nowhere to put it. ADV004
+    already carries `guard_column`/`guard_predicate` in its own evidence for exactly this
+    proposal shape, so keying on their presence is structural rather than textual: it
+    cannot be spoofed by an identifier and cannot miss on casing.
+    """
+    return "guard_column" in proposal.evidence or "guard_predicate" in proposal.evidence
 
 
 def _relation_of(proposal: Proposal) -> Relation | None:
@@ -228,13 +271,18 @@ def _comment_block(lines: list[str]) -> str:
 
     `parse_relation_name` accepts a newline inside a quoted identifier — dbt's own
     `relation_name` field can carry one — and the column/table names this module
-    interpolates ultimately come from a live catalog, which permits the same thing. This
-    function's caller already `repr()`s any identifier it embeds, which itself escapes an
-    embedded `\\n` into the two literal characters `\\` `n` rather than a real line break;
-    this splits each logical line again regardless, so nothing reaching here can produce
-    an output line lacking a leading `--` even if a future caller forgets to `repr()`
-    first. `render_ddl` defends the same hazard the same way for raw DDL; this is that
-    defense's equivalent for a generated config block.
+    interpolates ultimately come from a live catalog, which permits the same thing.
+    Wrapping an interpolated column list in `list(...)` already neutralizes that: a
+    built-in `list` has no `__str__` of its own, so formatting it falls back to `__repr__`,
+    which escapes an embedded `\\n` in each contained string into the two literal
+    characters `\\` and `n` before this function ever sees it — `repr()`'s own escaping is
+    what does that work, not the value's *outer* formatting conversion, so an explicit
+    `!r` on top of an already-listed value adds nothing. Splitting each logical line again
+    here is a second, independent defense: it protects a future caller that interpolates a
+    raw value without going through a list's own escaping, so nothing reaching here can
+    produce an output line lacking a leading `--` even then. `render_ddl` defends the same
+    hazard the same way for raw DDL; this is that defense's equivalent for a generated
+    config block.
     """
     out: list[str] = []
     for line in lines:
@@ -250,10 +298,11 @@ def _dbt_attribution(model: ModelNode) -> str:
 def enrich_proposals(proposals: list[Proposal], context: DbtContext) -> list[Proposal]:
     """Rewrite index-creating proposals whose relation dbt manages; attribute the rest.
 
-    A `CREATE INDEX` proposal on a `table`- or `incremental`-materialized dbt model is
-    expressed instead as a config block a human can paste into that model's `.yml`, since
-    the raw DDL is destroyed the next time dbt rebuilds the relation. A `view` cannot carry
-    an index at all, so the proposal is dropped and explained rather than rewritten. An
+    A `CREATE INDEX` (or `CREATE UNIQUE INDEX`, optionally `CONCURRENTLY`) proposal on a
+    `table`-, `incremental`- or `materialized_view`-materialized dbt model is expressed
+    instead as a config block a human can paste into that model's `.yml`, since the raw
+    DDL is destroyed the next time dbt rebuilds the relation. A `view` cannot carry an
+    index at all, so the proposal is dropped and explained rather than rewritten. An
     unrecognised (or absent) materialization is left alone — unknown is not the same as
     known-safe, so the DDL is not touched on a guess.
 
@@ -314,12 +363,13 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
         )
         return dataclasses.replace(proposal, rationale=rationale, evidence=evidence)
 
-    # `table` or `incremental`: the relation genuinely gets rebuilt, so a raw CREATE INDEX
-    # is lost sooner or later. A partial index (ADV004's WHERE-restricted proposal) has no
-    # dbt `indexes`-config equivalent — that config has no predicate field — so it must be
-    # disclosed as not expressible rather than silently rewritten into a config block that
-    # quietly drops the WHERE clause and turns a correct proposal into a wrong one.
-    if "WHERE" in ddl:
+    # `table`, `incremental` or `materialized_view`: the relation genuinely gets rebuilt,
+    # so a raw CREATE INDEX is lost sooner or later. A partial index (ADV004's
+    # WHERE-restricted proposal) has no dbt `indexes`-config equivalent — that config has
+    # no predicate field — so it must be disclosed as not expressible rather than silently
+    # rewritten into a config block that quietly drops the WHERE clause and turns a
+    # correct proposal into a wrong one.
+    if _is_partial_index(proposal):
         rationale = (
             f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
             f"{_REBUILD[materialized]}. dbt's `indexes` config has no predicate field, so this "
@@ -338,14 +388,18 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
         # invent one.
         return dataclasses.replace(proposal, evidence=evidence)
 
-    config_ddl = _comment_block(
-        [
-            "ADV302: express this as dbt config, not DDL. Add to the model's config block:",
-            "  indexes:",
-            f"    - columns: {list(columns)!r}",
-            "      type: btree",
-        ]
-    )
+    # `!r` is deliberately absent: `list(columns)` has no `__str__` of its own, so plain
+    # `{list(columns)}` formatting already falls back to `__repr__` and gets the same
+    # per-element escaping `!r` would have asked for explicitly — see `_comment_block`.
+    config_lines = [
+        "ADV302: express this as dbt config, not DDL. Add to the model's config block:",
+        "  indexes:",
+        f"    - columns: {list(columns)}",
+        "      type: btree",
+    ]
+    if _is_unique_index(ddl):
+        config_lines.append("      unique: true")
+    config_ddl = _comment_block(config_lines)
     evidence["dbt_index_config"] = config_ddl
     rationale = (
         f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
