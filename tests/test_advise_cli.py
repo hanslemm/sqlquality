@@ -989,7 +989,25 @@ TWO_INDEXES_ON_ORDERS_ROWS = {
         ("public", "orders", "status", 5000.0),
         ("public", "orders", "customer_id", 5000.0),
     ],
-    "pg_index": [],
+    #: An index on the dbt-managed relation that the workload never scans, so ADV002 fires
+    #: through the real rules and the run contains a genuine `DROP INDEX` for a dbt model.
+    "pg_index": [
+        (
+            "public",
+            "orders",
+            "idx_orders_cold",
+            "id",
+            1,
+            False,  # unique
+            False,  # primary
+            0,  # scans
+            8192,
+            False,  # partial
+            None,  # predicate
+            False,  # expressions
+            "CREATE INDEX idx_orders_cold ON public.orders USING btree (id)",
+        )
+    ],
 }
 
 
@@ -1055,10 +1073,13 @@ def test_adv302_rewrites_an_index_proposal_into_dbt_config_through_the_cli(monke
     proposals = json.loads(result.stdout)["proposals"]
     orders = [p for p in proposals if p["evidence"].get("table") == "orders"]
     assert orders, f"the scenario must produce a proposal for public.orders: {proposals}"
+    rewritten = [p for p in orders if p["evidence"].get("dbt_index_config") is True]
+    assert rewritten, f"no index proposal was expressed as dbt config: {orders}"
     for proposal in orders:
         assert not (proposal["ddl"] or "").upper().lstrip().startswith("CREATE INDEX"), proposal
-        assert "ADV302" in proposal["ddl"], proposal
         assert proposal["evidence"]["dbt_model"] == "model.demo.orders"
+    for proposal in rewritten:
+        assert "ADV302" in proposal["ddl"], proposal
     # The control: `payments` is not dbt-managed, so its proposal must be untouched.
     [payments] = [p for p in proposals if p["evidence"].get("table") == "payments"]
     assert payments["ddl"] == 'CREATE INDEX ON "public"."payments" ("customer_id");'
@@ -1120,6 +1141,26 @@ def test_two_index_proposals_for_one_dbt_model_yield_one_config_block_through_th
     ], f"both recommended indexes must survive in the one block:\n{body}"
 
 
+def _warned_statements(script: str) -> dict[str, bool]:
+    """`{statement: whether its block carries a dbt warning}` for every statement in a script.
+
+    Keyed by the statement itself rather than by the relation named in it, because the two are
+    not the same thing: `DROP INDEX "public"."idx_orders_cold";` names an index, so filtering
+    blocks on the *table* name skipped every drop — which is how a bare `DROP INDEX` for a
+    dbt-managed relation sat in the same file that declared that relation dbt-managed.
+    """
+    result: dict[str, bool] = {}
+    for block in script.split("\n\n"):
+        lines = block.splitlines()
+        statements = [ln for ln in lines if ln.strip() and not ln.startswith("--")]
+        if not statements:
+            continue
+        warned = any("dbt WARNING" in ln for ln in lines)
+        for statement in statements:
+            result[statement] = warned
+    return result
+
+
 def test_the_ddl_file_warns_beside_every_statement_it_keeps_for_a_dbt_relation(
     monkeypatch, tmp_path
 ):
@@ -1143,26 +1184,38 @@ def test_the_ddl_file_warns_beside_every_statement_it_keeps_for_a_dbt_relation(
             "postgresql://u@h/db",
             "--manifest",
             str(_orders_manifest(tmp_path, materialized="exotic")),
+            "--json",
             "--ddl",
             str(ddl_path),
         ],
     )
     assert result.exit_code == 0, result.output
     script = ddl_path.read_text(encoding="utf-8")
+    payload = json.loads(result.stdout)
 
-    blocks = [b for b in script.split("\n\n") if b.strip()]
-    executable_blocks = [
-        b for b in blocks if any(ln.strip() and not ln.startswith("--") for ln in b.splitlines())
-    ]
-    dbt_blocks = [b for b in executable_blocks if '"public"."orders"' in b]
-    assert dbt_blocks, f"the scenario must keep executable DDL for public.orders:\n{script}"
-    for block in dbt_blocks:
-        assert "dbt WARNING" in block, f"executable DDL for a dbt relation, no warning:\n{block}"
-        assert "model.demo.orders" in block
-    # Discriminating: `payments` is not dbt-managed, so its statement must NOT be annotated —
-    # a renderer that warned on everything would satisfy the loop above and mean nothing.
-    [payments] = [b for b in executable_blocks if '"public"."payments"' in b]
-    assert "dbt WARNING" not in payments
+    # Matched by statement text against the payload, deliberately **not** by looking for the
+    # relation's name in the DDL: `DROP INDEX "public"."idx_orders_cold";` names the *index*,
+    # so a `'"public"."orders"' in block` filter silently skipped every drop — the exact shape
+    # of statement that turned out to be missing its warning.
+    warned = _warned_statements(script)
+    dbt_statements = {
+        p["ddl"] for p in payload["proposals"] if "dbt_model" in p["evidence"] and p["ddl"]
+    }
+    plain_statements = {
+        p["ddl"] for p in payload["proposals"] if "dbt_model" not in p["evidence"] and p["ddl"]
+    }
+    assert dbt_statements, f"the scenario must keep executable DDL for a dbt model:\n{script}"
+    assert plain_statements, "and at least one statement for a relation dbt does not manage"
+    assert any(s.upper().startswith("CREATE INDEX") for s in dbt_statements), dbt_statements
+    assert any(s.upper().startswith("DROP INDEX") for s in dbt_statements), (
+        f"ADV002 must fire for the dbt-managed relation: {dbt_statements}"
+    )
+    for statement in dbt_statements:
+        assert warned.get(statement) is True, f"no dbt warning beside: {statement}\n{script}"
+    # Discriminating in the other direction: a renderer that warned on everything would
+    # satisfy the loop above and mean nothing.
+    for statement in plain_statements:
+        assert warned.get(statement) is False, f"spurious dbt warning beside: {statement}"
 
 
 def test_the_ddl_file_carries_a_warning_on_every_adv302_decline_shape(monkeypatch, tmp_path):
@@ -1226,14 +1279,10 @@ def test_the_ddl_file_carries_a_warning_on_every_adv302_decline_shape(monkeypatc
     assert result.exit_code == 0, result.output
     script = ddl_path.read_text(encoding="utf-8")
 
-    kept = [
-        block
-        for block in script.split("\n\n")
-        if any(ln.strip() and not ln.startswith("--") for ln in block.splitlines())
-    ]
-    assert len(kept) == 3, f"three declines keep their DDL; ADV001 becomes config:\n{script}"
-    for block in kept:
-        assert "dbt WARNING" in block, block
+    warned = _warned_statements(script)
+    assert len(warned) == 3, f"three declines keep their DDL; ADV001 becomes config:\n{script}"
+    for statement, has_warning in warned.items():
+        assert has_warning, f"no dbt warning beside: {statement}\n{script}"
     assert "ADV004" in script and "ADV009" in script and "ADV008" in script
     # And the one that *was* rewritten carries no bare statement at all.
     assert "-- ADV001 [high" in script

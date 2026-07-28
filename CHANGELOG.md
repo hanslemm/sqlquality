@@ -53,9 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one config are a duplicate YAML key whose loser is silently discarded. Wherever ADV302
   declines and leaves executable DDL in place (a partial index, an unrecognised
   materialization, no plain column list, a non-btree access method), the warning is written
-  into the `--ddl` script above the statement, not only into the rationale. A non-postgres
-  `adapter_type` or a non-v12 manifest schema is disclosed on stderr, since dbt's `indexes`
-  config is a postgres/redshift feature. **ADV301** proposes
+  into the `--ddl` script above the statement, not only into the rationale. A `DROP INDEX`
+  proposal (ADV002, ADV003) on a dbt-managed relation is the same hazard pointing the other
+  way — if the index is declared in the model's `indexes:` config, `dbt run` recreates it and
+  the drop silently reverts — so those keep their DDL and gain a warning, in the rationale and
+  in the DDL script, that the config entry has to be removed too. A manifest whose
+  `adapter_type` is neither postgres nor redshift (or is absent), or whose schema is not v12,
+  is disclosed on stderr: a foreign adapter means dbt is not building the relations `advise`
+  introspected at all, so every match is a name coincidence. **ADV301** proposes
   materializing a `view`-backed model that carries a hot share of workload cost, capped at
   MEDIUM. **ADV303** flags a dbt model within reach of the manifest that the analyzed
   workload never touched and that no other model, snapshot or dbt exposure declares as a

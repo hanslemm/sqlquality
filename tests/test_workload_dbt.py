@@ -346,6 +346,7 @@ def test_adv302_does_not_rewrite_a_drop_index_proposal():
     )
     [out] = enrich_proposals([drop], context)
     assert out.ddl == drop.ddl
+    assert "indexes:" not in out.ddl
 
 
 def test_adv302_does_not_rewrite_an_advisory_proposal_with_no_ddl():
@@ -1394,3 +1395,119 @@ def test_the_merged_block_and_its_cross_reference_stay_fully_commented():
         lines = [ln for ln in (proposal.ddl or "").splitlines() if ln.strip()]
         assert lines, proposal
         assert all(ln.startswith("--") for ln in lines), lines
+
+
+def test_a_drop_index_on_a_dbt_relation_warns_that_the_config_entry_must_go_too():
+    """The mirror image of the bug ADV302 exists to fix, and it is reachable through the
+    ordinary rules — ADV002 and ADV003 read the catalog, not the manifest.
+
+    "Dropping an index dbt never created is ordinary" — the original justification for
+    exempting drops entirely — is false in exactly the case this module cares about. If the
+    index is declared in the model's `indexes:` config, the next `dbt run` recreates it: the
+    operator drops it, dbt puts it back, and this tool proposes the same drop again next run.
+    That is the same silently-reverting advice ADV302 was built to eliminate. The proposal is
+    *not* suppressed — dropping a genuinely unused index is still right — so the operator has
+    to be given both halves of the instruction, in the rationale and beside the statement.
+    """
+    context = DbtContext.from_project(_project())
+    drop = Proposal(
+        code="ADV002",
+        title="Drop unused index idx_cold on main.orders",
+        rationale="no scans.",
+        evidence={"schema": "main", "table": "orders", "index": "idx_cold"},
+        confidence=Confidence.MEDIUM,
+        ddl='DROP INDEX "main"."idx_cold";',
+    )
+    [out] = enrich_proposals([drop], context)
+
+    assert out.ddl == drop.ddl, "a genuinely unused index is still worth dropping"
+    assert out.confidence is drop.confidence
+    # The DDL script never carries a rationale, so the warning has to be a note as well.
+    assert out.note is not None
+    assert "dbt WARNING" in out.note
+    assert "model.demo.orders" in out.note
+    assert "indexes" in out.note and "recreates it" in out.note
+    assert "remove the config entry" in out.note
+    assert "`indexes:` config" in out.rationale
+    assert "will not stick" in out.rationale
+
+
+def test_a_drop_index_on_a_relation_dbt_does_not_manage_gets_no_note():
+    """Discriminating: a note on every drop would satisfy the test above and mean nothing."""
+    context = DbtContext.from_project(_project())
+    drop = Proposal(
+        code="ADV002",
+        title="Drop unused index idx_cold on public.orders",
+        rationale="no scans.",
+        evidence={"schema": "public", "table": "orders", "index": "idx_cold"},
+        confidence=Confidence.MEDIUM,
+        ddl='DROP INDEX "public"."idx_cold";',
+    )
+    assert enrich_proposals([drop], context) == [drop]
+
+
+def test_an_advisory_proposal_for_a_dbt_relation_gets_no_note():
+    """`note` renders only beside a statement in the DDL script. A proposal with no DDL
+    contributes no line to that file, so a note would appear nowhere at all — its `rationale`
+    already reaches every surface that shows it."""
+    context = DbtContext.from_project(_project())
+    advisory = Proposal(
+        code="ADV005",
+        title="Non-sargable predicate on main.orders.status",
+        rationale="wrapped in a function.",
+        evidence={"schema": "main", "table": "orders", "column": "status"},
+        confidence=Confidence.HIGH,
+        ddl=None,
+    )
+    [out] = enrich_proposals([advisory], context)
+    assert out.note is None
+    assert out.evidence["dbt_model"] == "model.demo.orders"
+
+
+def test_any_other_kept_statement_for_a_dbt_relation_also_warns():
+    """No rule emits one today, and `_is_index_creating` matches by DDL prefix specifically so
+    a future one stays covered. The constraint is about the *file*: no executable statement for
+    a dbt-managed relation without an adjacent warning, whatever the statement is."""
+    context = DbtContext.from_project(_project())
+    proposal = Proposal(
+        code="ADV999",
+        title="Cluster main.orders",
+        rationale="r.",
+        evidence={"schema": "main", "table": "orders", "columns": ("status",)},
+        confidence=Confidence.MEDIUM,
+        ddl='CLUSTER "main"."orders" USING "idx_status";',
+    )
+    [out] = enrich_proposals([proposal], context)
+    assert out.ddl == proposal.ddl
+    assert out.note is not None and "dbt WARNING" in out.note
+    assert "which dbt rebuilds on its own schedule" in out.rationale
+
+
+def test_load_warns_when_the_manifest_targets_a_different_warehouse(tmp_path):
+    """A foreign `adapter_type` is not merely "ADV302 might emit a config key that adapter
+    lacks" — it means dbt is not building the Postgres relations `advise` just introspected at
+    all, so every `(schema, table)` match is a name coincidence and all three dbt rules are
+    wrong, ADV302's rebuild premise included."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["metadata"]["adapter_type"] = "snowflake"
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    _context, disclosure = load_dbt_context(None, path)
+    assert "snowflake" in disclosure
+    assert "do not build the relations being introspected" in disclosure
+
+
+def test_load_warns_when_the_manifest_records_no_adapter_type(tmp_path):
+    """Deliberate: `dbt compile` always writes an `adapter_type`, so absence means a
+    hand-written or truncated manifest. Warning on "different" while staying silent on
+    "unknown" would make silence mean two things — enrichment consistent with the connection,
+    or unchecked. `check` draws the same distinction rather than assuming."""
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    del raw["metadata"]["adapter_type"]
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    context, disclosure = load_dbt_context(None, path)
+    assert context is not None, "an unverifiable pairing still enriches, with a warning"
+    assert "records no adapter_type" in disclosure
+    # And it must not claim a *schema version* problem the manifest does not have.
+    assert "dbt_schema_version" not in disclosure
