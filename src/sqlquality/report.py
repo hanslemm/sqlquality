@@ -147,18 +147,21 @@ def advise_payload(
 ) -> dict:
     """JSON-serializable summary of an advise run.
 
-    `dbt` is `None` when no manifest loaded — the dbt-free path is first-class, and every
-    existing caller of this function omits the argument, so the default must reproduce
-    exactly what they got before this key existed. When a manifest did load, the caller
-    (`cli.advise`) is responsible for handing in a plain, JSON-serializable dict (a
-    `Relation` or a dataclass is not), since this function does not itself normalize it the
-    way `_jsonable` normalizes proposal evidence.
+    The `"dbt"` key is *omitted entirely* when `dbt` is `None` (the default, and what every
+    existing caller before this key existed still gets) rather than present with a `None`
+    value: the dbt-free path is first-class, and this is what lets a no-manifest `advise`
+    invocation stay byte-identical to the payload from before dbt enrichment existed, not
+    merely equal apart from one known extra key. A consumer wanting the manifest count
+    unconditionally can still do `payload.get("dbt")`, which behaves the same either way.
+    When a manifest did load, the caller (`cli.advise`) is responsible for handing in a
+    plain, JSON-serializable dict (a `Path` or a `Relation` is not — `cli.advise` already
+    stringifies the manifest path before building this dict), since this function does not
+    itself normalize it the way `_jsonable` normalizes proposal evidence.
     """
-    return {
+    payload = {
         "engine": engine,
         "redacted": redacted,
         "window": workload.window_description,
-        "dbt": dbt,
         "analyzed": {
             # The count of groups whose usage was actually extracted — not `len(stats)`,
             # which includes the unresolvable and ambiguous groups reported under "skipped"
@@ -190,6 +193,9 @@ def advise_payload(
             for p in proposals
         ],
     }
+    if dbt is not None:
+        payload["dbt"] = dbt
+    return payload
 
 
 def _jsonable(value: object) -> object:

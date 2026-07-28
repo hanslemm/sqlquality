@@ -581,7 +581,9 @@ def test_no_manifest_means_no_behaviour_change(monkeypatch):
 
     This is a unit-level pin of the same constraint the task proves by diffing a whole run's
     artifacts against `main`: with neither `--project-dir` nor `--manifest`, no proposal may
-    carry dbt evidence and the payload's `dbt` key must be `None`.
+    carry dbt evidence and the payload must carry no `"dbt"` key at all — not even one set
+    to `None` — so the payload stays byte-identical to what `main` produced before this key
+    existed, rather than merely equal apart from one known extra key.
     """
     _stub_adapter(
         monkeypatch,
@@ -603,7 +605,7 @@ def test_no_manifest_means_no_behaviour_change(monkeypatch):
     assert payload["proposals"], "the scenario must produce at least one proposal to test"
     for proposal in payload["proposals"]:
         assert "dbt_model" not in proposal["evidence"]
-    assert payload["dbt"] is None
+    assert "dbt" not in payload
 
 
 def test_an_unreadable_manifest_via_the_flag_does_not_fail_the_run(monkeypatch, tmp_path):
@@ -621,10 +623,14 @@ def test_an_unreadable_manifest_via_the_flag_does_not_fail_the_run(monkeypatch, 
     assert result.exit_code == 0
     assert "dbt enrichment unavailable" in result.stderr
     payload = json.loads(result.stdout)
-    assert payload["dbt"] is None
+    assert "dbt" not in payload
 
 
 def test_the_payload_records_which_manifest_was_used(monkeypatch):
+    """The mirror image of `test_no_manifest_means_no_behaviour_change`: with a manifest,
+    the `"dbt"` key must be present (not merely non-`None` — `"dbt" in payload` is the
+    actual claim, since the no-manifest test now pins its *absence*) and carry the
+    manifest path, model count and collision count."""
     _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
     result = runner.invoke(
         app,
@@ -632,11 +638,33 @@ def test_the_payload_records_which_manifest_was_used(monkeypatch):
     )
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["dbt"] is not None
+    assert "dbt" in payload
     assert payload["dbt"]["manifest"] == str(DBT_FIXTURE)
     # The fixture carries exactly 3 models: stg_orders, orders, customer_orders.
     assert payload["dbt"]["models"] == 3
     assert payload["dbt"]["dropped_collisions"] == 0
+
+
+def test_the_json_payload_is_serializable_with_a_manifest_loaded(monkeypatch):
+    """`--manifest` is parsed by typer as a `Path`, and `json.dumps` cannot encode one.
+
+    If `cli.advise` ever handed a raw `Path` into `dbt_payload["manifest"]` instead of
+    `str(resolved_manifest)`, `json.dumps(payload, ...)` would raise `TypeError` — *after*
+    the whole catalog analysis had already run, the same late-failure shape the write-
+    failure handlers elsewhere in this module exist to avoid. Asserting `isinstance(...,
+    str)` pins the actual hazard directly, rather than only failing coincidentally were a
+    future encoder ever more lenient than the stdlib's about non-`str` dict values.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    assert "Traceback" not in result.output
+    payload = json.loads(result.stdout)
+    assert isinstance(payload["dbt"]["manifest"], str)
+    json.dumps(payload)  # must not raise
 
 
 def test_the_payload_reports_a_nonzero_dropped_collision_count(monkeypatch, tmp_path):
