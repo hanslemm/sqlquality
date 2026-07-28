@@ -47,13 +47,14 @@ from sqlquality.workload.aggregate import aggregate, star_tables
 from sqlquality.workload.base import MAX_TIMEOUT_S, MIN_TIMEOUT_S
 from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
 from sqlquality.workload.dbt import (
+    describe_rewrites,
     enrich_proposals,
     load_dbt_context,
     propose_materialization,
     propose_unused_models,
+    resolve_manifest_path,
 )
 from sqlquality.workload.fingerprint import ingest
-from sqlquality.workload.postgres import PostgresWorkloadAdapter
 
 console = Console()
 
@@ -706,21 +707,6 @@ def _validate_schemas(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _resolved_manifest_path(project_dir: Path | None, manifest: Path | None) -> Path | None:
-    """The manifest path `load_dbt_context(project_dir, manifest)` would resolve, or None.
-
-    Mirrors that function's own precedence (an explicit `--manifest` wins; otherwise
-    `--project-dir/target/manifest.json`; otherwise neither was given) exactly, since this
-    is what lets the CLI report *which* path was loaded without re-parsing the disclosure
-    string `load_dbt_context` already produced for a human to read.
-    """
-    if manifest is not None:
-        return manifest
-    if project_dir is not None:
-        return project_dir / "target" / "manifest.json"
-    return None
-
-
 def _parse_since(value: str | None) -> timedelta | None:
     """Parse a '7d' / '24h' / '2w' duration, or exit 2."""
     if value is None:
@@ -777,7 +763,9 @@ def advise(
             "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 "
             "-- the last only with --project-dir/--manifest); the index-hygiene rules "
             "ADV002 and ADV003, and ADV303 (its evidence is absence, not cost, so there is "
-            "no share to threshold), carry no cost evidence and are always reported."
+            "no share to threshold), carry no cost evidence and are reported whatever the "
+            "threshold. ADV303 has its own non-threshold suppression: it emits nothing when "
+            "no query usage could be extracted at all."
         ),
     ),
     keep_literals: bool = typer.Option(
@@ -894,12 +882,24 @@ def advise(
             aggregation, dbt_context, min_cost_share=min_cost_share
         )
         proposals = proposals + propose_unused_models(aggregation, dbt_context, workload)
-        proposals = sorted(proposals, key=PostgresWorkloadAdapter._ranking_key)
+        # `adapter.ranking_key`, not one specific adapter's: ordering is each adapter's own
+        # responsibility, and reaching into `PostgresWorkloadAdapter` here meant a future
+        # engine would silently get Postgres's ordering on the dbt path while keeping its
+        # own everywhere else.
+        proposals = sorted(proposals, key=adapter.ranking_key)
 
-        # Mirrors `load_dbt_context`'s own resolution order so the path disclosed here is
-        # exactly the one it loaded — recomputed rather than parsed back out of
-        # `dbt_disclosure`'s text, which is a message for a human, not a machine field.
-        resolved_manifest = _resolved_manifest_path(project_dir, manifest)
+        # ADV302 is a rewrite, not a proposal code: an enriched row in the table above is
+        # byte-identical to the same proposal from a dbt-free run, and the terminal never
+        # prints `rationale`. Without this line a terminal-only user cannot tell that
+        # enrichment fired at all.
+        rewrite_note = describe_rewrites(proposals)
+        if rewrite_note is not None:
+            typer.echo(rewrite_note, err=True)
+
+        # The same resolution `load_dbt_context` itself used, so the path disclosed here is
+        # exactly the one it loaded — one shared function rather than a second copy of the
+        # precedence, which could be (and was) changed in one place only.
+        resolved_manifest = resolve_manifest_path(project_dir, manifest)
         assert resolved_manifest is not None  # dbt_context is only ever set when one was given
         dbt_payload = {
             "manifest": str(resolved_manifest),

@@ -1607,9 +1607,6 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             )
         return {relation: tuple(indexes) for relation, indexes in result.items()}
 
-    #: Highest confidence first, then largest cost share — the reading order a human wants.
-    _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
-
     #: Which rule's rationale to keep when two rules propose byte-identical DDL at equal
     #: confidence. Lower wins. The order is by how directly the evidence supports *this*
     #: index: a filter predicate (ADV001) is the most direct reason to build a B-tree, a
@@ -1989,24 +1986,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         proposals = self._dedupe_by_ddl(proposals)
         proposals = self._collapse_index_prefixes(proposals)
         proposals = self._disclose_column_set_overlaps(proposals)
-        return sorted(proposals, key=self._ranking_key)
-
-    @classmethod
-    def _ranking_key(cls, proposal: Proposal) -> tuple[int, float, str, str]:
-        """Highest confidence first, then largest cost share — the reading order a human
-        wants — with a canonical tiebreak so equal-confidence equal-cost proposals do not
-        reorder between runs and make the CLI's tests flaky.
-
-        `cost_share_of` rather than `float(evidence.get(...))`: bool is an int subclass, so
-        a stray True became -1.0 and sorted a fabricated share ahead of a genuinely hot
-        proposal, at the top of the list the CLI presents as "read this first".
-        """
-        return (
-            cls._CONFIDENCE_ORDER[proposal.confidence],
-            -(cost_share_of(proposal.evidence) or 0.0),
-            proposal.code,
-            proposal.title,
-        )
+        return sorted(proposals, key=self.ranking_key)
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
         """A commented, reviewable script. sqlquality never executes this."""
@@ -2044,6 +2024,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 body.append("-- NOT RENDERED: an identifier in this proposal contains a line")
                 body.append("-- break, so it cannot be emitted as a single-line statement.")
                 body.append("-- Verify the name and apply this by hand:")
+                if proposal.note:
+                    body.extend(_comment_lines(proposal.note))
                 body.extend(_comment_lines(proposal.ddl))
                 body.append("")
                 continue
@@ -2051,6 +2033,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             share_text = f", {share:.1%} of workload cost" if share is not None else ""
             body.append(f"-- {proposal.code} [{proposal.confidence.value}{share_text}]")
             body.extend(_comment_lines(proposal.title))
+            # `note` before the statement, not after: this script's whole purpose is to be
+            # read top-to-bottom before anything is run, and `rationale` — where every other
+            # caveat lives — never reaches this file at all. A caveat printed below the
+            # statement it qualifies is a caveat an operator reads after pasting it.
+            if proposal.note:
+                body.extend(_comment_lines(proposal.note))
             body.append(proposal.ddl)
             body.append("")
         if not body:

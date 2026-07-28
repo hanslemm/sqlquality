@@ -968,8 +968,23 @@ def test_the_ranking_key_ignores_a_boolean_cost_share():
         evidence={"cost_share": 0.5},
         confidence=Confidence.HIGH,
     )
-    key = PostgresWorkloadAdapter._ranking_key
+    key = PostgresWorkloadAdapter.ranking_key
     assert key(hot) < key(stray)
+
+
+def test_the_ranking_key_is_public_on_the_adapter_interface():
+    """`cli.advise` re-sorts after dbt enrichment and needs *this adapter's* order.
+
+    It used to reach `PostgresWorkloadAdapter._ranking_key` directly — a private classmethod
+    of one specific adapter, from the engine-agnostic CLI — so a second engine would have
+    silently got Postgres's ordering on the dbt path and its own everywhere else. Ordering
+    belongs to the adapter, so the hook has to be on the ABC and public; pinning both here
+    keeps the CLI from needing an engine-specific import to sort a list.
+    """
+    from sqlquality.workload.base import WorkloadAdapter
+
+    assert "ranking_key" in vars(WorkloadAdapter), "the hook must live on the ABC, not one adapter"
+    assert PostgresWorkloadAdapter.ranking_key.__func__ is WorkloadAdapter.ranking_key.__func__
 
 
 def test_the_schema_statement_runs_once_per_run():

@@ -42,8 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **ADV302** rewrites an index-creating proposal for a `table`-, `incremental`- or
   `materialized_view`-materialized dbt model into a commented `indexes:` config block
   instead of raw DDL, because a normal `dbt run` (or `--full-refresh`) drops and rebuilds
-  those relations and the DDL would not survive it; a proposal on a `view` is dropped and
-  explained instead, since a view has no storage to index. **ADV301** proposes
+  those relations and the DDL would not survive it; on a `view` the *DDL* is dropped and
+  explained while the proposal stays at LOW confidence, since a view has no storage to index
+  but "this index cannot apply here" is still the finding. ADV302 is a rewrite, not a
+  proposal code: the original rule keeps its code, confidence and cost share, so no proposal
+  ever carries `code: "ADV302"` — filter on `evidence.dbt_index_config` instead — and
+  `advise` prints a stderr line saying how many proposals it rewrote, since the terminal
+  table row is otherwise unchanged. Several index proposals for one model merge into a single
+  `indexes:` block, because dbt reads one `indexes` key per config and two blocks pasted into
+  one config are a duplicate YAML key whose loser is silently discarded. Wherever ADV302
+  declines and leaves executable DDL in place (a partial index, an unrecognised
+  materialization, no plain column list, a non-btree access method), the warning is written
+  into the `--ddl` script above the statement, not only into the rationale. A non-postgres
+  `adapter_type` or a non-v12 manifest schema is disclosed on stderr, since dbt's `indexes`
+  config is a postgres/redshift feature. **ADV301** proposes
   materializing a `view`-backed model that carries a hot share of workload cost, capped at
   MEDIUM. **ADV303** flags a dbt model within reach of the manifest that the analyzed
   workload never touched and that no other model, snapshot or dbt exposure declares as a

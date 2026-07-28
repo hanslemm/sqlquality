@@ -516,8 +516,8 @@ why.
 | Code | Proposal | Note |
 |---|---|---|
 | ADV301 | Hot table maps to a model materialized as `view` → propose `table` or `incremental` | cost share attributed to the model; capped at MEDIUM |
-| ADV302 | An index-creating proposal for a `table`/`incremental`/`materialized_view` dbt model is rewritten into a config block instead of DDL that a normal (or `--full-refresh`) `dbt run` would destroy; on a `view` the proposal is dropped and explained | dbt materialization, columns |
-| ADV303 | Model never referenced in the analyzed window, and no other model, snapshot or dbt exposure declares it as a consumer → dead-model candidate | permanently LOW confidence: BI tools, longer windows, `--limit` truncation and downstream-only models all hide usage |
+| ADV302 | An index-creating proposal for a `table`/`incremental`/`materialized_view` dbt model is rewritten into a config block instead of DDL that a normal (or `--full-refresh`) `dbt run` would destroy; on a `view` the *DDL* is dropped and explained and the proposal survives at LOW. Not a proposal code: the original rule keeps its own code — see deviation 5 | dbt materialization, columns |
+| ADV303 | Model never referenced in the analyzed window, and no other model, snapshot or dbt exposure declares it as a consumer → dead-model candidate. Only *immediate* consumers count, so a dead chain unwinds one model per run from its leaf | permanently LOW confidence: BI tools, longer windows, `--limit` truncation and downstream-only models all hide usage |
 
 The originally-specified "recurring join path across models → propose a mart" rule is out
 of scope for Batch 3a; nothing in the shipped code claims that code or that behavior.
@@ -549,7 +549,12 @@ subsection above originally specified.
    it.** `sqlquality.workload.dbt` is imported from exactly one place, `cli.py`, which
    calls `enrich_proposals`/`propose_materialization`/`propose_unused_models` once, after
    `adapter.propose()` has already returned and been re-sorted with the adapter's own
-   ranking key. `PostgresWorkloadAdapter` (and, when it ships, the Redshift adapter) has
+   ranking key — `adapter.ranking_key`, a public hook on the `WorkloadAdapter` ABC that each
+   adapter may override, resolved off the instance the CLI resolved. (It first shipped as
+   `PostgresWorkloadAdapter._ranking_key` reached into directly from `cli.py`, which made
+   this claim false for any second engine: it would have got Postgres's ordering on the dbt
+   path and its own everywhere else. Corrected before merge; the CLI now imports no adapter
+   at all.) `PostgresWorkloadAdapter` (and, when it ships, the Redshift adapter) has
    no knowledge that dbt enrichment exists. This was a design goal restated in the
    architecture section above, not a deviation from it — recorded here because it was
    verified by grep (`sqlquality.workload.dbt` appears nowhere under `workload/postgres.py`
@@ -582,7 +587,43 @@ subsection above originally specified.
    *omitted from the JSON payload entirely* when no manifest loaded, rather than emitted
    as `"dbt": null` — the latter is a schema addition relative to `main` that would have
    made "byte-identical" true only with an asterisk. A consumer that wants the key
-   unconditionally still has `payload.get("dbt")`.
+   unconditionally still has `payload.get("dbt")`. Guarded by a test that renders all four
+   artifacts from a fixed, non-vacuous workload and asserts every dbt-conditional element is
+   absent from each — a diff against another commit is not something the suite can do, but
+   the absence property is, and the byte-identity claim was otherwise unprotected against
+   regression.
+5. **ADV302 is a rewrite, not a proposal `code`.** No `Proposal` ever carries
+   `code="ADV302"`: `_enrich_one` replaces `ddl` and amends `rationale`, and the original
+   rule (ADV001/ADV004/ADV007/ADV008) keeps its code, confidence and cost share, since the
+   evidence for the index is unchanged — only the delivery mechanism is. Consequences,
+   recorded because they surprise a consumer: a `--json` filter on `code == "ADV302"` matches
+   nothing on every run (filter on `evidence.dbt_index_config` instead), and the terminal
+   table row is identical to the same proposal from a dbt-free run, so `advise` prints a
+   stderr line naming how many proposals were rewritten.
+6. **One model gets one `indexes:` block.** dbt reads a single `indexes` key per model
+   config, so two standalone blocks pasted into one config are a duplicate YAML mapping key
+   and PyYAML — dbt's parser — silently keeps one, discarding the other recommended index.
+   Multiple index proposals per relation is the ordinary case (the collapse layer never folds
+   non-prefix column lists, and deliberately preserves same-set-different-order pairs), so
+   `enrich_proposals` merges every index for one model into the block carried by the
+   highest-ranked of those proposals; the others point at it by code.
+7. **ADV302's `indexes:` config shape is postgres/redshift-specific, and is disclosed rather
+   than suppressed elsewhere.** dbt implements the `indexes` model config only on those two
+   adapters. `advise` warns on stderr when the manifest's `adapter_type` is something else,
+   and when the manifest is not a v12 schema — the same two checks `check` makes on the same
+   file. It still emits the rewrite: the alternative is raw DDL the same rebuild destroys, so
+   declining would leave the operator less informed, and `advise` connects only to Postgres
+   today, so this configuration is already a mismatch worth naming rather than working
+   around.
+8. **A caveat that qualifies an executable statement is written into the `--ddl` script.**
+   `render_ddl` emits only the code/confidence header, the title and the DDL — never
+   `rationale` — so ADV302's decline paths (partial index, unrecognised materialization, no
+   plain column list, non-btree access method) produced a file holding a config block that
+   explained raw DDL does not survive `dbt run` and, below it, a bare `CREATE INDEX` on that
+   same dbt-managed table. `Proposal` grew an optional `note` field that `render_ddl` emits as
+   comment lines above the statement; it is deliberately absent from the JSON payload and the
+   markdown report, both of which already carry `rationale`, so the pre-dbt payload shape is
+   unchanged.
 
 ## Confidence model
 

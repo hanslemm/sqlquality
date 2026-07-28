@@ -189,6 +189,67 @@ class DbtContext:
         return self.models.get(relation)
 
 
+def resolve_manifest_path(project_dir: Path | None, manifest: Path | None) -> Path | None:
+    """The manifest path `load_dbt_context` will read, or None if neither option was given.
+
+    An explicit `--manifest` wins; otherwise `--project-dir/target/manifest.json`; otherwise
+    neither was given. One function with two callers, deliberately: `load_dbt_context`
+    resolves the path it loads, and `cli.advise` reports which path *was* loaded in its JSON
+    payload. Those were two independent copies of this same precedence, and swapping the
+    order in either copy alone left the whole suite green — so the payload could name a
+    manifest that was never read.
+    """
+    if manifest is not None:
+        return manifest
+    if project_dir is not None:
+        return project_dir / "target" / "manifest.json"
+    return None
+
+
+#: dbt adapters whose `indexes` model config exists at all. It is implemented by the
+#: relational adapters that have CREATE INDEX — postgres and its redshift derivative — and
+#: has no counterpart on Snowflake, BigQuery or Databricks, where ADV302's rewrite would be
+#: advice for a config key the project cannot use.
+_INDEX_CONFIG_ADAPTERS = frozenset({"postgres", "redshift"})
+
+
+def _manifest_warnings(project: DbtProject) -> list[str]:
+    """The two manifest checks `check` makes and the dbt `advise` path did not.
+
+    `check` warns on a non-v12 `dbt_schema_version` and resolves its dialect from
+    `adapter_type`; `advise` read neither, so it silently accepted a v10/v11 manifest, and
+    silently offered ADV302's `indexes` config rewrite for a Snowflake or BigQuery project —
+    where that config key does not exist at all, which turns unusable advice into something
+    presented as a correctness fix. Two commands reading the same file and disagreeing about
+    whether it is even the right shape is exactly what a user of both would not expect.
+
+    Warn rather than suppress the rewrite. ADV302's alternative to a config block is raw DDL
+    that the same rebuild destroys, so declining would leave the operator *less* informed,
+    not more; and `advise` connects only to Postgres today, so a Snowflake manifest paired
+    with a Postgres connection is a mismatch the user needs told about rather than silently
+    worked around. Both values are `isinstance`-guarded because `metadata` is a section some
+    other tool wrote: a non-string version would otherwise raise from the `in` test, and this
+    function runs where a raise degrades the whole enrichment.
+    """
+    warnings: list[str] = []
+    schema_version = project.schema_version()
+    if not isinstance(schema_version, str) or "/v12" not in schema_version:
+        found = schema_version if schema_version else "(absent)"
+        warnings.append(
+            f"warning: manifest dbt_schema_version is {found}, expected a v12 schema — "
+            "dbt enrichment may be unreliable"
+        )
+    adapter_type = project.adapter_type()
+    if isinstance(adapter_type, str) and adapter_type:
+        if adapter_type not in _INDEX_CONFIG_ADAPTERS:
+            warnings.append(
+                f"warning: manifest adapter_type is {adapter_type}; ADV302 expresses index "
+                "proposals as dbt's `indexes` model config, which only the postgres and "
+                "redshift adapters implement — treat that rewrite as postgres-specific"
+            )
+    return warnings
+
+
 def load_dbt_context(
     project_dir: Path | None, manifest: Path | None
 ) -> tuple[DbtContext | None, str | None]:
@@ -199,15 +260,13 @@ def load_dbt_context(
     analysis has already happened — aborting would throw away real work over an optional
     input. Same reasoning as the report-write failure path in `cli.py`.
     """
-    if manifest is not None:
-        path = manifest
-    elif project_dir is not None:
-        path = project_dir / "target" / "manifest.json"
-    else:
+    path = resolve_manifest_path(project_dir, manifest)
+    if path is None:
         return None, None
     try:
         project = DbtProject.from_path(path)
         context = DbtContext.from_project(project)
+        warnings = _manifest_warnings(project)
     except DbtProjectError as exc:
         # The expected failure mode: `DbtProject.from_path` already wraps a missing file
         # or unparseable JSON into a `DbtProjectError` whose own message names `path`, so
@@ -227,6 +286,8 @@ def load_dbt_context(
     if context.dropped_collisions:
         disclosure += f", {context.dropped_collisions} cross-database collision(s) dropped"
     disclosure += ")"
+    for warning in warnings:
+        disclosure += f"\n{warning}"
     return context, disclosure
 
 
@@ -260,6 +321,11 @@ _REBUILD = {
 _INDEX_CREATE_RE = re.compile(r"(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\b")
 _UNIQUE_INDEX_RE = re.compile(r"(?i)^CREATE\s+UNIQUE\s+INDEX\b")
 
+#: A `USING <method>` clause naming anything but btree. `\S` after the lookahead is load
+#: bearing: without it, `\s+` backtracks so that `USING  btree` (two spaces) satisfies a
+#: bare `(?!btree\b)` one space in, and a plain btree index would be refused.
+_NON_BTREE_RE = re.compile(r"(?i)\bUSING\s+(?!btree\b)\S")
+
 
 def _is_index_creating(ddl: str | None) -> bool:
     """An index-creating proposal, detected by its DDL prefix rather than its rule code.
@@ -277,6 +343,27 @@ def _is_index_creating(ddl: str | None) -> bool:
 def _is_unique_index(ddl: str) -> bool:
     """Whether `ddl` is a `CREATE UNIQUE INDEX`, which dbt's config expresses as `unique: true`."""
     return _UNIQUE_INDEX_RE.match(ddl.lstrip()) is not None
+
+
+def _names_a_non_btree_method(ddl: str) -> bool:
+    """Whether `ddl` asks for an access method the config reconstruction cannot express.
+
+    The config block is rebuilt from `evidence["columns"]` and hardcodes `type: btree`; the
+    DDL text itself is discarded. That is faithful for every rule shipping today — all of
+    them emit a plain btree over a column list, with no `USING`, no expression, no
+    `DESC`/`NULLS`/opclass — but the day a rule proposes `USING gin`, a silent rewrite to
+    `type: btree` would hand back a *different index* than the one the evidence justified.
+    So a non-btree access method declines the rewrite and discloses instead.
+
+    Textual, unlike `_is_partial_index`, and that asymmetry is deliberate: a column literally
+    named `USING` (quoted, so `\\bUSING` still matches it) makes this over-trigger, which
+    declines a rewrite that would have been fine — the conservative direction. A missed
+    detection would go the other way and quietly change the recommendation, so a false
+    positive here is the cheaper error. Ordering, opclasses and expression indexes are *not*
+    detectable this way and remain a documented limitation of the reconstruction rather than
+    a guard.
+    """
+    return _NON_BTREE_RE.search(ddl) is not None
 
 
 def _is_partial_index(proposal: Proposal) -> bool:
@@ -330,7 +417,60 @@ def _comment_block(lines: list[str]) -> str:
 
 
 def _dbt_attribution(model: ModelNode) -> str:
-    return f"`{model.unique_id}` (materialized as `{model.materialized}`)"
+    """Which model this is and how it is built, as one operator-facing phrase.
+
+    An absent materialization says so once, in words. Interpolating it directly rendered
+    "materialized as `None`" — a Python literal leaking into a sentence an operator reads —
+    and `materialized=""` rendered "materialized as ``", an empty code span, in both cases
+    *beside* a second spelling of the same fact ("materialization '(absent)'") supplied by
+    the caller. One fact, one phrase, and callers no longer restate it.
+    """
+    if not model.materialized:
+        return f"`{model.unique_id}`, with no materialization recorded in the manifest"
+    return f"`{model.unique_id}`, materialized as `{model.materialized}`"
+
+
+def _dbt_ddl_note(model: ModelNode, reason: str) -> str:
+    """A `Proposal.note` for a statement that stays executable on a dbt-managed relation.
+
+    ADV302 declines to rewrite on several paths (a partial index, an unrecognised
+    materialization, no plain column list, a non-btree access method) and each leaves real,
+    runnable DDL in place. The explanation for that used to live only in `rationale`, which
+    never reaches the `--ddl` file — so that file could hold a config block explaining that
+    raw DDL is destroyed by `dbt run` and, a few lines below, a bare `CREATE INDEX` on that
+    same dbt-managed table. This is the disclosure that travels with the statement instead.
+
+    No backticks and no markdown: this is rendered into a SQL script as `--` comment lines,
+    where markdown emphasis is noise. Pre-wrapped rather than one long line for the same
+    reason — `_comment_lines` prefixes each physical line and wraps nothing.
+    """
+    built_as = model.materialized if model.materialized else "materialization not recorded"
+    return (
+        f"dbt WARNING: this relation is built by dbt model {model.unique_id}\n"
+        f"({built_as}), so the statement below is not durable. {reason}\n"
+        "Reapply it by hand after any rebuild, or it silently disappears."
+    )
+
+
+@dataclass(frozen=True)
+class _IndexEntry:
+    """One `- columns: [...]` item in a dbt model's `indexes` config list.
+
+    Frozen and comparable so two proposals that reduce to the same index (same columns, same
+    uniqueness) contribute one entry to the merged block rather than two identical ones.
+    """
+
+    columns: tuple[str, ...]
+    unique: bool
+
+    def render(self) -> list[str]:
+        # `!r` is deliberately absent: `list(columns)` has no `__str__` of its own, so plain
+        # `{list(...)}` formatting already falls back to `__repr__` and gets the same
+        # per-element escaping `!r` would have asked for explicitly — see `_comment_block`.
+        lines = [f"    - columns: {list(self.columns)}", "      type: btree"]
+        if self.unique:
+            lines.append("      unique: true")
+        return lines
 
 
 def enrich_proposals(proposals: list[Proposal], context: DbtContext) -> list[Proposal]:
@@ -340,9 +480,22 @@ def enrich_proposals(proposals: list[Proposal], context: DbtContext) -> list[Pro
     `table`-, `incremental`- or `materialized_view`-materialized dbt model is expressed
     instead as a config block a human can paste into that model's `.yml`, since the raw
     DDL is destroyed the next time dbt rebuilds the relation. A `view` cannot carry an
-    index at all, so the proposal is dropped and explained rather than rewritten. An
-    unrecognised (or absent) materialization is left alone — unknown is not the same as
-    known-safe, so the DDL is not touched on a guess.
+    index at all, so the *DDL* is dropped and explained — the proposal itself survives at
+    LOW, since "this index cannot apply here" is the finding. An unrecognised (or absent)
+    materialization is left alone — unknown is not the same as known-safe, so the DDL is
+    not touched on a guess.
+
+    **One model gets exactly one `indexes` block, however many proposals it collects.**
+    This is the reason for the two passes below and not an optimization. `indexes` is a
+    single YAML mapping key, so two standalone blocks pasted into one model's config are a
+    duplicate key and PyYAML — dbt's own parser — silently keeps the last: the other
+    recommended index is discarded with no error at all. Two survivors per relation is the
+    *normal* case, not an edge case, because the adapter's collapse layer never folds
+    non-prefix column lists and deliberately preserves same-set-different-order pairs. So
+    the first (highest-ranked) proposal for a model carries the complete merged block, and
+    every later one for that same model is rewritten to point at it rather than emit a
+    second block. Per-model rather than per-relation only in spelling: `DbtContext` indexes
+    one model per relation.
 
     Everything else passes through with only its evidence enriched: a `DROP INDEX`
     proposal is ordinary regardless of dbt (dbt never created the index, so there is
@@ -352,28 +505,84 @@ def enrich_proposals(proposals: list[Proposal], context: DbtContext) -> list[Pro
 
     A proposal whose relation dbt does not manage — or that carries no `(schema, table)`
     evidence at all — is returned completely unchanged.
+
+    Output order is the input order. The caller re-sorts by the adapter's own ranking key
+    after appending ADV301/ADV303, and this function must not pre-empt that.
     """
-    out: list[Proposal] = []
+    # Pass 1: decide every proposal that can be decided alone, and collect the index entries
+    # of the ones that cannot — a config block cannot be rendered until every proposal for
+    # that model has been seen.
+    models: list[ModelNode | None] = []
+    decided: list[Proposal | None] = []
+    entries: list[_IndexEntry | None] = []
     for proposal in proposals:
         relation = _relation_of(proposal)
         model = context.model_for(relation) if relation is not None else None
+        models.append(model)
         if model is None:
-            out.append(proposal)
+            decided.append(proposal)
+            entries.append(None)
             continue
-        out.append(_enrich_one(proposal, model))
+        finished, entry = _classify(proposal, model)
+        decided.append(finished)
+        entries.append(entry)
+
+    merged: dict[str, list[_IndexEntry]] = {}
+    owner: dict[str, int] = {}
+    for position, (model, entry) in enumerate(zip(models, entries)):
+        if model is None or entry is None:
+            continue
+        block = merged.setdefault(model.unique_id, [])
+        if entry not in block:
+            block.append(entry)
+        owner.setdefault(model.unique_id, position)
+
+    # Pass 2: render the config block once per model.
+    out: list[Proposal] = []
+    for position, proposal in enumerate(proposals):
+        finished = decided[position]
+        if finished is not None:
+            out.append(finished)
+            continue
+        model = models[position]
+        entry = entries[position]
+        assert model is not None and entry is not None  # the only shape pass 1 leaves undecided
+        if owner[model.unique_id] == position:
+            out.append(_as_config_block(proposal, model, merged[model.unique_id]))
+        else:
+            out.append(
+                _deferred_to_block(proposal, model, proposals[owner[model.unique_id]], entry)
+            )
     return out
 
 
-def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
+def _dbt_evidence(proposal: Proposal, model: ModelNode) -> dict[str, object]:
+    """`proposal.evidence` plus the model attribution — as a *copy*.
+
+    Copied, not mutated in place: enrichment is a transformation over proposals the adapter
+    already produced, and quietly editing the caller's dict would make the same proposal
+    object read differently depending on whether enrichment ran.
+    """
     evidence = dict(proposal.evidence)
     evidence["dbt_model"] = model.unique_id
     evidence["dbt_materialized"] = model.materialized
+    return evidence
+
+
+def _classify(proposal: Proposal, model: ModelNode) -> tuple[Proposal | None, _IndexEntry | None]:
+    """Either the finished proposal, or the index entry it contributes to a merged block.
+
+    Exactly one of the two is non-None. Returning `(None, entry)` means "this one becomes
+    dbt config, but which text it gets depends on the other proposals for this model", which
+    only `enrich_proposals`'s second pass can know.
+    """
+    evidence = _dbt_evidence(proposal, model)
 
     if not _is_index_creating(proposal.ddl):
         # DROP INDEX, and any advisory proposal with no DDL at all: attributed, not
         # rewritten. Dropping an index dbt never created is ordinary, and there is no
         # `indexes` config entry that expresses a removal.
-        return dataclasses.replace(proposal, evidence=evidence)
+        return dataclasses.replace(proposal, evidence=evidence), None
 
     ddl = proposal.ddl
     assert ddl is not None  # _is_index_creating(None) is False, so this branch guarantees it
@@ -384,22 +593,35 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
             f"{proposal.rationale} This relation is a dbt view ({_dbt_attribution(model)}): "
             "a view has no storage of its own to index, so this proposal does not apply."
         )
-        return dataclasses.replace(
-            proposal,
-            ddl=None,
-            rationale=rationale,
-            confidence=Confidence.LOW,
-            evidence=evidence,
+        return (
+            dataclasses.replace(
+                proposal,
+                ddl=None,
+                rationale=rationale,
+                confidence=Confidence.LOW,
+                evidence=evidence,
+            ),
+            None,
         )
 
     if materialized not in _REBUILD:
-        label = materialized if materialized else "(absent)"
+        why = (
+            f"but materialization '{materialized}' is unrecognised"
+            if materialized
+            else "but an unrecorded materialization is unknown rather than known-safe"
+        )
         rationale = (
             f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}), "
-            f"but materialization '{label}' is unrecognised, so the DDL below is left as-is "
-            "rather than rewritten on a guess."
+            f"{why}, so the DDL below is left as-is rather than rewritten on a guess."
         )
-        return dataclasses.replace(proposal, rationale=rationale, evidence=evidence)
+        note = _dbt_ddl_note(
+            model,
+            "sqlquality does not recognise that materialization, so it cannot tell whether\n"
+            "a dbt run destroys this index.",
+        )
+        return dataclasses.replace(
+            proposal, rationale=rationale, evidence=evidence, note=note
+        ), None
 
     # `table`, `incremental` or `materialized_view`: the relation genuinely gets rebuilt,
     # so a raw CREATE INDEX is lost sooner or later. A partial index (ADV004's
@@ -414,7 +636,14 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
             "partial index cannot be expressed as config — it will be dropped on the next "
             "rebuild unless you reapply the DDL above by hand afterward."
         )
-        return dataclasses.replace(proposal, rationale=rationale, evidence=evidence)
+        note = _dbt_ddl_note(
+            model,
+            "dbt's indexes config has no predicate field, so this partial index cannot be\n"
+            "expressed as config.",
+        )
+        return dataclasses.replace(
+            proposal, rationale=rationale, evidence=evidence, note=note
+        ), None
 
     columns = proposal.evidence.get("columns")
     if (
@@ -423,28 +652,150 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
         or not all(isinstance(c, str) for c in columns)
     ):
         # No plain column list to express as config — leave the DDL untouched rather than
-        # invent one.
-        return dataclasses.replace(proposal, evidence=evidence)
+        # invent one, and *say so*. Unreachable from today's rules, all of which populate
+        # `columns`; reachable by design, because `_is_index_creating` matches on the DDL
+        # prefix precisely so a future index-creating rule is covered without being
+        # enumerated here. This path used to decline in complete silence — no rationale
+        # amendment, executable DDL kept — which is the one outcome this module exists to
+        # prevent, so the disclosure matters more here than on the paths that are exercised.
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
+            f"{_REBUILD[materialized]}. This proposal carries no plain column list, so it "
+            "cannot be expressed as dbt `indexes` config and the DDL below is left as-is — "
+            "reapply it by hand after each rebuild."
+        )
+        note = _dbt_ddl_note(
+            model,
+            "This proposal carries no plain column list, so it cannot be expressed as\n"
+            "dbt indexes config.",
+        )
+        return dataclasses.replace(
+            proposal, rationale=rationale, evidence=evidence, note=note
+        ), None
 
-    # `!r` is deliberately absent: `list(columns)` has no `__str__` of its own, so plain
-    # `{list(columns)}` formatting already falls back to `__repr__` and gets the same
-    # per-element escaping `!r` would have asked for explicitly — see `_comment_block`.
-    config_lines = [
-        "ADV302: express this as dbt config, not DDL. Add to the model's config block:",
-        "  indexes:",
-        f"    - columns: {list(columns)}",
-        "      type: btree",
+    if _names_a_non_btree_method(ddl):
+        rationale = (
+            f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
+            f"{_REBUILD[materialized]}. This index names a non-btree access method, which the "
+            "config block below cannot express without changing the index it recommends, so "
+            "the DDL is left as-is — reapply it by hand after each rebuild."
+        )
+        note = _dbt_ddl_note(
+            model,
+            "This index names a non-btree access method, which dbt indexes config as\n"
+            "reconstructed here cannot express.",
+        )
+        return dataclasses.replace(
+            proposal, rationale=rationale, evidence=evidence, note=note
+        ), None
+
+    return None, _IndexEntry(columns=tuple(columns), unique=_is_unique_index(ddl))
+
+
+def _as_config_block(proposal: Proposal, model: ModelNode, entries: list[_IndexEntry]) -> Proposal:
+    """Rewrite `proposal`'s DDL as the one `indexes` block covering this whole model.
+
+    The block names the model. It used to say only "the model's config block", so two
+    different relations recommending the same column list rendered byte-identical `ddl` —
+    distinguishable in the DDL file only by the title comment above it, and in the JSON
+    payload by nothing at all. It also no longer says "above": in markdown the fenced DDL is
+    *below* the rationale, in the DDL file the rationale is absent entirely, and in JSON
+    there is no spatial relation to be right or wrong about.
+    """
+    lines = [
+        "ADV302: express this as dbt config, not DDL — raw DDL does not survive a rebuild.",
+        f"Add to the config of dbt model {model.unique_id}:",
     ]
-    if _is_unique_index(ddl):
-        config_lines.append("      unique: true")
-    config_ddl = _comment_block(config_lines)
-    evidence["dbt_index_config"] = config_ddl
+    if len(entries) > 1:
+        lines += [
+            f"(all {len(entries)} indexes this run recommends for that model, in ONE block on",
+            "purpose: an `indexes` mapping key can appear once, so two blocks pasted into the",
+            "same config silently keep only the last)",
+        ]
+    lines.append("  indexes:")
+    for entry in entries:
+        lines.extend(entry.render())
+    config_ddl = _comment_block(lines)
+    evidence = _dbt_evidence(proposal, model)
+    # A flag, not the block itself. This key used to hold a byte-identical copy of `ddl`,
+    # which earned nothing and smeared the markdown Evidence line — evidence renders as flat
+    # `k=v` pairs, so a multi-line value lands inline with literal `\n` escapes mid-sentence.
+    # As a flag it is the one thing a consumer cannot get elsewhere: ADV302 is never a
+    # proposal `code`, so `code == "ADV302"` matches nothing and this is how a `--json`
+    # consumer filters for "the DDL here is dbt config, not runnable SQL".
+    evidence["dbt_index_config"] = True
+    # `or ""` is for the type checker only: `_classify` returns an entry — the sole way to
+    # reach this function — exactly when `materialized` is a key of `_REBUILD`.
     rationale = (
         f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
-        f"{_REBUILD[materialized]}. Add the config block above to the model instead of running "
-        "this DDL directly; `dbt run` applies it."
+        f"{_REBUILD[model.materialized or '']}. Add the config block this proposal carries in "
+        f"place of its DDL to `{model.unique_id}` instead of running that DDL directly; "
+        "`dbt run` applies it."
     )
+    if len(entries) > 1:
+        rationale += (
+            f" That block covers all {len(entries)} indexes this run recommends for the model, "
+            "because dbt reads only one `indexes` key per config."
+        )
     return dataclasses.replace(proposal, ddl=config_ddl, rationale=rationale, evidence=evidence)
+
+
+def _deferred_to_block(
+    proposal: Proposal, model: ModelNode, owner: Proposal, entry: _IndexEntry
+) -> Proposal:
+    """Point a second index proposal for one model at that model's single config block.
+
+    Emitting its own standalone block instead is the silent-data-loss bug this exists to
+    prevent: two `indexes` keys in one config, and dbt keeps the last.
+    """
+    lines = [
+        f"ADV302: the index on {list(entry.columns)} for dbt model {model.unique_id}",
+        f"is already included in the single dbt config block reported under {owner.code}:",
+        # `_comment_block` splits each logical line again, so an interpolated title carrying
+        # a raw newline still cannot produce an uncommented output line.
+        owner.title,
+        "Paste that one block. A second `indexes` key in the same config would be a",
+        "duplicate YAML mapping key, and dbt would silently keep only one of them.",
+    ]
+    evidence = _dbt_evidence(proposal, model)
+    evidence["dbt_index_config_reported_with"] = owner.code
+    rationale = (
+        f"{proposal.rationale} This relation is a dbt model ({_dbt_attribution(model)}): "
+        f"{_REBUILD[model.materialized or '']}. This index is already part of the single dbt "
+        f"`indexes` config block reported under {owner.code} for this model — dbt reads one "
+        "`indexes` key per config, so both indexes have to be expressed in that one block "
+        "rather than in a block of their own."
+    )
+    return dataclasses.replace(
+        proposal, ddl=_comment_block(lines), rationale=rationale, evidence=evidence
+    )
+
+
+def describe_rewrites(proposals: list[Proposal]) -> str | None:
+    """One line saying ADV302 fired, or None when it did not.
+
+    ADV302 is never a proposal `code` — it is a rewrite applied to another rule's proposal —
+    so `code == "ADV302"` matches nothing and an enriched terminal row is byte-identical to
+    the same proposal from a dbt-free run: same code, same confidence, same cost share, same
+    title. The terminal never prints `rationale`, where the whole disclosure lives, so
+    without this line a user who reads only the terminal cannot tell enrichment happened.
+    Counted off the two evidence flags rather than by searching the DDL text for "ADV302",
+    which would depend on the wording of a string meant for humans.
+    """
+    rewritten = sum(1 for p in proposals if p.evidence.get("dbt_index_config") is True)
+    merged = sum(1 for p in proposals if "dbt_index_config_reported_with" in p.evidence)
+    if not rewritten and not merged:
+        return None
+    line = (
+        f"ADV302 expressed {rewritten + merged} index proposal(s) as dbt `indexes` config: "
+        "their DDL is a config block to add to the model, not runnable SQL"
+    )
+    if merged:
+        line += (
+            f" ({merged} folded into another proposal's block, since dbt reads one `indexes` "
+            "key per model config)"
+        )
+    return line
 
 
 def propose_materialization(
@@ -573,7 +924,11 @@ def propose_unused_models(
             "the query history this tool actually saw, so a cold-but-used model can look "
             "unused within that slice. A model with a declared consumer — another model, a "
             "snapshot, or a dbt exposure — is excluded from this rule outright rather than "
-            "merely downgraded, because it is used, just not by an ad-hoc query."
+            "merely downgraded, because it is used, just not by an ad-hoc query. That "
+            "exclusion is not transitive: only a model's immediate consumers are considered, "
+            "so a dead chain surfaces one model per run, from its leaf — if this model feeds "
+            "another that turns out to be dead too, that one is only reported after this one "
+            "is gone."
         )
         proposals.append(
             Proposal(
