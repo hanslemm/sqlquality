@@ -626,7 +626,9 @@ def test_adv303_excludes_a_model_that_other_models_depend_on():
 def test_adv303_is_capped_at_low_confidence():
     context = DbtContext.from_project(_project())
     usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
-    for proposal in propose_unused_models(_aggregation(usage), context, _workload()):
+    proposals = propose_unused_models(_aggregation(usage), context, _workload())
+    assert proposals, "the loop below is vacuous otherwise — this must pin a non-empty result"
+    for proposal in proposals:
         assert proposal.confidence is Confidence.LOW
 
 
@@ -652,5 +654,156 @@ def test_adv303_carries_no_ddl():
     hand over a statement that does it."""
     context = DbtContext.from_project(_project())
     usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.5)
-    for proposal in propose_unused_models(_aggregation(usage), context, _workload()):
+    proposals = propose_unused_models(_aggregation(usage), context, _workload())
+    assert proposals, "the loop below is vacuous otherwise — this must pin a non-empty result"
+    for proposal in proposals:
         assert proposal.ddl is None
+
+
+def _unrelated_usage() -> ColumnUsage:
+    """A usage on a relation outside every fixture project used here, just enough to keep
+    `Aggregation.usage` non-empty so the "nothing was analysed" bail-out (see
+    `test_adv303_emits_nothing_when_no_usage_was_extracted`) does not swallow a test that
+    is not testing that guard."""
+    return _usage(Relation("other", "noise"), "id", ColumnRole.EQUALITY, cost_share=0.01)
+
+
+def test_adv303_emits_nothing_when_no_usage_was_extracted():
+    """An `Aggregation` with no usage at all means nothing was analysed — every relation in
+    `context.models` would trivially look "untouched" by definition (none of them can be in
+    `aggregation.tables`, which is built only from usage), so an empty workload or a fully
+    unparseable one must not read as evidence that every childless model is unused."""
+    context = DbtContext.from_project(_project())
+    assert propose_unused_models(_aggregation(), context, _workload()) == []
+
+
+def test_adv303_excludes_a_model_with_exactly_one_model_child():
+    """`> 0` and `> 1` both leave every other test green if the only fixture with children
+    happens to have two of them (`stg_orders` feeds both `orders` and `customer_orders`).
+    This is the commonest real shape — one staging model feeding one downstream model — so
+    it needs its own fixture to be pinned at all."""
+    manifest = {
+        "nodes": {
+            "model.demo.parent": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."parent"',
+            },
+            "model.demo.child": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."child"',
+            },
+        },
+        "child_map": {
+            "model.demo.parent": ["model.demo.child"],
+            "model.demo.child": [],
+        },
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    usage = _usage(Relation("main", "child"), "status", ColumnRole.EQUALITY, cost_share=0.5)
+    proposals = propose_unused_models(_aggregation(usage), context, _workload())
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.parent" not in flagged, "parent has exactly one model child"
+
+
+def test_adv303_excludes_a_model_whose_only_child_is_a_snapshot():
+    """An exposure/snapshot is a real, dbt-declared consumer that `model_children` cannot
+    see because it filters to `resource_type == 'model'`. ADV303 must read the manifest's
+    raw child_map (via `DbtProject.child_ids`) instead, or it would propose deleting a model
+    dbt itself documents as being snapshotted."""
+    manifest = {
+        "nodes": {
+            "model.demo.raw": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."raw"',
+            },
+            "snapshot.demo.raw_snapshot": {
+                "resource_type": "snapshot",
+                "config": {"materialized": "snapshot"},
+                "relation_name": '"dev"."main"."raw_snapshot"',
+            },
+        },
+        "child_map": {
+            "model.demo.raw": ["snapshot.demo.raw_snapshot"],
+            "snapshot.demo.raw_snapshot": [],
+        },
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.raw" not in flagged
+
+
+def test_adv303_excludes_a_model_whose_only_child_is_an_exposure():
+    """An exposure exists in dbt specifically to declare "a BI dashboard / a downstream
+    tool reads this" — a mart whose only declared consumer is an exposure is exactly the
+    case this rule must not flag. Exposures live outside `nodes` in a real manifest, so
+    this only works because `child_ids` reads `child_map` directly rather than resolving
+    each child through `DbtProject.node`."""
+    manifest = {
+        "nodes": {
+            "model.demo.mart": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."mart"',
+            },
+        },
+        "child_map": {"model.demo.mart": ["exposure.demo.dashboard"]},
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.mart" not in flagged
+
+
+def test_adv303_does_not_count_a_test_as_a_consumer():
+    """A `not_null` test is an assertion about a model, not a consumer of it: it does not
+    read the model's output for any purpose downstream would recognise, so a model whose
+    only child is a test is still unused and must be flagged, unlike a snapshot or an
+    exposure."""
+    manifest = {
+        "nodes": {
+            "model.demo.mart": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."mart"',
+            },
+            "test.demo.not_null_mart_id.abc123": {
+                "resource_type": "test",
+                "config": {"materialized": "test"},
+                "relation_name": None,
+            },
+        },
+        "child_map": {"model.demo.mart": ["test.demo.not_null_mart_id.abc123"]},
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
+    flagged = {p.evidence["dbt_model"] for p in proposals}
+    assert "model.demo.mart" in flagged
+
+
+def test_adv303_orders_proposals_canonically_by_relation():
+    """Canonical output order is by relation, not by dbt unique_id or manifest insertion
+    order — chosen so the two orders disagree: `DbtProject.model_ids()` already sorts by
+    unique_id, so removing `propose_unused_models`'s own `sorted(context.models)` would
+    still pass by accident unless a model's unique_id order disagrees with its relation's
+    (schema, table) order, as it deliberately does here."""
+    manifest = {
+        "nodes": {
+            "model.demo.a_second": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."zzz_relation"',
+            },
+            "model.demo.b_first": {
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "relation_name": '"dev"."main"."aaa_relation"',
+            },
+        },
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
+    assert [p.evidence["table"] for p in proposals] == ["aaa_relation", "zzz_relation"]

@@ -94,6 +94,20 @@ def parse_relation_name(relation_name: str) -> Relation | None:
     return Relation(schema=parts[-2], table=parts[-1])
 
 
+def _is_test_id(unique_id: str) -> bool:
+    """Whether `unique_id` names a dbt test, by dbt's own unique_id convention.
+
+    A test's unique_id is always `test.<package>.<name>.<hash>` — this is dbt's own
+    naming scheme, the same one that makes `unique_id.startswith("model.")` reliable
+    elsewhere in this module. Checking the id rather than resolving a node is deliberate:
+    an exposure or a source referenced in `child_map` may not even have an entry in
+    `manifest["nodes"]` (both live in their own top-level manifest sections), so a lookup
+    through `DbtProject.node` would raise for exactly the consumers this check must not
+    reject.
+    """
+    return unique_id.split(".", 1)[0] == "test"
+
+
 @dataclass(frozen=True)
 class DbtContext:
     """dbt models indexed by the relation they build, for joining against workload facts."""
@@ -103,14 +117,25 @@ class DbtContext:
     #: see `from_project`. Surfaced so the CLI disclosure can tell a user "we found nothing"
     #: apart from "we found two candidates and refused to guess."
     dropped_collisions: int = 0
-    #: How many other *models* depend on the model building this relation, keyed the same
-    #: way as `models`. ADV303 needs this to exclude a model that only looks unused because
-    #: nothing but another model reads it — but holding the whole `DbtProject` just to ask
-    #: `model_children` on demand would let dbt-shaped knowledge (unique_ids, the child map)
-    #: leak past this module's boundary into whatever calls `DbtContext.model_for` today.
-    #: Carrying only the count keeps `DbtContext` a plain fact about relations, the same
-    #: shape `model_for` already promises.
-    child_count: dict[Relation, int] = field(default_factory=dict)
+    #: How many other *declared consumers* — anything in the manifest's child_map except a
+    #: test — the model building this relation has, keyed the same way as `models`. ADV303
+    #: needs this to exclude a model that only looks unused because nothing but another
+    #: dbt-declared consumer reads it.
+    #:
+    #: Deliberately **not** `DbtProject.model_children`'s count: that method filters to
+    #: `resource_type == "model"`, which is correct for its own callers (the model DAG) but
+    #: wrong here — a snapshot or an exposure is a real, dbt-declared consumer (an exposure
+    #: exists specifically to say "a BI dashboard reads this"), and a model whose only child
+    #: is one of those is used, just not by another model. `from_project` instead counts
+    #: `DbtProject.child_ids`, which reads the manifest's child_map with no resource-type
+    #: filter, and excludes only `test.*` ids: a `not_null` test is an assertion *about* a
+    #: model, not a consumer *of* it, so it must not count toward "something reads this."
+    #:
+    #: Holding the whole `DbtProject` just to ask this on demand would let dbt-shaped
+    #: knowledge (unique_ids, the child map) leak past this module's boundary into whatever
+    #: calls `DbtContext.model_for` today. Carrying only the count keeps `DbtContext` a plain
+    #: fact about relations, the same shape `model_for` already promises.
+    consumer_count: dict[Relation, int] = field(default_factory=dict)
 
     @classmethod
     def from_project(cls, project: DbtProject) -> DbtContext:
@@ -147,8 +172,11 @@ class DbtContext:
                 continue
             candidates[relation] = node
         models = {r: n for r, n in candidates.items() if r not in collided}
-        child_count = {r: len(project.model_children(n.unique_id)) for r, n in models.items()}
-        return cls(models=models, dropped_collisions=len(collided), child_count=child_count)
+        consumer_count = {
+            r: sum(1 for cid in project.child_ids(n.unique_id) if not _is_test_id(cid))
+            for r, n in models.items()
+        }
+        return cls(models=models, dropped_collisions=len(collided), consumer_count=consumer_count)
 
     def model_for(self, relation: Relation) -> ModelNode | None:
         """The model building this exact relation, matching schema *and* table.
@@ -499,16 +527,33 @@ def propose_unused_models(
     * `--limit` truncates the query history handed to `advise`, so a cold-but-genuinely-used
       model can look exactly like an unused one within the slice this tool actually saw.
 
-    A model with dbt children is excluded outright — not merely downgraded — because that
-    is a correctness gate, not a caveat: a staging model consumed only by another model *is*
-    used, just not by an ad-hoc query, and without this exclusion the rule would propose
-    deleting every staging model in a well-formed project.
+    A model with a declared consumer is excluded outright — not merely downgraded — because
+    that is a correctness gate, not a caveat: a staging model consumed only by another model,
+    a snapshot, or a dbt exposure (which exists specifically to declare "a BI dashboard reads
+    this") *is* used, just not by an ad-hoc query, and without this exclusion the rule would
+    propose deleting every staging model in a well-formed project. See
+    `DbtContext.consumer_count` for what counts as a consumer and why a test does not.
+
+    This only looks at a model's *immediate* consumers, not the whole downstream chain: if
+    dead model A feeds dead model B, B being unused does not get attributed back to A — A is
+    judged solely on its own `consumer_count`, which B's presence still satisfies. This is
+    conservative by construction (it never flags something it shouldn't) but it also means a
+    fully dead sub-DAG is only ever reported from its leaf, not from its root — cascading
+    would require knowing that every consumer along the chain is itself unused, which this
+    rule does not attempt.
+
+    An `Aggregation` with no usage at all is refused rather than treated as evidence: every
+    relation in `context.models` would trivially be "untouched" (none can be in
+    `aggregation.tables`, which is built only from usage), so an empty or fully-unparseable
+    workload must not read as proof that every childless model is unused.
     """
+    if not aggregation.usage:
+        return []
     proposals: list[Proposal] = []
     for relation in sorted(context.models):
         if relation in aggregation.tables:
             continue
-        if context.child_count.get(relation, 0) > 0:
+        if context.consumer_count.get(relation, 0) > 0:
             continue
         model = context.models[relation]
         rationale = (
@@ -517,9 +562,9 @@ def propose_unused_models(
             "proof of it: the window may simply not cover this model's reader — a monthly "
             "report, a BI tool with its own cache, a quarterly job — and `--limit` truncates "
             "the query history this tool actually saw, so a cold-but-used model can look "
-            "unused within that slice. A model with dbt children is excluded from this rule "
-            "outright rather than merely downgraded, because a model consumed only by "
-            "another model is used, just not by an ad-hoc query."
+            "unused within that slice. A model with a declared consumer — another model, a "
+            "snapshot, or a dbt exposure — is excluded from this rule outright rather than "
+            "merely downgraded, because it is used, just not by an ad-hoc query."
         )
         proposals.append(
             Proposal(
