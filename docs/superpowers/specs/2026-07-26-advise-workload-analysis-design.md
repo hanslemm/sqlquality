@@ -3,11 +3,16 @@
 Date: 2026-07-26
 Status: Postgres (steps 1–4 below) shipped in `sqlquality advise`, now including ADV007
 (join keys), ADV008 (`GROUP BY`), multi-schema `(schema, table)` keying, and
-`DECLARE`/`COPY` unwrapping (Batch 2, 2026-07-27); Redshift, Snowflake and dbt enrichment
-(steps 5–7) remain design-only, not yet implemented. See
-`docs/superpowers/plans/2026-07-26-advise-postgres.md` for the implementation plan and its
-"Deviations from the spec" section, reconciled into this document below, and "Deviations
-from the spec (Batch 2)" further down for what changed after the initial ship.
+`DECLARE`/`COPY` unwrapping (Batch 2, 2026-07-27); optional dbt enrichment (ADV301–ADV303,
+`--project-dir`/`--manifest`) shipped Batch 3a, 2026-07-28, with a code reassignment from
+this document's original dbt section — see "Deviations from the spec (Batch 3a: dbt
+enrichment)" below. Redshift and Snowflake (steps 5–6) remain design-only, not yet
+implemented. See `docs/superpowers/plans/2026-07-26-advise-postgres.md` for the Postgres
+implementation plan and its own "Deviations from the spec" section, reconciled into this
+document below; `docs/superpowers/plans/2026-07-27-advise-dbt-enrichment.md` for the dbt
+enrichment plan; "Deviations from the spec (Batch 2)" further down for what changed after
+the initial Postgres ship; and "Deviations from the spec (Batch 3a: dbt enrichment)" for
+what changed while building dbt enrichment.
 
 ## Summary
 
@@ -77,7 +82,9 @@ src/sqlquality/workload/
   postgres.py      introspection SQL + index rules + DDL rendering
   redshift.py      introspection SQL + table-design rules + DDL rendering
   snowflake.py     introspection SQL + clustering rules + DDL rendering
-  dbtenrich.py     ADV301-303, active only when --manifest is supplied
+  dbt.py           ADV301-303, active only when --project-dir/--manifest is supplied
+                   (shipped filename; see Batch 3a deviation #2 below for why this module
+                   is imported from cli.py only, never from an adapter)
 ```
 
 `extract.py`, `aggregate.py` and `fingerprint.py` are engine-agnostic and hold the bulk of
@@ -500,13 +507,82 @@ Clustering carries ongoing credit cost, so ADV201 and ADV203 must state that the
 recommendation itself has a price — unlike an index, it is not a one-time cost.
 `SYSTEM$CLUSTERING_INFORMATION` consumes compute and is therefore not called by default.
 
-### dbt enrichment (`--manifest`)
+### dbt enrichment (`--project-dir` / `--manifest`)
+
+Shipped in Batch 3a (2026-07-28), with a code reassignment from what this section
+originally specified — see "Deviations from the spec (Batch 3a: dbt enrichment)" below for
+why.
 
 | Code | Proposal | Note |
 |---|---|---|
-| ADV301 | Hot table maps to a model materialized as `view` → propose `table` or `incremental` | cost share attributed to the model |
-| ADV302 | Model never referenced in the window → dead-model candidate | permanently LOW confidence: BI tools, longer windows and downstream-only models all hide usage |
-| ADV303 | Recurring join path across a large cost share, all tables mapping to models → propose a mart | fingerprint count |
+| ADV301 | Hot table maps to a model materialized as `view` → propose `table` or `incremental` | cost share attributed to the model; capped at MEDIUM |
+| ADV302 | An index-creating proposal for a `table`/`incremental`/`materialized_view` dbt model is rewritten into a config block instead of DDL that a normal (or `--full-refresh`) `dbt run` would destroy; on a `view` the proposal is dropped and explained | dbt materialization, columns |
+| ADV303 | Model never referenced in the analyzed window, and no other model, snapshot or dbt exposure declares it as a consumer → dead-model candidate | permanently LOW confidence: BI tools, longer windows, `--limit` truncation and downstream-only models all hide usage |
+
+The originally-specified "recurring join path across models → propose a mart" rule is out
+of scope for Batch 3a; nothing in the shipped code claims that code or that behavior.
+
+## Deviations from the spec (Batch 3a: dbt enrichment)
+
+Found and agreed while implementing the dbt enrichment this document's "dbt enrichment"
+subsection above originally specified.
+
+1. **Code reassignment: ADV302 is the DDL-correctness rewrite, not "dead-model
+   candidate."** The spec as written gave ADV301 the hot-view-materialization proposal,
+   ADV302 the dead-model proposal, and ADV303 a join-path/mart proposal. While scoping the
+   implementation it became clear the highest-value rule — the one that justified doing
+   dbt enrichment *before* Redshift/Snowflake in this batch — is neither of those: it is
+   recognizing that a raw `CREATE INDEX` proposal for a dbt-managed `table` (or
+   `incremental`, or `materialized_view`) relation is *actively wrong* advice, because
+   `dbt run` drops and recreates that relation (or, for `incremental`, `--full-refresh`
+   does), silently destroying the index the next time the pipeline runs. Every other
+   dbt-enrichment behavior is *additive* (a proposal that would not otherwise exist);
+   this one is *corrective* (a proposal the tool already made, made safe). That
+   asymmetry — correctness fix vs. new proposal — is why it took the lower, more
+   prominent number: **ADV302** is the rewrite/config-block rule, and the dead-model
+   rule this section originally called ADV302 shipped as **ADV303** instead. ADV301
+   (materialize a hot view) is unchanged from the original spec. The join-path/mart rule
+   originally slotted at ADV303 was dropped from this batch's scope entirely (see the
+   table above) rather than renumbered again, since a fourth code with no implementation
+   behind it would just be a dangling promise.
+2. **dbt is layered strictly on top of the engine-agnostic core — no adapter imports
+   it.** `sqlquality.workload.dbt` is imported from exactly one place, `cli.py`, which
+   calls `enrich_proposals`/`propose_materialization`/`propose_unused_models` once, after
+   `adapter.propose()` has already returned and been re-sorted with the adapter's own
+   ranking key. `PostgresWorkloadAdapter` (and, when it ships, the Redshift adapter) has
+   no knowledge that dbt enrichment exists. This was a design goal restated in the
+   architecture section above, not a deviation from it — recorded here because it was
+   verified by grep (`sqlquality.workload.dbt` appears nowhere under `workload/postgres.py`
+   or any other adapter) at the end of every task in this batch, not merely assumed.
+3. **Matching a dbt model to a relation is on the qualified `(schema, table)` pair, with
+   deliberately no bare-table-name fallback.** `DbtContext.model_for` looks up
+   `self.models.get(relation)` and nothing else. A dbt project's target schema — `dev`,
+   `main`, a CI schema, whatever `profiles.yml` names — routinely differs from the schema
+   `advise` introspects in production. A name-only match (ignore the manifest's schema,
+   match on table name alone) would therefore attribute a production table's proposal to
+   whatever development-schema model happens to share its table name, and ADV302 would
+   then rewrite that production table's DDL into a config block on the strength of a
+   guess about the wrong model's materialization — the exact class of silent
+   misattribution this whole batch exists to avoid, not introduce. The cost of this
+   strictness: a relation that two *different* models both build (legitimate when a
+   project targets more than one database, since dbt's `relation_name` carries a
+   database segment this project drops) cannot be disambiguated from the manifest alone,
+   so it is dropped from the index entirely rather than resolved by dict-insertion-order
+   luck, and counted in `DbtContext.dropped_collisions` — surfaced in both the CLI's `dbt
+   enrichment from ...` disclosure line and the JSON payload's `dbt.dropped_collisions`.
+4. **The no-manifest path is byte-identical to a build with no dbt support at all, proven
+   by measurement, not asserted.** Neither `--project-dir` nor `--manifest` given means
+   `load_dbt_context` returns `(None, None)` and none of the enrichment functions run, so
+   `advise` without a manifest is, by construction, the same code path as before this
+   batch. This was verified, not just argued: `stdout` (`--json`), the markdown report,
+   the `--ddl` file and `stderr` were each diffed byte-for-byte against `main` twice —
+   once with a stubbed adapter (deterministic, no live DB) and once against a live,
+   seeded Postgres — and all four came back an empty diff both times. Getting to a
+   literal empty diff required one interface decision: `advise_payload`'s `dbt` key is
+   *omitted from the JSON payload entirely* when no manifest loaded, rather than emitted
+   as `"dbt": null` — the latter is a schema addition relative to `main` that would have
+   made "byte-identical" true only with an asterisk. A consumer that wants the key
+   unconditionally still has `payload.get("dbt")`.
 
 ## Confidence model
 
@@ -515,7 +591,7 @@ Mechanical, derived from inputs rather than judgment:
 - **HIGH** — cost share above threshold, **and** supporting catalog stats present, **and**
   the current physical state confirmed to lack the proposal.
 - **MEDIUM** — cost evidence solid, but a catalog input is missing or stale.
-- **LOW** — absence-based (ADV302) or thin evidence.
+- **LOW** — absence-based (ADV303) or thin evidence.
 
 Every proposal renders its inputs inline: cost share, calls, distinct fingerprints, row
 estimate, NDV, and current index/DISTKEY/clustering state. A reader must be able to

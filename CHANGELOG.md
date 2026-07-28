@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could no longer satisfy the hot query's `ORDER BY`.
 - ADV003 is scoped to the tables the workload was observed using, like ADV002 — it no longer
   proposes `DROP INDEX` for a relation the run never analysed.
+- Optional dbt enrichment for `advise`: `--project-dir` (reads
+  `<project-dir>/target/manifest.json`) or `--manifest <path>` layers dbt model metadata
+  onto the same analysis, and every manifest-free `advise` invocation is proven
+  byte-identical (stdout, markdown, DDL and stderr) to a run with no dbt support at all.
+  **ADV302** rewrites an index-creating proposal for a `table`-, `incremental`- or
+  `materialized_view`-materialized dbt model into a commented `indexes:` config block
+  instead of raw DDL, because a normal `dbt run` (or `--full-refresh`) drops and rebuilds
+  those relations and the DDL would not survive it; a proposal on a `view` is dropped and
+  explained instead, since a view has no storage to index. **ADV301** proposes
+  materializing a `view`-backed model that carries a hot share of workload cost, capped at
+  MEDIUM. **ADV303** flags a dbt model within reach of the manifest that the analyzed
+  workload never touched and that no other model, snapshot or dbt exposure declares as a
+  consumer, capped at LOW. Matching a model to a relation is on the exact `(schema, table)`
+  pair with no bare-name fallback, since a dbt project's target schema routinely differs
+  from the schema being introspected; a relation two different models both claim is
+  dropped from matching (not guessed at) and counted in the CLI disclosure and the JSON
+  payload's `dbt.dropped_collisions`.
 
 ### Fixed
 
