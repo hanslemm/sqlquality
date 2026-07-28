@@ -17,12 +17,14 @@ from datetime import timedelta
 
 from sqlquality.models import (
     Aggregation,
+    Confidence,
     ConnectionParams,
     Proposal,
     Relation,
     TableFacts,
     Workload,
     WorkloadFetch,
+    cost_share_of,
 )
 
 #: Executes one parameterized introspection statement and returns its rows.
@@ -60,6 +62,36 @@ class WorkloadAdapter(ABC):
         self.degraded: list[tuple[str, str]] = []
         #: Schema(s) to introspect. The CLI overwrites this from --schema before connect().
         self.schemas: tuple[str, ...] = ("public",)
+
+    #: Highest confidence first, then largest cost share — the reading order a human wants.
+    _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
+
+    @classmethod
+    def ranking_key(cls, proposal: Proposal) -> tuple[int, float, str, str]:
+        """Canonical presentation order for proposals *this* adapter produced.
+
+        Public, and on the ABC, because ordering is each adapter's own responsibility and a
+        caller outside the adapter legitimately needs it: `cli.advise` re-sorts after the
+        optional dbt enrichment layer appends ADV301/ADV303 and downgrades some proposals,
+        and without a hook it reached into one specific adapter's private classmethod — so a
+        future engine would silently have got Postgres's ordering on the dbt path only, while
+        keeping its own everywhere else. An adapter whose proposals want a different reading
+        order overrides this; the default is the ordering every adapter has wanted so far.
+
+        Highest confidence first, then largest cost share, then a canonical tiebreak so
+        equal-confidence equal-cost proposals do not reorder between runs and make the CLI's
+        tests flaky.
+
+        `cost_share_of` rather than `float(evidence.get(...))`: bool is an int subclass, so a
+        stray True became -1.0 and sorted a fabricated share ahead of a genuinely hot
+        proposal, at the top of the list the CLI presents as "read this first".
+        """
+        return (
+            cls._CONFIDENCE_ORDER[proposal.confidence],
+            -(cost_share_of(proposal.evidence) or 0.0),
+            proposal.code,
+            proposal.title,
+        )
 
     @abstractmethod
     def introspection_sql(self) -> list[IntrospectionStatement]:

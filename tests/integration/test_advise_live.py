@@ -247,3 +247,134 @@ def test_never_analysed_join_key_still_proposes_at_low_confidence(seeded):
     assert order_items_proposals, "ADV007 did not fire for public.order_items"
     assert order_items_proposals[0]["evidence"]["row_estimate"] is None
     assert order_items_proposals[0]["confidence"] == "low", order_items_proposals[0]
+
+
+def _adv001_for(payload: dict, *, schema: str, table: str) -> dict | None:
+    for p in payload["proposals"]:
+        if p["code"] == "ADV001" and p["evidence"].get("schema") == schema:
+            if p["evidence"].get("table") == table:
+                return p
+    return None
+
+
+def test_adv302_rewrites_a_real_index_proposal_into_dbt_config(seeded, tmp_path):
+    """ADV302's whole reason to exist, proven on live data rather than a fixture.
+
+    A raw `CREATE INDEX` on a dbt `table`-materialized relation does not survive the next
+    `dbt run` (it drops and recreates the relation), so ADV302 rewrites that proposal into
+    a config block instead of doomed DDL. `tests/fixtures/manifest_v12.json` cannot prove
+    this live: its `relation_name`s are all schema `"main"`, which this seeded database
+    never has (`public`/`staging`), and relation matching is on the qualified
+    `(schema, table)` pair with no bare-name fallback -- so a manifest built from schemas
+    that do not match what got seeded would match nothing, and the test would pass while
+    proving nothing. This manifest declares `public.orders` instead, which conftest.py's
+    `seeded` fixture actually creates.
+
+    Non-vacuity guard first: the *un-enriched* run must really emit `CREATE INDEX` for
+    `public.orders` (ADV001, on the hot `status` predicate -- see conftest.py's seeded
+    workload). Without this half, the enriched assertion below would pass just as well if
+    the workload simply produced no proposal for that relation at all.
+    """
+    dsn, _schema = seeded
+
+    bare = _run_advise(seeded, schemas=("public", "staging"))
+    bare_orders = _adv001_for(bare, schema="public", table="orders")
+    assert bare_orders is not None, (
+        f"no un-enriched ADV001 for public.orders; got "
+        f"{[(p['code'], p['evidence'].get('schema'), p['evidence'].get('table')) for p in bare['proposals']]}"
+    )
+    assert bare_orders["ddl"] is not None
+    assert bare_orders["ddl"].upper().lstrip().startswith("CREATE INDEX"), bare_orders
+    assert "dbt_index_config" not in bare_orders["evidence"], bare_orders
+
+    manifest = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+            "adapter_type": "postgres",
+        },
+        "nodes": {
+            "model.live_it.orders": {
+                "unique_id": "model.live_it.orders",
+                "name": "orders",
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "compiled_code": "select * from {{ source('raw', 'orders') }}",
+                # The database part ("analytics") is deliberately NOT what conftest.py's
+                # `seeded` fixture actually connects to -- parse_relation_name drops it,
+                # since `advise` connects to one database at a time. Only the
+                # (schema, table) pair below has to match what got seeded.
+                "relation_name": '"analytics"."public"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            }
+        },
+        "sources": {},
+        "parent_map": {"model.live_it.orders": []},
+        "child_map": {"model.live_it.orders": []},
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            dsn,
+            "--schema",
+            "public",
+            "--schema",
+            "staging",
+            "--json",
+            "--min-cost-share",
+            "0.0",
+            "--manifest",
+            str(manifest_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["dbt"]["models"] == 1, payload.get("dbt")
+    assert payload["dbt"]["dropped_collisions"] == 0, payload.get("dbt")
+
+    enriched = _adv001_for(payload, schema="public", table="orders")
+    assert enriched is not None, "the dbt-managed public.orders proposal disappeared entirely"
+    assert not (enriched["ddl"] or "").upper().lstrip().startswith("CREATE INDEX"), enriched
+    assert enriched["evidence"]["dbt_model"] == "model.live_it.orders"
+    assert enriched["evidence"]["dbt_materialized"] == "table"
+
+    # This live workload really does produce more than one index proposal for `public.orders`
+    # -- a hot predicate and a hot join key -- which is the ordinary case, not an edge one.
+    # dbt reads one `indexes` key per model config, so the whole run must contain exactly one
+    # `indexes:` block for the model: two standalone blocks pasted into one config are a
+    # duplicate YAML mapping key, and PyYAML (dbt's own parser) silently keeps just one of
+    # them, discarding the other recommended index with no error at all.
+    for_model = [
+        p for p in payload["proposals"] if p["evidence"].get("dbt_model") == "model.live_it.orders"
+    ]
+    assert len(for_model) >= 2, (
+        "this test's whole point is multiple proposals for one dbt model; got "
+        f"{[(p['code'], p['title']) for p in for_model]}"
+    )
+    owners = [p for p in for_model if p["evidence"].get("dbt_index_config") is True]
+    assert len(owners) == 1, [p["code"] for p in owners]
+    blocks = [
+        line
+        for p in for_model
+        for line in (p["ddl"] or "").splitlines()
+        if line.removeprefix("--").strip() == "indexes:"
+    ]
+    assert len(blocks) == 1, f"one model, one `indexes:` block, got {len(blocks)}"
+
+    [owner] = owners
+    assert "indexes:" in owner["ddl"], owner
+    assert "model.live_it.orders" in owner["ddl"], "the block names the model to paste it into"
+    # Every index recommended for the model is inside that one block, this ADV001's included.
+    columns = [p["evidence"]["columns"] for p in for_model if p["evidence"].get("columns")]
+    assert columns, for_model
+    for column_list in columns:
+        assert str(list(column_list)) in owner["ddl"], (column_list, owner["ddl"])
+    for other in for_model:
+        if other is owner:
+            continue
+        assert other["evidence"]["dbt_index_config_reported_with"] == owner["code"]
+        assert "already included in the single dbt config block" in other["ddl"]
