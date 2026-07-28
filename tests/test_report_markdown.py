@@ -143,10 +143,13 @@ def test_payload_is_json_serializable():
     json.dumps(_payload())
 
 
-def test_payload_dbt_key_defaults_to_none():
-    """Every existing caller omits `dbt`; the key must still appear, set to `None`, so a
-    consumer can rely on it being present rather than having to guard a missing key."""
-    assert _payload()["dbt"] is None
+def test_payload_omits_the_dbt_key_when_absent():
+    """Every existing caller omits `dbt`; the key must not appear at all — not even set to
+    `None` — so a no-manifest payload stays byte-identical to what callers got before this
+    key existed, rather than merely equal apart from one known extra key. A consumer that
+    wants the value unconditionally can still do `payload.get("dbt")`, which behaves the
+    same either way."""
+    assert "dbt" not in _payload()
 
 
 def test_payload_carries_the_dbt_disclosure_when_given():
