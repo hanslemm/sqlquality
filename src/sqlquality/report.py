@@ -143,12 +143,22 @@ def advise_payload(
     engine: str,
     redacted: bool,
     degraded: list[tuple[str, str]],
+    dbt: dict | None = None,
 ) -> dict:
-    """JSON-serializable summary of an advise run."""
+    """JSON-serializable summary of an advise run.
+
+    `dbt` is `None` when no manifest loaded — the dbt-free path is first-class, and every
+    existing caller of this function omits the argument, so the default must reproduce
+    exactly what they got before this key existed. When a manifest did load, the caller
+    (`cli.advise`) is responsible for handing in a plain, JSON-serializable dict (a
+    `Relation` or a dataclass is not), since this function does not itself normalize it the
+    way `_jsonable` normalizes proposal evidence.
+    """
     return {
         "engine": engine,
         "redacted": redacted,
         "window": workload.window_description,
+        "dbt": dbt,
         "analyzed": {
             # The count of groups whose usage was actually extracted — not `len(stats)`,
             # which includes the unresolvable and ambiguous groups reported under "skipped"
@@ -199,8 +209,14 @@ def render_advise_markdown(
     engine: str,
     redacted: bool,
     degraded: list[tuple[str, str]],
+    dbt: dict | None = None,
 ) -> str:
-    """Render advise proposals as markdown (suitable for a ticket or PR comment)."""
+    """Render advise proposals as markdown (suitable for a ticket or PR comment).
+
+    `dbt` defaults to `None` — every existing caller omits it — so a no-manifest run
+    renders exactly the markdown it always has; the section below only appears when a
+    manifest actually loaded.
+    """
     lines = [
         f"# sqlquality advise — {_md_escape(engine)}",
         "",
@@ -233,6 +249,15 @@ def render_advise_markdown(
         lines.append("")
         for capability, reason in degraded:
             lines.append(f"- `{_md_escape(capability)}`: {_md_escape(reason)}")
+        lines.append("")
+
+    if dbt is not None:
+        lines.append("## dbt enrichment")
+        lines.append("")
+        lines.append(f"- manifest: `{_md_escape(dbt['manifest'])}`")
+        lines.append(f"- models indexed: {dbt['models']}")
+        if dbt.get("dropped_collisions"):
+            lines.append(f"- cross-database collisions dropped: {dbt['dropped_collisions']}")
         lines.append("")
 
     if not proposals:
