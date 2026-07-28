@@ -807,3 +807,33 @@ def test_adv303_orders_proposals_canonically_by_relation():
     context = DbtContext.from_project(DbtProject.from_manifest(manifest))
     proposals = propose_unused_models(_aggregation(_unrelated_usage()), context, _workload())
     assert [p.evidence["table"] for p in proposals] == ["aaa_relation", "zzz_relation"]
+
+
+def test_adv301_orders_proposals_canonically_by_relation():
+    """Same canonical-order requirement as ADV303, pinned independently for
+    `propose_materialization`: without its own `sorted(by_relation)`, output would follow
+    the order usages were supplied in, not relation order."""
+    manifest = {
+        "nodes": {
+            "model.demo.z_model": {
+                "resource_type": "model",
+                "config": {"materialized": "view"},
+                "relation_name": '"dev"."main"."z_model"',
+            },
+            "model.demo.a_model": {
+                "resource_type": "model",
+                "config": {"materialized": "view"},
+                "relation_name": '"dev"."main"."a_model"',
+            },
+        },
+    }
+    context = DbtContext.from_project(DbtProject.from_manifest(manifest))
+    proposals = propose_materialization(
+        _aggregation(
+            _usage(Relation("main", "z_model"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+            _usage(Relation("main", "a_model"), "status", ColumnRole.EQUALITY, cost_share=0.5),
+        ),
+        context,
+        min_cost_share=0.01,
+    )
+    assert [p.evidence["table"] for p in proposals] == ["a_model", "z_model"]
