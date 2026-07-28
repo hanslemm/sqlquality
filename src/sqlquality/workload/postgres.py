@@ -1218,6 +1218,25 @@ def _comment_lines(text: str) -> list[str]:
     return [f"-- {line}" for line in text.splitlines()]
 
 
+def _is_fully_commented(ddl: str) -> bool:
+    """True when every physical line of `ddl` already begins with `--`.
+
+    `render_ddl`'s line-break guard exists to catch an *identifier* whose embedded newline
+    would otherwise leave part of a raw statement looking like a bare, executable line. A
+    `ddl` value that is already a `--`-commented disclosure on every line — for instance, a
+    config-block proposal something upstream of this adapter generated instead of raw
+    DDL — is categorically not that hazard: it is already inert on every line, so it can be
+    emitted verbatim (with the usual code/confidence header) rather than routed through the
+    NOT-RENDERED fallback, which would double-comment every line and print a reason ("an
+    identifier contains a line break") that is simply false for this kind of proposal. This
+    check is about the *shape* of the text alone, so it names nothing about dbt or any
+    other specific caller — any adapter-agnostic multi-line, pre-commented `ddl` gets the
+    same treatment.
+    """
+    lines = ddl.splitlines()
+    return bool(lines) and all(line.startswith("--") for line in lines)
+
+
 class PostgresWorkloadAdapter(WorkloadAdapter):
     engine = "postgres"
 
@@ -1587,9 +1606,6 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 )
             )
         return {relation: tuple(indexes) for relation, indexes in result.items()}
-
-    #: Highest confidence first, then largest cost share — the reading order a human wants.
-    _CONFIDENCE_ORDER = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
 
     #: Which rule's rationale to keep when two rules propose byte-identical DDL at equal
     #: confidence. Lower wins. The order is by how directly the evidence supports *this*
@@ -1970,24 +1986,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         proposals = self._dedupe_by_ddl(proposals)
         proposals = self._collapse_index_prefixes(proposals)
         proposals = self._disclose_column_set_overlaps(proposals)
-        return sorted(proposals, key=self._ranking_key)
-
-    @classmethod
-    def _ranking_key(cls, proposal: Proposal) -> tuple[int, float, str, str]:
-        """Highest confidence first, then largest cost share — the reading order a human
-        wants — with a canonical tiebreak so equal-confidence equal-cost proposals do not
-        reorder between runs and make the CLI's tests flaky.
-
-        `cost_share_of` rather than `float(evidence.get(...))`: bool is an int subclass, so
-        a stray True became -1.0 and sorted a fabricated share ahead of a genuinely hot
-        proposal, at the top of the list the CLI presents as "read this first".
-        """
-        return (
-            cls._CONFIDENCE_ORDER[proposal.confidence],
-            -(cost_share_of(proposal.evidence) or 0.0),
-            proposal.code,
-            proposal.title,
-        )
+        return sorted(proposals, key=self.ranking_key)
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
         """A commented, reviewable script. sqlquality never executes this."""
@@ -2006,7 +2005,9 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         for proposal in proposals:
             if not proposal.ddl:
                 continue
-            if "\n" in proposal.ddl or "\r" in proposal.ddl:
+            if ("\n" in proposal.ddl or "\r" in proposal.ddl) and not _is_fully_commented(
+                proposal.ddl
+            ):
                 # An identifier containing a line break cannot be emitted as a single-line
                 # statement. Quoting already makes it *semantically* safe — psql parses the
                 # whole thing as one quoted identifier, so nothing extra executes — but the
@@ -2015,9 +2016,16 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 # instead would emit DDL targeting an object that does not exist. So it is
                 # commented out in full with the reason, rather than rendered wrong or
                 # silently dropped.
+                #
+                # This is skipped when `_is_fully_commented` already holds: a `ddl` that is
+                # every-line-`--`-commented is not an identifier smuggling a line break, it
+                # is an intentional multi-line disclosure, and running it through this
+                # fallback would double-comment it and print a reason that is false for it.
                 body.append("-- NOT RENDERED: an identifier in this proposal contains a line")
                 body.append("-- break, so it cannot be emitted as a single-line statement.")
                 body.append("-- Verify the name and apply this by hand:")
+                if proposal.note:
+                    body.extend(_comment_lines(proposal.note))
                 body.extend(_comment_lines(proposal.ddl))
                 body.append("")
                 continue
@@ -2025,6 +2033,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             share_text = f", {share:.1%} of workload cost" if share is not None else ""
             body.append(f"-- {proposal.code} [{proposal.confidence.value}{share_text}]")
             body.extend(_comment_lines(proposal.title))
+            # `note` before the statement, not after: this script's whole purpose is to be
+            # read top-to-bottom before anything is run, and `rationale` — where every other
+            # caveat lives — never reaches this file at all. A caveat printed below the
+            # statement it qualifies is a caveat an operator reads after pasting it.
+            if proposal.note:
+                body.extend(_comment_lines(proposal.note))
             body.append(proposal.ddl)
             body.append("")
         if not body:

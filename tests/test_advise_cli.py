@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from sqlquality.cli import (
     _validate_schemas,
     app,
 )
-from sqlquality.models import Aggregation, QueryStat, Relation, Workload
+from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
 from sqlquality.report import advise_payload
 
 runner = CliRunner()
@@ -511,6 +512,302 @@ def test_empty_workload_exits_0(monkeypatch):
     assert json.loads(result.stdout)["proposals"] == []
 
 
+DBT_FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
+
+
+def test_project_dir_loads_a_manifest_and_discloses_only_on_stderr(monkeypatch, tmp_path):
+    """--project-dir must actually reach `load_dbt_context` — replacing `target/manifest.json`
+    with garbage used to leave every test in this module green, because nothing exercised the
+    option at all. The disclosure it produces must land on stderr: stdout has to stay valid
+    JSON under --json, since that is what a later task diffs byte-for-byte against `main`.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(DBT_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--project-dir", str(tmp_path), "--json"],
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment" in result.stderr
+    assert "dbt enrichment" not in result.stdout
+    payload = json.loads(result.stdout)  # stdout must still be pure, parseable JSON
+    assert payload["proposals"] == []
+    # The payload's manifest path must resolve via --project-dir/target/manifest.json —
+    # the same precedence load_dbt_context itself used to load this file.
+    assert payload["dbt"]["manifest"] == str(target / "manifest.json")
+    assert payload["dbt"]["models"] == 3
+
+
+def test_project_dir_with_a_broken_manifest_does_not_abort_the_run(monkeypatch, tmp_path):
+    """A garbage `target/manifest.json` must degrade to 'no enrichment', not crash a run
+    that already did the whole catalog analysis."""
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--project-dir", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment unavailable" in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_manifest_option_loads_and_discloses_the_source(monkeypatch):
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE)]
+    )
+    assert result.exit_code == 0
+    assert str(DBT_FIXTURE) in result.stderr
+
+
+def test_no_dbt_option_means_no_disclosure_anywhere(monkeypatch):
+    """The no-manifest path is every existing `advise` invocation. A later task proves
+    byte-identical output against `main` by diffing artifacts, so nothing dbt-shaped may
+    appear anywhere in the output without either --project-dir or --manifest.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0
+    assert "dbt enrichment" not in result.output
+
+
+def test_no_manifest_means_no_behaviour_change(monkeypatch):
+    """The dbt-free path is first-class, so enrichment must be additive by construction.
+
+    This is a unit-level pin of the same constraint the task proves by diffing a whole run's
+    artifacts against `main`: with neither `--project-dir` nor `--manifest`, no proposal may
+    carry dbt evidence and the payload must carry no `"dbt"` key at all — not even one set
+    to `None` — so the payload stays byte-identical to what `main` produced before this key
+    existed, rather than merely equal apart from one known extra key.
+    """
+    _stub_adapter(
+        monkeypatch,
+        {
+            "pg_stat_statements": [
+                ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+            "information_schema.columns": WIDE_COLUMNS,
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
+            "pg_index": [],
+        },
+    )
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    assert result.exit_code == 0
+    assert "dbt" not in result.stderr.lower()
+    payload = json.loads(result.stdout)
+    assert payload["proposals"], "the scenario must produce at least one proposal to test"
+    for proposal in payload["proposals"]:
+        assert "dbt_model" not in proposal["evidence"]
+    assert "dbt" not in payload
+
+
+def test_an_unreadable_manifest_via_the_flag_does_not_fail_the_run(monkeypatch, tmp_path):
+    """Exit 0 with a disclosure — the catalog work already happened, and dbt is optional.
+
+    Distinct from `test_project_dir_with_a_broken_manifest_does_not_abort_the_run`: that one
+    exercises a malformed *file* reached via `--project-dir`; this one exercises `--manifest`
+    naming a path that does not exist at all.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    missing = tmp_path / "no.json"
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(missing), "--json"]
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment unavailable" in result.stderr
+    payload = json.loads(result.stdout)
+    assert "dbt" not in payload
+
+
+def test_the_payload_records_which_manifest_was_used(monkeypatch):
+    """The mirror image of `test_no_manifest_means_no_behaviour_change`: with a manifest,
+    the `"dbt"` key must be present (not merely non-`None` — `"dbt" in payload` is the
+    actual claim, since the no-manifest test now pins its *absence*) and carry the
+    manifest path, model count and collision count."""
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "dbt" in payload
+    assert payload["dbt"]["manifest"] == str(DBT_FIXTURE)
+    # The fixture carries exactly 3 models: stg_orders, orders, customer_orders.
+    assert payload["dbt"]["models"] == 3
+    assert payload["dbt"]["dropped_collisions"] == 0
+
+
+def test_the_json_payload_is_serializable_with_a_manifest_loaded(monkeypatch):
+    """`--manifest` is parsed by typer as a `Path`, and `json.dumps` cannot encode one.
+
+    If `cli.advise` ever handed a raw `Path` into `dbt_payload["manifest"]` instead of
+    `str(resolved_manifest)`, `json.dumps(payload, ...)` would raise `TypeError` — *after*
+    the whole catalog analysis had already run, the same late-failure shape the write-
+    failure handlers elsewhere in this module exist to avoid. Asserting `isinstance(...,
+    str)` pins the actual hazard directly, rather than only failing coincidentally were a
+    future encoder ever more lenient than the stdlib's about non-`str` dict values.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    assert "Traceback" not in result.output
+    payload = json.loads(result.stdout)
+    assert isinstance(payload["dbt"]["manifest"], str)
+    json.dumps(payload)  # must not raise
+
+
+def test_the_payload_reports_a_nonzero_dropped_collision_count(monkeypatch, tmp_path):
+    """`dropped_collisions` must reflect `DbtContext.dropped_collisions`, not a hardcoded 0.
+
+    Two models here build the same `(schema, table)` in two different databases — the
+    cross-database collision `DbtContext.from_project` refuses to guess at (see
+    workload/dbt.py). Task 1 counts it precisely so a user can learn a relation was
+    silently dropped from the index; this pins that the count actually reaches the CLI
+    payload rather than a value that happens to already be right for the shared fixture,
+    which has zero collisions and so cannot catch a hardcoded 0.
+    """
+    manifest = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+            "adapter_type": "postgres",
+        },
+        "nodes": {
+            "model.demo.a": {
+                "unique_id": "model.demo.a",
+                "name": "a",
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "compiled_code": "select 1",
+                "relation_name": '"prod"."main"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            },
+            "model.demo.b": {
+                "unique_id": "model.demo.b",
+                "name": "b",
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "compiled_code": "select 1",
+                "relation_name": '"stage"."main"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            },
+        },
+        "sources": {},
+        "parent_map": {"model.demo.a": [], "model.demo.b": []},
+        "child_map": {"model.demo.a": [], "model.demo.b": []},
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(manifest_path), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["dbt"]["dropped_collisions"] == 1
+    assert payload["dbt"]["models"] == 0
+
+
+def test_adv301_and_adv303_only_appear_with_a_manifest(monkeypatch):
+    """ADV301/ADV303 need the model graph a manifest carries, so neither may appear without
+    one — and at least one must appear with the fixture manifest, or this test proves
+    nothing about the wiring at all.
+
+    `customer_orders` in the fixture manifest has no declared consumer, so
+    `propose_unused_models` (ADV303) flags it as soon as the workload has *any* usage at
+    all — regardless of which schema that usage is in, since the negative check is simply
+    "not in aggregation.tables". The workload below queries `public.orders`, wholly
+    unrelated to the fixture's `main` schema, so ADV303 firing here is attributable only to
+    the manifest being loaded, not to any accidental overlap with the query below.
+    """
+    rows = {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1", 5, 100.0, 5),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": [
+            ("public", "orders", "id", "integer"),
+            ("public", "orders", "status", "text"),
+        ],
+        "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+        "pg_stats": [("public", "orders", "status", 5000.0)],
+        "pg_index": [],
+    }
+    _stub_adapter(monkeypatch, rows)
+    without = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    _stub_adapter(monkeypatch, rows)
+    with_dbt = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert without.exit_code == 0
+    assert with_dbt.exit_code == 0
+    without_codes = {p["code"] for p in json.loads(without.stdout)["proposals"]}
+    with_codes = {p["code"] for p in json.loads(with_dbt.stdout)["proposals"]}
+    assert not ({"ADV301", "ADV303"} & without_codes), without_codes
+    assert {"ADV301", "ADV303"} & with_codes, with_codes
+
+
+def test_enrichment_output_is_resorted_by_the_adapters_ranking_key(monkeypatch):
+    """After enriching and extending with ADV301/ADV303, the combined list must be re-sorted
+    by `PostgresWorkloadAdapter._ranking_key`, not left in call order — otherwise the
+    terminal table, the markdown and the DDL file could each disagree on the order.
+
+    The base adapter is stubbed to return one LOW-confidence proposal; `propose_materialization`
+    is stubbed to contribute one HIGH-confidence proposal. Concatenation in call order would
+    put the LOW proposal first; the ranking key puts HIGH first. Only a real re-sort produces
+    the HIGH-first order asserted below.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+
+    low = Proposal(
+        code="ADV999",
+        title="low one",
+        rationale="r",
+        evidence={},
+        confidence=Confidence.LOW,
+        ddl=None,
+    )
+    high = Proposal(
+        code="ADV001",
+        title="high one",
+        rationale="r",
+        evidence={},
+        confidence=Confidence.HIGH,
+        ddl=None,
+    )
+
+    monkeypatch.setattr(
+        "sqlquality.workload.postgres.PostgresWorkloadAdapter.propose",
+        lambda self, *a, **k: [low],
+    )
+    monkeypatch.setattr("sqlquality.cli.enrich_proposals", lambda proposals, context: proposals)
+    monkeypatch.setattr("sqlquality.cli.propose_materialization", lambda *a, **k: [high])
+    monkeypatch.setattr("sqlquality.cli.propose_unused_models", lambda *a, **k: [])
+
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    codes = [p["code"] for p in payload["proposals"]]
+    assert codes == ["ADV001", "ADV999"], codes
+
+
 def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):
     _stub_adapter(
         monkeypatch,
@@ -659,3 +956,503 @@ def test_coverage_warning_is_silent_exactly_at_the_threshold():
         _workload_with(stats=80, unparseable=19, noise=0), _aggregation_with()
     )
     assert below is None, "the warning fired below the threshold"
+
+
+#: A workload whose hot predicate and hot join key both land on `public.orders`, plus a join
+#: key on an unrelated `public.payments`. Two survivors on one relation is the *normal* shape
+#: — the adapter's collapse layer never folds non-prefix column lists — and `payments` is the
+#: control: nothing dbt-managed, so nothing about it may change.
+TWO_INDEXES_ON_ORDERS_ROWS = {
+    "pg_stat_statements": [
+        ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+        (
+            "select o.id from orders o join payments p on p.customer_id = o.customer_id",
+            80,
+            4000.0,
+            8,
+        ),
+    ],
+    "pg_stat_database": [("2026-07-01",)],
+    "information_schema.columns": [
+        ("public", "orders", "id", "integer"),
+        ("public", "orders", "status", "text"),
+        ("public", "orders", "created_at", "timestamp"),
+        ("public", "orders", "customer_id", "integer"),
+        ("public", "payments", "id", "integer"),
+        ("public", "payments", "customer_id", "integer"),
+    ],
+    "pg_total_relation_size": [
+        ("public", "orders", 5_000_000, 10**8),
+        ("public", "payments", 5_000_000, 10**8),
+    ],
+    "pg_stats": [
+        ("public", "orders", "status", 5000.0),
+        ("public", "orders", "customer_id", 5000.0),
+    ],
+    #: An index on the dbt-managed relation that the workload never scans, so ADV002 fires
+    #: through the real rules and the run contains a genuine `DROP INDEX` for a dbt model.
+    "pg_index": [
+        (
+            "public",
+            "orders",
+            "idx_orders_cold",
+            "id",
+            1,
+            False,  # unique
+            False,  # primary
+            0,  # scans
+            8192,
+            False,  # partial
+            None,  # predicate
+            False,  # expressions
+            "CREATE INDEX idx_orders_cold ON public.orders USING btree (id)",
+        )
+    ],
+}
+
+
+def _orders_manifest(tmp_path, materialized="table"):
+    """A manifest declaring `public.orders` — the schema the stubbed workload really uses.
+
+    `tests/fixtures/manifest_v12.json` cannot serve here: its `relation_name`s are all schema
+    `main`, matching is on the qualified `(schema, table)` pair with no bare-name fallback, so
+    a fixture built from a schema the workload never touches would match nothing and every
+    assertion below would pass while proving nothing. The database part is deliberately not
+    the connected one — `parse_relation_name` drops it.
+    """
+    manifest = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+            "adapter_type": "postgres",
+        },
+        "nodes": {
+            "model.demo.orders": {
+                "unique_id": "model.demo.orders",
+                "name": "orders",
+                "resource_type": "model",
+                "config": {"materialized": materialized},
+                "compiled_code": "select 1",
+                "relation_name": '"analytics"."public"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            }
+        },
+        "sources": {},
+        "parent_map": {"model.demo.orders": []},
+        "child_map": {"model.demo.orders": []},
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
+def test_adv302_rewrites_an_index_proposal_into_dbt_config_through_the_cli(monkeypatch, tmp_path):
+    """ADV302's entire CLI wiring, pinned in the suite CI actually runs.
+
+    Nothing in the default suite pinned that `advise` calls `enrich_proposals` at all:
+    replacing that one line with `pass` — which disables the branch's headline feature
+    completely — left all 665 tests passing. The only guard was
+    `tests/integration/test_advise_live.py`, and `pyproject.toml` sets
+    `addopts = "-m 'not integration'"` while `ci.yml` provisions no Postgres, so CI never runs
+    it: ADV302 could have been deleted from the CLI with every check green. This is the third
+    instance of that defect class on this branch, so it is pinned here — no Docker, no extras,
+    no live database, because the `no-extras` CI job depends on that.
+    """
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path)),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    proposals = json.loads(result.stdout)["proposals"]
+    orders = [p for p in proposals if p["evidence"].get("table") == "orders"]
+    assert orders, f"the scenario must produce a proposal for public.orders: {proposals}"
+    rewritten = [p for p in orders if p["evidence"].get("dbt_index_config") is True]
+    assert rewritten, f"no index proposal was expressed as dbt config: {orders}"
+    for proposal in orders:
+        assert not (proposal["ddl"] or "").upper().lstrip().startswith("CREATE INDEX"), proposal
+        assert proposal["evidence"]["dbt_model"] == "model.demo.orders"
+    for proposal in rewritten:
+        assert "ADV302" in proposal["ddl"], proposal
+    # The control: `payments` is not dbt-managed, so its proposal must be untouched.
+    [payments] = [p for p in proposals if p["evidence"].get("table") == "payments"]
+    assert payments["ddl"] == 'CREATE INDEX ON "public"."payments" ("customer_id");'
+    assert "dbt_model" not in payments["evidence"]
+
+
+def test_two_index_proposals_for_one_dbt_model_yield_one_config_block_through_the_cli(
+    monkeypatch, tmp_path
+):
+    """The end-to-end form of the duplicate-YAML-key data loss.
+
+    Two ordinary proposals on one dbt-managed relation each emitted a complete, standalone
+    `indexes:` block. Pasted under one model's `config:` that is a duplicate mapping key, and
+    PyYAML — dbt's own parser — silently keeps the last: the other recommended index is
+    discarded with no error. Asserted on the `--ddl` artifact because that is the file a human
+    copies from.
+    """
+    import yaml
+
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    ddl_path = tmp_path / "out.sql"
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path)),
+            "--ddl",
+            str(ddl_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    script = ddl_path.read_text(encoding="utf-8")
+    lines = [ln.removeprefix("--").strip() for ln in script.splitlines()]
+    assert lines.count("indexes:") == 1, f"one model, one `indexes:` block:\n{script}"
+
+    # Un-comment from the `indexes:` line to the end of that comment run — exactly the region
+    # a human copies into a model config — keeping the original indentation, which is what
+    # makes it YAML at all.
+    body_lines: list[str] = []
+    started = False
+    for raw in script.splitlines():
+        if not raw.startswith("--"):
+            if started:
+                break
+            continue
+        content = raw[3:] if raw.startswith("-- ") else raw[2:]
+        if content.strip() == "indexes:":
+            started = True
+        if started:
+            body_lines.append(content)
+    body = "\n".join(body_lines)
+    parsed = yaml.safe_load(body)
+    assert [entry["columns"] for entry in parsed["indexes"]] == [
+        ["status", "created_at"],
+        ["customer_id"],
+    ], f"both recommended indexes must survive in the one block:\n{body}"
+
+
+def _warned_statements(script: str) -> dict[str, bool]:
+    """`{statement: whether its block carries a dbt warning}` for every statement in a script.
+
+    Keyed by the statement itself rather than by the relation named in it, because the two are
+    not the same thing: `DROP INDEX "public"."idx_orders_cold";` names an index, so filtering
+    blocks on the *table* name skipped every drop — which is how a bare `DROP INDEX` for a
+    dbt-managed relation sat in the same file that declared that relation dbt-managed.
+    """
+    result: dict[str, bool] = {}
+    for block in script.split("\n\n"):
+        lines = block.splitlines()
+        statements = [ln for ln in lines if ln.strip() and not ln.startswith("--")]
+        if not statements:
+            continue
+        warned = any("dbt WARNING" in ln for ln in lines)
+        for statement in statements:
+            result[statement] = warned
+    return result
+
+
+def test_the_ddl_file_warns_beside_every_statement_it_keeps_for_a_dbt_relation(
+    monkeypatch, tmp_path
+):
+    """The constraint: the `--ddl` file must never carry an executable statement for a
+    dbt-managed relation without an adjacent comment saying dbt will destroy it.
+
+    `render_ddl` emits only the code/confidence header, the title and the DDL — `rationale`,
+    where every ADV302 disclosure used to live, never reaches this file. So one file held a
+    config block explaining that raw DDL is destroyed by `dbt run` and, below it, a bare
+    `CREATE INDEX` on that same dbt-managed table. Here the manifest declares an
+    *unrecognised* materialization, which is a real end-to-end decline path: the DDL is
+    deliberately kept, so the warning has to be in the file.
+    """
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    ddl_path = tmp_path / "out.sql"
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path, materialized="exotic")),
+            "--json",
+            "--ddl",
+            str(ddl_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    script = ddl_path.read_text(encoding="utf-8")
+    payload = json.loads(result.stdout)
+
+    # Matched by statement text against the payload, deliberately **not** by looking for the
+    # relation's name in the DDL: `DROP INDEX "public"."idx_orders_cold";` names the *index*,
+    # so a `'"public"."orders"' in block` filter silently skipped every drop — the exact shape
+    # of statement that turned out to be missing its warning.
+    warned = _warned_statements(script)
+    dbt_statements = {
+        p["ddl"] for p in payload["proposals"] if "dbt_model" in p["evidence"] and p["ddl"]
+    }
+    plain_statements = {
+        p["ddl"] for p in payload["proposals"] if "dbt_model" not in p["evidence"] and p["ddl"]
+    }
+    assert dbt_statements, f"the scenario must keep executable DDL for a dbt model:\n{script}"
+    assert plain_statements, "and at least one statement for a relation dbt does not manage"
+    assert any(s.upper().startswith("CREATE INDEX") for s in dbt_statements), dbt_statements
+    assert any(s.upper().startswith("DROP INDEX") for s in dbt_statements), (
+        f"ADV002 must fire for the dbt-managed relation: {dbt_statements}"
+    )
+    for statement in dbt_statements:
+        assert warned.get(statement) is True, f"no dbt warning beside: {statement}\n{script}"
+    # Discriminating in the other direction: a renderer that warned on everything would
+    # satisfy the loop above and mean nothing.
+    for statement in plain_statements:
+        assert warned.get(statement) is False, f"spurious dbt warning beside: {statement}"
+
+
+def test_the_ddl_file_carries_a_warning_on_every_adv302_decline_shape(monkeypatch, tmp_path):
+    """The same constraint over all four decline paths at once, including the two no live
+    workload reaches (a proposal with no plain column list, and a non-btree access method).
+
+    `propose` is stubbed here precisely because the point is coverage of the *shapes* ADV302
+    declines on rather than of the rules that produce them: `_is_index_creating` matches by
+    DDL prefix specifically so future rules are covered without being enumerated, so these
+    paths must hold for a proposal shape, not for today's four rule codes.
+    """
+    from sqlquality.workload.postgres import PostgresWorkloadAdapter
+
+    def _p(code, ddl, extra=None):
+        evidence = {
+            "schema": "public",
+            "table": "orders",
+            "columns": ("status",),
+            "cost_share": 0.5,
+        }
+        evidence.update(extra or {})
+        return Proposal(
+            code=code,
+            title=f"{code} on public.orders",
+            rationale="r.",
+            evidence=evidence,
+            confidence=Confidence.HIGH,
+            ddl=ddl,
+        )
+
+    no_columns = _p("ADV008", 'CREATE INDEX ON "public"."orders" (lower("email"));')
+    no_columns = dataclasses.replace(
+        no_columns, evidence={k: v for k, v in no_columns.evidence.items() if k != "columns"}
+    )
+    stubbed = [
+        _p(
+            "ADV004",
+            'CREATE INDEX ON "public"."orders" ("region") WHERE "deleted" IS NULL;',
+            {"guard_column": "deleted", "guard_predicate": "IS NULL"},
+        ),
+        no_columns,
+        _p("ADV009", 'CREATE INDEX ON "public"."orders" USING gin ("payload");'),
+        _p("ADV001", 'CREATE INDEX ON "public"."orders" ("status");'),
+    ]
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    monkeypatch.setattr(PostgresWorkloadAdapter, "propose", lambda self, *a, **k: list(stubbed))
+
+    ddl_path = tmp_path / "out.sql"
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path)),
+            "--ddl",
+            str(ddl_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    script = ddl_path.read_text(encoding="utf-8")
+
+    warned = _warned_statements(script)
+    assert len(warned) == 3, f"three declines keep their DDL; ADV001 becomes config:\n{script}"
+    for statement, has_warning in warned.items():
+        assert has_warning, f"no dbt warning beside: {statement}\n{script}"
+    assert "ADV004" in script and "ADV009" in script and "ADV008" in script
+    # And the one that *was* rewritten carries no bare statement at all.
+    assert "-- ADV001 [high" in script
+    assert "  indexes:" in script.replace("--", "")
+
+
+def test_the_terminal_says_adv302_fired(monkeypatch, tmp_path):
+    """ADV302 is never a proposal `code`, so an enriched row in the terminal table is
+    byte-identical to the same proposal from a dbt-free run — same code, confidence, cost
+    share and title — and the terminal never prints `rationale`. Without a line of its own a
+    terminal user cannot tell enrichment happened at all.
+
+    On stderr, like every other disclosure this command makes, so stdout stays pure JSON.
+    """
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path)),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "ADV302" in result.stderr
+    assert "ADV302" not in result.stdout.split('"proposals"')[0]
+    json.loads(result.stdout)  # stdout is still pure JSON
+
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    without = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    assert "ADV302" not in without.stderr, "no manifest, no rewrite, no line"
+
+
+def test_an_explicit_manifest_wins_over_project_dir_in_both_the_load_and_the_payload(
+    monkeypatch, tmp_path
+):
+    """The precedence existed twice — in `load_dbt_context` and in the CLI's payload builder —
+    and swapping it in *either* copy alone left the whole suite green, because no test passed
+    both flags. The payload could therefore name a manifest that was never read.
+
+    Both manifests are valid and differ in model count, so the payload's `models` proves which
+    file was actually loaded rather than merely which path was formatted into a string.
+    """
+    project_dir = tmp_path / "proj"
+    (project_dir / "target").mkdir(parents=True)
+    (project_dir / "target" / "manifest.json").write_text(
+        DBT_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
+    )  # 3 models
+    explicit = _orders_manifest(tmp_path)  # 1 model
+
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--project-dir",
+            str(project_dir),
+            "--manifest",
+            str(explicit),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["dbt"]["manifest"] == str(explicit)
+    assert payload["dbt"]["models"] == 1, "the *explicit* manifest is the one that was read"
+    assert str(explicit) in result.stderr
+
+
+def test_the_resort_uses_the_resolved_adapters_ranking_key(monkeypatch, tmp_path):
+    """The re-sort after enrichment must go through the adapter it resolved.
+
+    It reached `PostgresWorkloadAdapter._ranking_key` — a private classmethod of one specific
+    adapter, from the engine-agnostic CLI — while the resolved adapter instance was in scope,
+    so a future engine would silently have got Postgres's ordering on the dbt path only.
+    Overriding the public hook must change the order the CLI emits.
+    """
+    from sqlquality.workload.postgres import PostgresWorkloadAdapter
+
+    class _TitleRankingAdapter(PostgresWorkloadAdapter):
+        """Stands in for a second engine: same rules, its own reading order."""
+
+        @classmethod
+        def ranking_key(cls, proposal):
+            return (proposal.title, proposal.code)
+
+    # A *subclass*, resolved the way the CLI resolves any adapter. Patching
+    # `PostgresWorkloadAdapter.ranking_key` itself could not discriminate: the un-fixed code
+    # named that same class, so the override would have been picked up either way.
+    monkeypatch.setattr(
+        "sqlquality.cli.get_workload_adapter", lambda engine: _TitleRankingAdapter()
+    )
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--manifest",
+            str(_orders_manifest(tmp_path)),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    titles = [p["title"] for p in json.loads(result.stdout)["proposals"]]
+    assert titles == sorted(titles), f"the overridden ranking key must be the one used: {titles}"
+
+
+def test_the_no_manifest_run_contains_no_dbt_conditional_element_anywhere(monkeypatch, tmp_path):
+    """A regression guard for the branch's headline compatibility claim.
+
+    "The no-manifest path is byte-identical to `main`" was established by a one-off manual
+    diff of all four artifacts; nothing in the suite performed it, so the claim was
+    unprotected. A diff against another commit is not something a unit test can do, but the
+    equivalent property is: on a run that produces real proposals and writes every artifact,
+    no dbt-conditional element may appear in any of them.
+    """
+    _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
+    ddl_path = tmp_path / "out.sql"
+    md_path = tmp_path / "out.md"
+    result = runner.invoke(
+        app,
+        [
+            "advise",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--json",
+            "--ddl",
+            str(ddl_path),
+            "--markdown",
+            str(md_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["proposals"], "a vacuous run would satisfy every assertion below"
+    assert ddl_path.read_text(encoding="utf-8").count("CREATE INDEX ON") == 3, (
+        "two indexes on orders and one on payments — the count pins that the artifacts are "
+        "non-vacuous, since a run with no DDL would satisfy every absence check below"
+    )
+    assert "dbt" not in payload
+
+    surfaces = {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "ddl": ddl_path.read_text(encoding="utf-8"),
+        "markdown": md_path.read_text(encoding="utf-8"),
+    }
+    # Every dbt-conditional element this branch can emit, each checked against every
+    # surface — a single "dbt" substring check would pass while ADV301 leaked.
+    forbidden = [
+        "dbt",
+        "ADV301",
+        "ADV302",
+        "ADV303",
+        "indexes:",
+        "dbt_model",
+        "dbt_materialized",
+        "dbt_index_config",
+        "materialized as",
+        "manifest",
+    ]
+    for name, text in surfaces.items():
+        for token in forbidden:
+            assert token not in text, f"{token!r} leaked into {name} on a dbt-free run"
+    for proposal in payload["proposals"]:
+        assert not any(k.startswith("dbt") for k in proposal["evidence"]), proposal

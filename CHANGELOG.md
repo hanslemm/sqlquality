@@ -35,6 +35,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could no longer satisfy the hot query's `ORDER BY`.
 - ADV003 is scoped to the tables the workload was observed using, like ADV002 — it no longer
   proposes `DROP INDEX` for a relation the run never analysed.
+- Optional dbt enrichment for `advise`: `--project-dir` (reads
+  `<project-dir>/target/manifest.json`) or `--manifest <path>` layers dbt model metadata
+  onto the same analysis, and every manifest-free `advise` invocation is proven
+  byte-identical (stdout, markdown, DDL and stderr) to a run with no dbt support at all.
+  **ADV302** rewrites an index-creating proposal for a `table`-, `incremental`- or
+  `materialized_view`-materialized dbt model into a commented `indexes:` config block
+  instead of raw DDL, because a normal `dbt run` (or `--full-refresh`) drops and rebuilds
+  those relations and the DDL would not survive it; on a `view` the *DDL* is dropped and
+  explained while the proposal stays at LOW confidence, since a view has no storage to index
+  but "this index cannot apply here" is still the finding. ADV302 is a rewrite, not a
+  proposal code: the original rule keeps its code, confidence and cost share, so no proposal
+  ever carries `code: "ADV302"` — filter on `evidence.dbt_index_config` instead — and
+  `advise` prints a stderr line saying how many proposals it rewrote, since the terminal
+  table row is otherwise unchanged. Several index proposals for one model merge into a single
+  `indexes:` block, because dbt reads one `indexes` key per config and two blocks pasted into
+  one config are a duplicate YAML key whose loser is silently discarded. Wherever ADV302
+  declines and leaves executable DDL in place (a partial index, an unrecognised
+  materialization, no plain column list, a non-btree access method), the warning is written
+  into the `--ddl` script above the statement, not only into the rationale. A `DROP INDEX`
+  proposal (ADV002, ADV003) on a dbt-managed relation is the same hazard pointing the other
+  way — if the index is declared in the model's `indexes:` config, `dbt run` recreates it and
+  the drop silently reverts — so those keep their DDL and gain a warning, in the rationale and
+  in the DDL script, that the config entry has to be removed too. A manifest whose
+  `adapter_type` is neither postgres nor redshift (or is absent), or whose schema is not v12,
+  is disclosed on stderr: a foreign adapter means dbt is not building the relations `advise`
+  introspected at all, so every match is a name coincidence. **ADV301** proposes
+  materializing a `view`-backed model that carries a hot share of workload cost, capped at
+  MEDIUM. **ADV303** flags a dbt model within reach of the manifest that the analyzed
+  workload never touched and that no other model, snapshot or dbt exposure declares as a
+  consumer, capped at LOW. Matching a model to a relation is on the exact `(schema, table)`
+  pair with no bare-name fallback, since a dbt project's target schema routinely differs
+  from the schema being introspected; a relation two different models both claim is
+  dropped from matching (not guessed at) and counted in the CLI disclosure and the JSON
+  payload's `dbt.dropped_collisions`.
 
 ### Fixed
 

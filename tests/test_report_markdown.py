@@ -143,6 +143,61 @@ def test_payload_is_json_serializable():
     json.dumps(_payload())
 
 
+def test_payload_omits_the_dbt_key_when_absent():
+    """Every existing caller omits `dbt`; the key must not appear at all — not even set to
+    `None` — so a no-manifest payload stays byte-identical to what callers got before this
+    key existed, rather than merely equal apart from one known extra key. A consumer that
+    wants the value unconditionally can still do `payload.get("dbt")`, which behaves the
+    same either way."""
+    assert "dbt" not in _payload()
+
+
+def test_payload_carries_the_dbt_disclosure_when_given():
+    dbt = {"manifest": "/proj/target/manifest.json", "models": 3, "dropped_collisions": 1}
+    payload = advise_payload(
+        PROPOSALS,
+        WORKLOAD,
+        AGGREGATION,
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        dbt=dbt,
+    )
+    assert payload["dbt"] == dbt
+
+
+def test_markdown_omits_the_dbt_section_when_absent():
+    """The no-manifest markdown must not mention dbt at all — this is the same additive-by-
+    construction constraint `advise` proves byte-for-byte against `main`, pinned here at the
+    renderer's own level."""
+    md = render_advise_markdown(
+        PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "dbt" not in md.lower()
+
+
+def test_markdown_renders_the_dbt_disclosure_when_given():
+    dbt = {"manifest": "/proj/target/manifest.json", "models": 3, "dropped_collisions": 2}
+    md = render_advise_markdown(
+        PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[], dbt=dbt
+    )
+    assert "## dbt enrichment" in md
+    assert "/proj/target/manifest.json" in md
+    assert "models indexed: 3" in md
+    assert "cross-database collisions dropped: 2" in md
+
+
+def test_markdown_omits_the_collision_line_when_there_were_none():
+    """A truthy-count check, not `"dropped_collisions" in dbt`: the key is always present
+    (see cli.advise), so a bare membership check would print "dropped: 0" on every run."""
+    dbt = {"manifest": "/proj/target/manifest.json", "models": 1, "dropped_collisions": 0}
+    md = render_advise_markdown(
+        PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[], dbt=dbt
+    )
+    assert "## dbt enrichment" in md
+    assert "collisions dropped" not in md
+
+
 def test_markdown_shows_confidence_and_cost_share():
     md = render_advise_markdown(
         PROPOSALS, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]

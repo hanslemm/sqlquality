@@ -143,9 +143,22 @@ def advise_payload(
     engine: str,
     redacted: bool,
     degraded: list[tuple[str, str]],
+    dbt: dict | None = None,
 ) -> dict:
-    """JSON-serializable summary of an advise run."""
-    return {
+    """JSON-serializable summary of an advise run.
+
+    The `"dbt"` key is *omitted entirely* when `dbt` is `None` (the default, and what every
+    existing caller before this key existed still gets) rather than present with a `None`
+    value: the dbt-free path is first-class, and this is what lets a no-manifest `advise`
+    invocation stay byte-identical to the payload from before dbt enrichment existed, not
+    merely equal apart from one known extra key. A consumer wanting the manifest count
+    unconditionally can still do `payload.get("dbt")`, which behaves the same either way.
+    When a manifest did load, the caller (`cli.advise`) is responsible for handing in a
+    plain, JSON-serializable dict (a `Path` or a `Relation` is not — `cli.advise` already
+    stringifies the manifest path before building this dict), since this function does not
+    itself normalize it the way `_jsonable` normalizes proposal evidence.
+    """
+    payload = {
         "engine": engine,
         "redacted": redacted,
         "window": workload.window_description,
@@ -180,6 +193,9 @@ def advise_payload(
             for p in proposals
         ],
     }
+    if dbt is not None:
+        payload["dbt"] = dbt
+    return payload
 
 
 def _jsonable(value: object) -> object:
@@ -199,8 +215,14 @@ def render_advise_markdown(
     engine: str,
     redacted: bool,
     degraded: list[tuple[str, str]],
+    dbt: dict | None = None,
 ) -> str:
-    """Render advise proposals as markdown (suitable for a ticket or PR comment)."""
+    """Render advise proposals as markdown (suitable for a ticket or PR comment).
+
+    `dbt` defaults to `None` — every existing caller omits it — so a no-manifest run
+    renders exactly the markdown it always has; the section below only appears when a
+    manifest actually loaded.
+    """
     lines = [
         f"# sqlquality advise — {_md_escape(engine)}",
         "",
@@ -233,6 +255,15 @@ def render_advise_markdown(
         lines.append("")
         for capability, reason in degraded:
             lines.append(f"- `{_md_escape(capability)}`: {_md_escape(reason)}")
+        lines.append("")
+
+    if dbt is not None:
+        lines.append("## dbt enrichment")
+        lines.append("")
+        lines.append(f"- manifest: `{_md_escape(dbt['manifest'])}`")
+        lines.append(f"- models indexed: {dbt['models']}")
+        if dbt.get("dropped_collisions"):
+            lines.append(f"- cross-database collisions dropped: {dbt['dropped_collisions']}")
         lines.append("")
 
     if not proposals:

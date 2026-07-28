@@ -218,6 +218,26 @@ class Proposal:
     evidence: dict[str, object]
     confidence: Confidence
     ddl: str | None = None
+    #: A caveat that must travel *with the statement*, rendered as comment lines directly
+    #: above `ddl` in the DDL script.
+    #:
+    #: This exists because `rationale` does not reach the DDL script at all — only the code,
+    #: confidence, cost share and title do. So a caveat that only lives in `rationale` is
+    #: invisible to precisely the person acting on the statement, which is how a `--ddl` file
+    #: came to hold a dbt config block explaining that raw DDL is destroyed by `dbt run` and,
+    #: below it, a raw `CREATE INDEX` on that same dbt-managed table. Anything an operator
+    #: must know *before running this statement* belongs here as well as in `rationale`.
+    #:
+    #: Deliberately a separate field rather than comment lines prepended to `ddl`: prepending
+    #: makes `ddl` multi-line but not *fully* commented, which routes it into `render_ddl`'s
+    #: NOT-RENDERED fallback and prints a reason ("an identifier contains a line break") that
+    #: is false for it. Keeping `ddl` a pure statement also keeps it engine-agnostic — how a
+    #: note is rendered is the adapter's business, not the rule's.
+    #:
+    #: Deliberately *not* part of the JSON payload or the markdown report: both already carry
+    #: `rationale`, which says the same thing in prose, and adding a key that is `None` on
+    #: every dbt-free run would break the byte-identity of the pre-dbt payload for no gain.
+    note: str | None = None
 
 
 def analyzed_query_groups(workload: Workload, aggregation: Aggregation) -> int:

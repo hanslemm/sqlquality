@@ -15,6 +15,7 @@ from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SEL
 from sqlquality.workload.postgres import (
     PgIndex,
     PostgresWorkloadAdapter,
+    _is_fully_commented,
     _quote_ident,
     propose_grouping_indexes,
     propose_indexes,
@@ -1743,6 +1744,17 @@ def test_render_ddl_emits_a_reviewable_commented_script():
     assert "review" in script.lower()
 
 
+def _uncommented(script: str) -> list[str]:
+    """Every non-blank line of a rendered DDL script that is not a `--` comment.
+
+    The one property the whole script format exists to provide is that nothing unintended is
+    executable, so tests assert over this list *exactly* rather than over a per-line
+    "comment or looks like a statement" disjunction — which any injected line ending in a
+    semicolon satisfies.
+    """
+    return [line for line in script.splitlines() if line.strip() and not line.startswith("--")]
+
+
 def test_render_ddl_never_emits_a_bare_uncommented_line():
     """The one property this file exists to guarantee: safe to skim, nothing unintended.
 
@@ -1761,12 +1773,10 @@ def test_render_ddl_never_emits_a_bare_uncommented_line():
         ),
     ]
     script = PostgresWorkloadAdapter().render_ddl(proposals)
-    for line in script.splitlines():
-        if not line.strip():
-            continue
-        assert line.startswith("--") or line.rstrip().endswith(";"), (
-            f"bare non-comment, non-statement line in generated script: {line!r}"
-        )
+    # An exact list, not "comment or ends in a semicolon": that disjunction is satisfied by
+    # *any* bare line ending in `;`, which is precisely the thing being smuggled, so it could
+    # not distinguish a clean script from one carrying an injected statement.
+    assert _uncommented(script) == ["CREATE INDEX ON t (c);"], script
     assert "-- line2 -- injected" in script
 
 
@@ -1807,6 +1817,40 @@ def test_render_ddl_recommends_concurrently_for_index_creation():
     ]
     script = PostgresWorkloadAdapter().render_ddl(proposals)
     assert "CONCURRENTLY" in script
+
+
+def test_render_ddl_emits_a_pre_commented_multiline_block_verbatim_with_its_header():
+    """A proposal can arrive with `ddl` already a `--`-commented, multi-line disclosure
+    rather than raw executable DDL — dbt enrichment's ADV302 rewrite is exactly this
+    shape. Before this test, the line-break guard treated *any* multi-line `ddl` as the
+    identifier-with-an-embedded-break hazard: it double-commented every line, printed a
+    false "an identifier ... contains a line break", and — because that whole branch
+    `continue`s before the header is appended — dropped the `-- ADV001 [confidence]` line
+    a reader needs to know which rule this is and how confident it was. A `ddl` value that
+    is already fully commented is not that hazard and must be emitted verbatim, with its
+    usual header.
+    """
+    config_block = (
+        "-- ADV302: express this as dbt config, not DDL. Add to the model's config block:\n"
+        "--   indexes:\n"
+        "--     - columns: ['status']\n"
+        "--       type: btree"
+    )
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="Add index on orders(status)",
+            rationale="hot predicate.",
+            evidence={"cost_share": 0.5},
+            confidence=Confidence.HIGH,
+            ddl=config_block,
+        ),
+    ]
+    script = PostgresWorkloadAdapter().render_ddl(proposals)
+    assert "-- ADV001 [high, 50.0% of workload cost]" in script
+    assert "NOT RENDERED" not in script
+    assert "-- --   indexes:" not in script, "must not be double-commented"
+    assert script.count("- columns: ['status']") == 1
 
 
 def test_generated_ddl_quotes_identifiers():
@@ -1857,13 +1901,10 @@ def test_a_newline_in_an_identifier_is_not_rendered_as_a_statement():
     )
     script = PostgresWorkloadAdapter().render_ddl(proposals)
     assert "NOT RENDERED" in script
-    for line in script.splitlines():
-        if not line.strip():
-            continue
-        assert line.startswith("--") or line.rstrip().endswith(";"), f"bare line: {line!r}"
-    # No executable statement mentions the smuggled text — it survives only as a comment.
-    executable = [ln for ln in script.splitlines() if not ln.startswith("--")]
-    assert not any("DROP TABLE users" in ln for ln in executable)
+    # Nothing at all is executable here: the whole statement was commented out, so the
+    # smuggled text survives only as a comment. Asserting the empty list rather than
+    # "comment or ends in `;`" — a bare `DROP TABLE users; --` satisfies that disjunction.
+    assert _uncommented(script) == [], script
     # The real name is still recoverable, so an operator can see what was anomalous.
     assert "DROP TABLE users; --" in script
 
@@ -2634,3 +2675,134 @@ def test_adv007_orders_equal_cost_join_keys_by_column_name():
         for p in propose_join_keys(tuple(reversed(forward)), facts, {}, min_cost_share=0.01)
     ]
     assert reversed_columns == columns
+
+
+def _ddl_proposal(
+    ddl: str = 'CREATE INDEX ON "main"."orders" ("status");', note: str | None = None
+) -> Proposal:
+    """A minimal DDL-carrying proposal for the renderer tests below."""
+    return Proposal(
+        code="ADV001",
+        title="Add index on orders(status)",
+        rationale="hot predicate.",
+        evidence={"cost_share": 0.5},
+        confidence=Confidence.HIGH,
+        ddl=ddl,
+        note=note,
+    )
+
+
+def test_a_proposal_note_is_emitted_as_comment_lines_above_its_statement():
+    """`rationale` never reaches this file — only code, confidence, cost share and title do.
+
+    So a caveat that lives only in `rationale` is invisible to the one person acting on the
+    statement, which is how a `--ddl` file came to hold a dbt config block explaining that
+    raw DDL is destroyed by `dbt run` and, below it, a bare `CREATE INDEX` on that same
+    dbt-managed table. `note` is the field that travels with the statement, and it has to be
+    *above* it: a caveat printed below is a caveat read after pasting.
+    """
+    script = PostgresWorkloadAdapter().render_ddl(
+        [
+            _ddl_proposal(
+                note="dbt WARNING: rebuilt by dbt model model.demo.orders.\nReapply by hand."
+            )
+        ]
+    )
+    lines = script.splitlines()
+    statement = lines.index('CREATE INDEX ON "main"."orders" ("status");')
+    assert lines[statement - 2] == "-- dbt WARNING: rebuilt by dbt model model.demo.orders."
+    assert lines[statement - 1] == "-- Reapply by hand."
+    assert _uncommented(script) == ['CREATE INDEX ON "main"."orders" ("status");'], script
+
+
+def test_a_multiline_note_cannot_break_out_of_comment_mode():
+    """A note is interpolated from a manifest's `unique_id`, which can carry a newline.
+
+    Rendered through `_comment_lines`, every physical line gets its own `--`, so a note is
+    subject to the same guarantee as a title.
+    """
+    script = PostgresWorkloadAdapter().render_ddl(
+        [_ddl_proposal(note="warning\nDROP TABLE users; -- injected")]
+    )
+    assert "-- DROP TABLE users; -- injected" in script
+    assert _uncommented(script) == ['CREATE INDEX ON "main"."orders" ("status");'], script
+
+
+def test_a_note_survives_the_not_rendered_fallback():
+    """The fallback tells an operator to apply the statement by hand, so a caveat about
+    whether the statement is even durable belongs there too."""
+    script = PostgresWorkloadAdapter().render_ddl(
+        [_ddl_proposal(ddl='CREATE INDEX ON "main"."or\nders" ("status");', note="dbt WARNING: x")]
+    )
+    assert "NOT RENDERED" in script
+    assert "-- dbt WARNING: x" in script
+    assert _uncommented(script) == [], script
+
+
+def test_a_proposal_without_a_note_renders_exactly_as_before():
+    """`note` defaults to None and must add nothing at all when unset — every dbt-free run
+    is this case, and the pre-dbt DDL script has to stay byte-identical."""
+    script = PostgresWorkloadAdapter().render_ddl([_ddl_proposal()])
+    assert script == PostgresWorkloadAdapter().render_ddl([_ddl_proposal(note=None)])
+    assert (
+        "-- ADV001 [high, 50.0% of workload cost]\n"
+        "-- Add index on orders(status)\n"
+        'CREATE INDEX ON "main"."orders" ("status");'
+    ) in script
+
+
+def test_a_carriage_return_in_an_identifier_is_not_rendered_as_a_statement():
+    """The line-break guard tests `"\\n" in ddl or "\\r" in ddl` and only the `\\n` half was
+    pinned: dropping the `\\r` half left every test green while a CR-only break — which
+    `str.splitlines()` splits on, so the file really does show two physical lines — bypassed
+    the fallback entirely and emitted something reading like a bare statement."""
+    script = PostgresWorkloadAdapter().render_ddl(
+        [_ddl_proposal(ddl='CREATE INDEX ON "main"."or\rders" ("status");')]
+    )
+    assert "NOT RENDERED" in script
+    assert _uncommented(script) == [], script
+
+
+def test_is_fully_commented_requires_every_line_to_be_a_comment():
+    """The guard that lets a pre-commented multi-line `ddl` skip the NOT-RENDERED fallback.
+
+    It is the check standing between `render_ddl` and its own core promise, and it had no
+    direct test: `all(...)` → `any(...)` left the whole suite green while
+    `ddl='-- note\\nDROP TABLE users;'` was emitted verbatim, bare and executable. Each case
+    below kills a distinct leniency mutation — `any`, `startswith("-")`, tolerating blank
+    lines, and `.lstrip()`-ing before the check — so the guard cannot be widened silently.
+    """
+    assert _is_fully_commented("-- one line") is True
+    assert _is_fully_commented("--   indexes:\n--     - columns: ['status']") is True
+    # `any` instead of `all`: a first line that is a comment must not vouch for the rest.
+    assert _is_fully_commented("-- note\nDROP TABLE users;") is False
+    assert _is_fully_commented("DROP TABLE users;\n-- note") is False
+    # A single dash is not a SQL comment; `startswith("-")` would accept this.
+    assert _is_fully_commented("- note\n- more") is False
+    # A blank line is not a comment line. This one is about intent rather than safety — a
+    # blank line is inert either way, and a raw statement after one is still rejected (the
+    # next case) — but tolerating it silently widens which `ddl` values skip the fallback,
+    # and no generated block needs it: `_comment_block` prefixes every line it emits.
+    assert _is_fully_commented("-- note\n\n-- more") is False
+    assert _is_fully_commented("-- note\n\nDROP TABLE users;") is False
+    # An indented comment is not safe to emit verbatim: `psql` is fine with it, but the
+    # guard's premise is "already inert on every line as written", and `.lstrip()` would
+    # extend it to text this renderer has no other reason to trust.
+    assert _is_fully_commented("  -- note") is False
+    # Nothing at all is not "every line is a comment".
+    assert _is_fully_commented("") is False
+
+
+def test_a_partially_commented_ddl_is_never_emitted_bare():
+    """The invariant `_is_fully_commented` protects, asserted through the renderer.
+
+    A multi-line `ddl` whose first line is a comment and whose later lines are raw
+    statements is exactly the hazard the fallback exists for, and widening the guard routes
+    it around the fallback and prints it verbatim.
+    """
+    script = PostgresWorkloadAdapter().render_ddl(
+        [_ddl_proposal(ddl="-- a note\nDROP TABLE users;")]
+    )
+    assert "NOT RENDERED" in script
+    assert _uncommented(script) == [], script
+    assert "-- DROP TABLE users;" in script
