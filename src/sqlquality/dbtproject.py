@@ -83,6 +83,19 @@ class DbtProject:
     def model_children(self, uid: str) -> list[str]:
         return sorted(c for c in self._child_map.get(uid, []) if self._is_model(c))
 
+    def child_ids(self, uid: str) -> list[str]:
+        """Every declared consumer of `uid`, with no resource-type filter at all.
+
+        `model_children` narrows to models only, which is right for its own callers (the
+        model DAG). A caller asking "is anything declared to consume this?" wants the
+        opposite: a snapshot or an exposure is a real, dbt-declared consumer — an exposure
+        exists specifically to say "a BI dashboard reads this" — and `model_children`'s
+        filter would make either invisible. Returns raw `child_map` unique_ids so a caller
+        can apply its own notion of "consumer" (see `workload.dbt.propose_unused_models`,
+        which excludes tests from that notion but nothing else).
+        """
+        return sorted(self._child_map.get(uid, []))
+
     def compiled_sql(self, uid: str) -> str:
         node = self.node(uid)
         if not node.compiled_code:
