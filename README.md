@@ -268,8 +268,9 @@ optimizations — indexes to add, indexes to drop, partial indexes, non-sargable
 predicates, and hot `SELECT *`. Output is an advisory report plus a DDL file for you to
 review. **`advise` never writes to your database and never executes DDL.**
 
-Only **Postgres** is implemented today; Redshift, Snowflake and dbt enrichment are
-designed but not built — see [Limitations](#limitations).
+Only **Postgres** is implemented today; Redshift and Snowflake are designed but not built
+— see [Limitations](#limitations). An optional dbt manifest enriches the same analysis —
+see [dbt enrichment](#dbt-enrichment-optional) below.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics
@@ -312,10 +313,12 @@ missing driver degrades with an install hint instead of a traceback.
 | `--profile` | — | dbt profile name, read from `profiles.yml`. |
 | `--target` | — | dbt target within the profile. |
 | `--profiles-dir` | `~/.dbt` | Directory holding `profiles.yml`. |
+| `--project-dir` | — | dbt project dir; reads `target/manifest.json` to enrich proposals (optional). See [dbt enrichment](#dbt-enrichment-optional). |
+| `--manifest` | — | Path to a dbt `manifest.json`. Overrides `--project-dir`. |
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
 | `--limit` | `500` | Max query-history rows to read. |
-| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008); the index-hygiene rules **ADV002 and ADV003 carry no cost evidence and are always reported**, whatever the threshold. |
+| `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 — the last only with `--project-dir`/`--manifest`); the index-hygiene rules **ADV002 and ADV003**, and **ADV303** (its evidence is absence, not cost, so there is no share to threshold), carry no cost evidence and are always reported. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
 | `--dry-run` | off | Print every statement the adapter would issue, then exit 0 **without connecting**. |
@@ -386,6 +389,11 @@ statement is not valid SQL to copy out and run.
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
 | ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |
 | ADV008 | Composite index for a hot `GROUP BY`, column order inferred from cost, capped at MEDIUM | cost share, row estimate, absence of a covering index |
+| ADV301¹ | Materialize a `view`-backed dbt model that carries a hot share of workload cost, capped at MEDIUM | cost share, dbt materialization |
+| ADV302¹ | Rewrite an index-creating proposal for a dbt-managed relation into a config block, or drop it, instead of DDL that does not survive `dbt run` | dbt materialization, columns |
+| ADV303¹ | A dbt model within reach of the manifest that the analyzed workload never touched and no other model, snapshot or exposure declares as a consumer, capped at LOW | dbt model graph |
+
+¹ Only fires with `--project-dir` or `--manifest` loaded — see [dbt enrichment](#dbt-enrichment-optional).
 
 **Confidence model**, mechanical rather than judgment-based:
 
@@ -542,6 +550,65 @@ reduced coverage — ndv: permission denied for table pg_stats — reads pg_stat
 exposes only rows for tables the current role owns or can select from — a role without
 table access silently sees no statistics
 ```
+
+#### dbt enrichment (optional)
+
+Passing `--project-dir` (reads `<project-dir>/target/manifest.json`) or `--manifest
+<path>` layers dbt model metadata onto the same analysis. Neither is required: every
+`advise` invocation without one behaves exactly as documented above, and that no-manifest
+path is proven byte-identical (stdout, markdown, DDL and stderr) to a run with no dbt
+support at all — dbt is enrichment layered on top of an engine-agnostic core, never a
+requirement of it.
+
+**Why ADV302 exists.** The rules above propose DDL from query cost and catalog metadata
+with no idea whether the table they're indexing is dbt-managed — and if it is, that
+matters. dbt's `table` materialization drops and recreates its relation on *every*
+`dbt run`, so a raw `CREATE INDEX` applied once is silently gone the next time dbt runs.
+`incremental` differs only in degree: a normal run keeps the relation, but
+`dbt run --full-refresh` rebuilds it the same way. `materialized_view` behaves like
+`incremental` — refreshed in place on a normal run, rebuilt on `--full-refresh` or a config
+change dbt can't apply in place. A plain `view` has no storage of its own at all, so it
+cannot carry an index. Confidently advising DDL that a routine `dbt run` silently erases is
+worse than advising nothing, which is what **ADV302** exists to prevent: with a manifest
+loaded, an index-creating proposal for a `table`-, `incremental`- or
+`materialized_view`-materialized relation is rewritten into a commented dbt `indexes:`
+config block you paste into that model's own config instead of DDL you'd apply once and
+lose; on a `view` the proposal is dropped and explained instead (there is no relation to
+index); on any other or absent materialization the DDL is left untouched, since
+unrecognised is not the same as known-safe. A partial (`WHERE`-restricted) index has no
+config-block equivalent — dbt's `indexes` config carries no predicate — so that proposal is
+disclosed as not expressible rather than silently dropping the predicate.
+
+Two more proposals only fire with a manifest loaded — see the proposal table above for
+ADV301 and ADV303. Both are capped below HIGH, for the same reason ADV302's rewrite trusts
+the manifest as of whenever `dbt compile` last ran: a model's materialization or its
+consumers can change without a fresh compile, so a stale manifest degrades to a wrong (but
+traceable — the disclosed materialization or lack of a consumer names why) recommendation
+rather than a silent one.
+
+**Matching is exact, deliberately.** A model's `relation_name` is dropped down to its
+`(schema, table)` pair (dbt writes a `catalog.schema.table` name; the database part is
+discarded, since `advise` connects to one database at a time) and matched against the
+relation each proposal already carries — **there is no bare-table-name fallback**. A dbt
+project's target schema (`dev`, `main`, a CI schema, ...) routinely differs from the schema
+`advise` introspects in production, so matching on the table name alone would risk
+attributing a production table's proposal to an unrelated development model — and ADV302
+would then rewrite that table's DDL on the strength of a wrong guess. If two *different*
+models both build the same `(schema, table)` pair (legitimate when a project targets more
+than one database), `advise` cannot tell which is live: that relation is dropped from
+matching entirely — not guessed at — and counted, both in the CLI's `dbt enrichment from
+...` disclosure line and in the JSON payload's `dbt.dropped_collisions`.
+
+```console
+$ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --project-dir ./my_dbt_project
+engine: postgres (credentials from --dsn)
+dbt enrichment from my_dbt_project/target/manifest.json (42 model(s))
+...
+```
+
+A manifest that is missing, unreadable or malformed degrades to "no enrichment" plus a
+line on stderr — `advise` never aborts an otherwise-successful run over an optional input,
+since by the time the manifest loads the whole catalog analysis has already run.
 
 ### check (the CI gate)
 
@@ -897,6 +964,12 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   Qualify the table in the query, or run `advise` once per `--schema`, to recover it.
   Generated DDL is qualified with the schema it was read from, so it does not depend on the
   applying session's `search_path`.
-- **Redshift, Snowflake and dbt enrichment are designed but not implemented.** `advise`
-  supports Postgres only today; passing another `--engine` fails with a clear error
-  rather than silently degrading.
+- **Redshift and Snowflake are designed but not implemented.** `advise` supports Postgres
+  only today; passing another `--engine` fails with a clear error rather than silently
+  degrading. Optional dbt enrichment (`--project-dir`/`--manifest`, see
+  [dbt enrichment](#dbt-enrichment-optional)) is implemented for Postgres.
+- **dbt enrichment trusts the manifest as of its last `dbt compile`.** ADV302 rewrites DDL
+  based on a model's materialization as the manifest records it; a materialization changed
+  without a fresh `dbt compile` produces a stale — but traceable, since the disclosed
+  materialization names its own source — rewrite. Nothing verifies the manifest against
+  the live relation.
