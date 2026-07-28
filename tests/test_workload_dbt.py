@@ -4,13 +4,14 @@ from pathlib import Path
 import pytest
 
 from sqlquality.dbtproject import DbtProject
-from sqlquality.models import Confidence, Proposal, Relation
+from sqlquality.models import Aggregation, ColumnRole, ColumnUsage, Confidence, Proposal, Relation
 from sqlquality.workload.dbt import (
     DbtContext,
     _comment_block,
     enrich_proposals,
     load_dbt_context,
     parse_relation_name,
+    propose_materialization,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "manifest_v12.json"
@@ -504,3 +505,83 @@ def test_comment_block_defends_a_raw_newline_smuggled_past_the_repr_escaping():
     assert len(lines) == 4  # three logical lines, one of which splits into two physical ones
     for line in lines:
         assert line.startswith("--"), f"bare line outside comment mode: {line!r}"
+
+
+def _usage(relation, column, role, cost_share=0.5, cost_ms=50.0, fps=("fp1",)):
+    """Mirrors `tests/test_workload_rules.py`'s helper of the same name — not imported
+    across test modules, because that file's helper is private to it. `fps` defaults to a
+    single shared fingerprint, so usages co-occur unless a test deliberately gives them
+    disjoint sets; irrelevant to the dbt rules below (neither checks co-occurrence) but kept
+    for parity with the original."""
+    return ColumnUsage(
+        relation=relation,
+        column=column,
+        role=role,
+        calls=10,
+        cost_ms=cost_ms,
+        cost_share=cost_share,
+        fingerprint_ids=frozenset(fps),
+    )
+
+
+def _aggregation(*usages, total=1000.0):
+    return Aggregation(
+        usage=tuple(usages),
+        total_cost_ms=total,
+        skipped_unqualifiable=0,
+        tables=frozenset(u.relation for u in usages),
+    )
+
+
+def test_adv301_proposes_materializing_a_hot_view():
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "stg_orders")  # view
+    usage = _usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.4)
+    proposals = propose_materialization(_aggregation(usage), context, min_cost_share=0.01)
+    assert [p.code for p in proposals] == ["ADV301"]
+    assert proposals[0].confidence is Confidence.MEDIUM
+    assert proposals[0].evidence["dbt_model"] == "model.demo.stg_orders"
+    assert proposals[0].ddl is None, "changing a materialization is a config edit, not DDL"
+
+
+def test_adv301_is_silent_for_a_model_already_materialized_as_a_table():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.9)
+    assert propose_materialization(_aggregation(usage), context, min_cost_share=0.01) == []
+
+
+def test_adv301_respects_the_cost_share_threshold():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "stg_orders"), "status", ColumnRole.EQUALITY, cost_share=0.001)
+    assert propose_materialization(_aggregation(usage), context, min_cost_share=0.01) == []
+
+
+def test_adv301_never_reaches_high_confidence():
+    """The build-vs-read trade is not visible from query history, so HIGH would be a claim
+    about a schedule this tool cannot see."""
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("main", "stg_orders"), "status", ColumnRole.EQUALITY, cost_share=0.99)
+    [out] = propose_materialization(_aggregation(usage), context, min_cost_share=0.01)
+    assert out.confidence is Confidence.MEDIUM
+
+
+def test_adv301_ignores_relations_dbt_does_not_manage():
+    context = DbtContext.from_project(_project())
+    usage = _usage(Relation("public", "orders"), "status", ColumnRole.EQUALITY, cost_share=0.9)
+    assert propose_materialization(_aggregation(usage), context, min_cost_share=0.01) == []
+
+
+def test_adv301_reports_one_proposal_per_relation_not_per_column():
+    """Two hot columns on one view are one materialization decision."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "stg_orders")
+    proposals = propose_materialization(
+        _aggregation(
+            _usage(relation, "status", ColumnRole.EQUALITY, cost_share=0.4),
+            _usage(relation, "created_at", ColumnRole.RANGE, cost_share=0.3),
+        ),
+        context,
+        min_cost_share=0.01,
+    )
+    assert len(proposals) == 1
+    assert proposals[0].evidence["cost_share"] == 0.4, "the max, not the sum"
