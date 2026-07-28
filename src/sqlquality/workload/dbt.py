@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlquality.dbtproject import DbtProject, DbtProjectError, ModelNode
-from sqlquality.models import Confidence, Proposal, Relation
+from sqlquality.models import Aggregation, ColumnUsage, Confidence, Proposal, Relation
 
 
 def _split_relation_parts(text: str) -> list[str] | None:
@@ -407,3 +408,67 @@ def _enrich_one(proposal: Proposal, model: ModelNode) -> Proposal:
         "this DDL directly; `dbt run` applies it."
     )
     return dataclasses.replace(proposal, ddl=config_ddl, rationale=rationale, evidence=evidence)
+
+
+def propose_materialization(
+    aggregation: Aggregation, context: DbtContext, *, min_cost_share: float
+) -> list[Proposal]:
+    """ADV301 — a dbt model materialized as a `view` that carries a hot share of workload cost.
+
+    A view re-executes its defining query on every read, so any cost saved by a `table` or
+    `incremental` build is instead paid, in full, every time something reads it. When the
+    workload shows a view carrying a hot share of cost, that repeated cost is exactly what a
+    materialization change would trade for a heavier (and scheduled) `dbt run`. This is only
+    computable by joining workload cost — which this tool has — to the model graph's
+    materialization — which only the manifest has; neither alone is enough.
+
+    Confidence is capped at MEDIUM and there is deliberately no HIGH branch, mirroring
+    ADV008's precedent for the same shape of gap: whether the trade actually pays off depends
+    on how often the model is *rebuilt* versus how often it is *read*, and on how fresh the
+    data needs to be — neither is visible from query history. Claiming HIGH would be a claim
+    about a build schedule this tool cannot see. Do not add a HIGH branch here for symmetry
+    with ADV001; the missing rung is deliberate, not an oversight.
+
+    One proposal per relation, not per column: two hot columns on the same view are one
+    materialization decision, not two. `cost_share` is the *max* over that relation's usage,
+    not the sum — `ColumnUsage.cost_share` is deliberately not a partition (see its own
+    docstring), so a query hot on two columns of the same view would otherwise be counted
+    twice, exactly the double-count ADV001 and ADV008 already avoid the same way.
+    """
+    by_relation: dict[Relation, list[ColumnUsage]] = defaultdict(list)
+    for item in aggregation.usage:
+        by_relation[item.relation].append(item)
+
+    proposals: list[Proposal] = []
+    for relation in sorted(by_relation):
+        model = context.model_for(relation)
+        if model is None or model.materialized != "view":
+            continue
+        cost_share = max(item.cost_share for item in by_relation[relation])
+        if cost_share < min_cost_share:
+            continue
+        proposals.append(
+            Proposal(
+                code="ADV301",
+                title=f"Materialize {relation} instead of a view",
+                rationale=(
+                    f"This dbt model ({_dbt_attribution(model)}) carries a hot share of "
+                    f"workload cost ({cost_share:.1%}) but, as a view, re-executes its "
+                    "defining query on every read. Materializing it as `table` or "
+                    "`incremental` trades that repeated read cost for a build cost paid on "
+                    "each `dbt run` instead — worth it only if the model is read far more "
+                    "often than it is rebuilt, and if it does not need to reflect every "
+                    "write immediately. Neither is visible from query history, which is why "
+                    "this is capped at MEDIUM: it names the trade, not a verdict on it."
+                ),
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "dbt_model": model.unique_id,
+                    "cost_share": cost_share,
+                },
+                confidence=Confidence.MEDIUM,
+                ddl=None,
+            )
+        )
+    return proposals
