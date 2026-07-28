@@ -3,6 +3,7 @@ import re
 import sqlglot
 import pytest
 
+from sqlquality.models import Aggregation, ConnectionParams, Workload
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.redshift import (
     CAP_ADVISOR,
@@ -74,9 +75,37 @@ def test_there_is_no_ndv_or_index_capability():
     assert not any("ndv" in c or "index" in c for c in capabilities)
 
 
-def test_unimplemented_methods_say_so_rather_than_returning_empty():
+#: Every `WorkloadAdapter` method this task deliberately leaves unbuilt, with a call that
+#: reaches it. Named individually rather than discovered by reflection: a later task that
+#: implements one of these must delete its entry here, which is a visible, reviewable edit —
+#: whereas a reflective sweep would silently stop covering whatever got implemented.
+UNIMPLEMENTED = {
+    "connect": lambda a: a.connect(
+        ConnectionParams(engine="redshift", dsn="postgresql://h/d", fields={}, source="test"), 30
+    ),
+    "fetch_workload": lambda a: a.fetch_workload(None, 10),
+    "fetch_schema": lambda a: a.fetch_schema(("public",)),
+    "fetch_table_facts": lambda a: a.fetch_table_facts(("public",), frozenset()),
+    "propose": lambda a: a.propose(
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        {},
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.01,
+    ),
+    "render_ddl": lambda a: a.render_ddl([]),
+}
+
+
+@pytest.mark.parametrize("method", sorted(UNIMPLEMENTED))
+def test_unimplemented_methods_say_so_rather_than_returning_empty(method):
     """A half-built adapter that returns nothing looks exactly like a healthy cluster with
-    no workload, which is the worst possible failure mode for this command."""
+    no workload, which is the worst possible failure mode for this command.
+
+    Every unbuilt method is covered, not just one. Task 1 originally pinned `fetch_schema`
+    alone, which would have let a later task implement `fetch_workload` and silently leave
+    `fetch_table_facts` returning `[]` — the run would then report a healthy cluster with no
+    catalog facts rather than an unfinished adapter.
+    """
     adapter = RedshiftWorkloadAdapter()
     with pytest.raises(NotImplementedError):
-        adapter.fetch_schema(("public",))
+        UNIMPLEMENTED[method](adapter)
