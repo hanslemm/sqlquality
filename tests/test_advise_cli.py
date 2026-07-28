@@ -10,7 +10,7 @@ from sqlquality.cli import (
     _validate_schemas,
     app,
 )
-from sqlquality.models import Aggregation, QueryStat, Relation, Workload
+from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
 from sqlquality.report import advise_payload
 
 runner = CliRunner()
@@ -534,6 +534,10 @@ def test_project_dir_loads_a_manifest_and_discloses_only_on_stderr(monkeypatch, 
     assert "dbt enrichment" not in result.stdout
     payload = json.loads(result.stdout)  # stdout must still be pure, parseable JSON
     assert payload["proposals"] == []
+    # The payload's manifest path must resolve via --project-dir/target/manifest.json —
+    # the same precedence load_dbt_context itself used to load this file.
+    assert payload["dbt"]["manifest"] == str(target / "manifest.json")
+    assert payload["dbt"]["models"] == 3
 
 
 def test_project_dir_with_a_broken_manifest_does_not_abort_the_run(monkeypatch, tmp_path):
@@ -570,6 +574,209 @@ def test_no_dbt_option_means_no_disclosure_anywhere(monkeypatch):
     result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 0
     assert "dbt enrichment" not in result.output
+
+
+def test_no_manifest_means_no_behaviour_change(monkeypatch):
+    """The dbt-free path is first-class, so enrichment must be additive by construction.
+
+    This is a unit-level pin of the same constraint the task proves by diffing a whole run's
+    artifacts against `main`: with neither `--project-dir` nor `--manifest`, no proposal may
+    carry dbt evidence and the payload's `dbt` key must be `None`.
+    """
+    _stub_adapter(
+        monkeypatch,
+        {
+            "pg_stat_statements": [
+                ("select id from orders where status = $1 and created_at > $2", 100, 5000.0, 10),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+            "information_schema.columns": WIDE_COLUMNS,
+            "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+            "pg_stats": [("public", "orders", "status", 5000.0)],
+            "pg_index": [],
+        },
+    )
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    assert result.exit_code == 0
+    assert "dbt" not in result.stderr.lower()
+    payload = json.loads(result.stdout)
+    assert payload["proposals"], "the scenario must produce at least one proposal to test"
+    for proposal in payload["proposals"]:
+        assert "dbt_model" not in proposal["evidence"]
+    assert payload["dbt"] is None
+
+
+def test_an_unreadable_manifest_via_the_flag_does_not_fail_the_run(monkeypatch, tmp_path):
+    """Exit 0 with a disclosure — the catalog work already happened, and dbt is optional.
+
+    Distinct from `test_project_dir_with_a_broken_manifest_does_not_abort_the_run`: that one
+    exercises a malformed *file* reached via `--project-dir`; this one exercises `--manifest`
+    naming a path that does not exist at all.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    missing = tmp_path / "no.json"
+    result = runner.invoke(
+        app, ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(missing), "--json"]
+    )
+    assert result.exit_code == 0
+    assert "dbt enrichment unavailable" in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dbt"] is None
+
+
+def test_the_payload_records_which_manifest_was_used(monkeypatch):
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["dbt"] is not None
+    assert payload["dbt"]["manifest"] == str(DBT_FIXTURE)
+    # The fixture carries exactly 3 models: stg_orders, orders, customer_orders.
+    assert payload["dbt"]["models"] == 3
+    assert payload["dbt"]["dropped_collisions"] == 0
+
+
+def test_the_payload_reports_a_nonzero_dropped_collision_count(monkeypatch, tmp_path):
+    """`dropped_collisions` must reflect `DbtContext.dropped_collisions`, not a hardcoded 0.
+
+    Two models here build the same `(schema, table)` in two different databases — the
+    cross-database collision `DbtContext.from_project` refuses to guess at (see
+    workload/dbt.py). Task 1 counts it precisely so a user can learn a relation was
+    silently dropped from the index; this pins that the count actually reaches the CLI
+    payload rather than a value that happens to already be right for the shared fixture,
+    which has zero collisions and so cannot catch a hardcoded 0.
+    """
+    manifest = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+            "adapter_type": "postgres",
+        },
+        "nodes": {
+            "model.demo.a": {
+                "unique_id": "model.demo.a",
+                "name": "a",
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "compiled_code": "select 1",
+                "relation_name": '"prod"."main"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            },
+            "model.demo.b": {
+                "unique_id": "model.demo.b",
+                "name": "b",
+                "resource_type": "model",
+                "config": {"materialized": "table"},
+                "compiled_code": "select 1",
+                "relation_name": '"stage"."main"."orders"',
+                "depends_on": {"macros": [], "nodes": []},
+            },
+        },
+        "sources": {},
+        "parent_map": {"model.demo.a": [], "model.demo.b": []},
+        "child_map": {"model.demo.a": [], "model.demo.b": []},
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(manifest_path), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["dbt"]["dropped_collisions"] == 1
+    assert payload["dbt"]["models"] == 0
+
+
+def test_adv301_and_adv303_only_appear_with_a_manifest(monkeypatch):
+    """ADV301/ADV303 need the model graph a manifest carries, so neither may appear without
+    one — and at least one must appear with the fixture manifest, or this test proves
+    nothing about the wiring at all.
+
+    `customer_orders` in the fixture manifest has no declared consumer, so
+    `propose_unused_models` (ADV303) flags it as soon as the workload has *any* usage at
+    all — regardless of which schema that usage is in, since the negative check is simply
+    "not in aggregation.tables". The workload below queries `public.orders`, wholly
+    unrelated to the fixture's `main` schema, so ADV303 firing here is attributable only to
+    the manifest being loaded, not to any accidental overlap with the query below.
+    """
+    rows = {
+        "pg_stat_statements": [
+            ("select id from orders where status = $1", 5, 100.0, 5),
+        ],
+        "pg_stat_database": [("2026-07-01",)],
+        "information_schema.columns": [
+            ("public", "orders", "id", "integer"),
+            ("public", "orders", "status", "text"),
+        ],
+        "pg_total_relation_size": [("public", "orders", 5_000_000, 10**8)],
+        "pg_stats": [("public", "orders", "status", 5000.0)],
+        "pg_index": [],
+    }
+    _stub_adapter(monkeypatch, rows)
+    without = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    _stub_adapter(monkeypatch, rows)
+    with_dbt = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert without.exit_code == 0
+    assert with_dbt.exit_code == 0
+    without_codes = {p["code"] for p in json.loads(without.stdout)["proposals"]}
+    with_codes = {p["code"] for p in json.loads(with_dbt.stdout)["proposals"]}
+    assert not ({"ADV301", "ADV303"} & without_codes), without_codes
+    assert {"ADV301", "ADV303"} & with_codes, with_codes
+
+
+def test_enrichment_output_is_resorted_by_the_adapters_ranking_key(monkeypatch):
+    """After enriching and extending with ADV301/ADV303, the combined list must be re-sorted
+    by `PostgresWorkloadAdapter._ranking_key`, not left in call order — otherwise the
+    terminal table, the markdown and the DDL file could each disagree on the order.
+
+    The base adapter is stubbed to return one LOW-confidence proposal; `propose_materialization`
+    is stubbed to contribute one HIGH-confidence proposal. Concatenation in call order would
+    put the LOW proposal first; the ranking key puts HIGH first. Only a real re-sort produces
+    the HIGH-first order asserted below.
+    """
+    _stub_adapter(monkeypatch, {"pg_stat_statements": [], "pg_stat_database": [("2026-07-01",)]})
+
+    low = Proposal(
+        code="ADV999",
+        title="low one",
+        rationale="r",
+        evidence={},
+        confidence=Confidence.LOW,
+        ddl=None,
+    )
+    high = Proposal(
+        code="ADV001",
+        title="high one",
+        rationale="r",
+        evidence={},
+        confidence=Confidence.HIGH,
+        ddl=None,
+    )
+
+    monkeypatch.setattr(
+        "sqlquality.workload.postgres.PostgresWorkloadAdapter.propose",
+        lambda self, *a, **k: [low],
+    )
+    monkeypatch.setattr("sqlquality.cli.enrich_proposals", lambda proposals, context: proposals)
+    monkeypatch.setattr("sqlquality.cli.propose_materialization", lambda *a, **k: [high])
+    monkeypatch.setattr("sqlquality.cli.propose_unused_models", lambda *a, **k: [])
+
+    result = runner.invoke(
+        app,
+        ["advise", "--dsn", "postgresql://u@h/db", "--manifest", str(DBT_FIXTURE), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    codes = [p["code"] for p in payload["proposals"]]
+    assert codes == ["ADV001", "ADV999"], codes
 
 
 def test_ddl_and_markdown_files_are_written(monkeypatch, tmp_path):

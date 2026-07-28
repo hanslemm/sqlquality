@@ -46,8 +46,14 @@ from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.aggregate import aggregate, star_tables
 from sqlquality.workload.base import MAX_TIMEOUT_S, MIN_TIMEOUT_S
 from sqlquality.workload.connection import ConnectionResolutionError, resolve_connection
-from sqlquality.workload.dbt import load_dbt_context
+from sqlquality.workload.dbt import (
+    enrich_proposals,
+    load_dbt_context,
+    propose_materialization,
+    propose_unused_models,
+)
 from sqlquality.workload.fingerprint import ingest
+from sqlquality.workload.postgres import PostgresWorkloadAdapter
 
 console = Console()
 
@@ -700,6 +706,21 @@ def _validate_schemas(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _resolved_manifest_path(project_dir: Path | None, manifest: Path | None) -> Path | None:
+    """The manifest path `load_dbt_context(project_dir, manifest)` would resolve, or None.
+
+    Mirrors that function's own precedence (an explicit `--manifest` wins; otherwise
+    `--project-dir/target/manifest.json`; otherwise neither was given) exactly, since this
+    is what lets the CLI report *which* path was loaded without re-parsing the disclosure
+    string `load_dbt_context` already produced for a human to read.
+    """
+    if manifest is not None:
+        return manifest
+    if project_dir is not None:
+        return project_dir / "target" / "manifest.json"
+    return None
+
+
 def _parse_since(value: str | None) -> timedelta | None:
     """Parse a '7d' / '24h' / '2w' duration, or exit 2."""
     if value is None:
@@ -753,9 +774,10 @@ def advise(
         # share they do not have would be inventing evidence.
         help=(
             "Suppress proposals below this share of workload cost. Applies to the "
-            "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008); the "
-            "index-hygiene rules ADV002 and ADV003 carry no cost evidence and are always "
-            "reported."
+            "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 "
+            "-- the last only with --project-dir/--manifest); the index-hygiene rules "
+            "ADV002 and ADV003, and ADV303 (its evidence is absence, not cost, so there is "
+            "no share to threshold), carry no cost evidence and are always reported."
         ),
     ),
     keep_literals: bool = typer.Option(
@@ -850,11 +872,40 @@ def advise(
     proposals = adapter.propose(aggregation, facts, workload, min_cost_share=min_cost_share)
 
     # Optional dbt enrichment: neither option given means (None, None) and nothing below
-    # fires, so every existing `advise` invocation behaves identically without a manifest.
-    # Enrichment rules land in later tasks — this only loads the context and discloses it.
-    _dbt_context, dbt_disclosure = load_dbt_context(project_dir, manifest)
+    # fires, so every existing `advise` invocation behaves identically without a manifest —
+    # that identity is proved byte-for-byte in tests/test_advise_cli.py and is the
+    # constraint this whole block exists to honour.
+    dbt_context, dbt_disclosure = load_dbt_context(project_dir, manifest)
     if dbt_disclosure is not None:
         typer.echo(dbt_disclosure, err=True)
+
+    dbt_payload: dict | None = None
+    if dbt_context is not None:
+        # Rewrite index-creating proposals for dbt-managed relations (ADV302), then add
+        # ADV301 (materialize a hot view) and ADV303 (a model the workload never touched).
+        # `enrich_proposals` and both `propose_*` calls return an *unsorted-relative-to-
+        # each-other* concatenation, so the combined list is re-sorted with the adapter's
+        # own ranking key: without this, a proposal `enrich_proposals` downgrades (e.g. a
+        # view it strips DDL from, dropping it to LOW) would keep its old, now-wrong
+        # position, and the terminal table, the markdown and the DDL file would each see a
+        # different order depending on which pass touched them last.
+        proposals = enrich_proposals(proposals, dbt_context)
+        proposals = proposals + propose_materialization(
+            aggregation, dbt_context, min_cost_share=min_cost_share
+        )
+        proposals = proposals + propose_unused_models(aggregation, dbt_context, workload)
+        proposals = sorted(proposals, key=PostgresWorkloadAdapter._ranking_key)
+
+        # Mirrors `load_dbt_context`'s own resolution order so the path disclosed here is
+        # exactly the one it loaded — recomputed rather than parsed back out of
+        # `dbt_disclosure`'s text, which is a message for a human, not a machine field.
+        resolved_manifest = _resolved_manifest_path(project_dir, manifest)
+        assert resolved_manifest is not None  # dbt_context is only ever set when one was given
+        dbt_payload = {
+            "manifest": str(resolved_manifest),
+            "models": len(dbt_context.models),
+            "dropped_collisions": dbt_context.dropped_collisions,
+        }
 
     payload = advise_payload(
         proposals,
@@ -863,6 +914,7 @@ def advise(
         engine=params.engine,
         redacted=not keep_literals,
         degraded=adapter.degraded,
+        dbt=dbt_payload,
     )
     # Both writes happen after the whole analysis, so an unwritable path would otherwise
     # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate
@@ -888,6 +940,7 @@ def advise(
             engine=params.engine,
             redacted=not keep_literals,
             degraded=adapter.degraded,
+            dbt=dbt_payload,
         )
         try:
             markdown.write_text(markdown_text, encoding="utf-8")
