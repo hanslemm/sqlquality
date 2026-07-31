@@ -6,7 +6,7 @@ from datetime import timedelta
 import sqlglot
 import pytest
 
-from sqlquality.models import Aggregation, ConnectionParams, Workload
+from sqlquality.models import Aggregation, ConnectionParams, Relation, Workload
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.fingerprint import ingest
@@ -91,7 +91,6 @@ def test_there_is_no_ndv_or_index_capability():
 #: Redshift speaks the same PostgreSQL wire protocol Postgres does, so it is the one
 #: method genuinely exercisable without a live Redshift cluster.
 UNIMPLEMENTED = {
-    "fetch_table_facts": lambda a: a.fetch_table_facts(("public",), frozenset()),
     "propose": lambda a: a.propose(
         Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
         {},
@@ -265,6 +264,213 @@ def test_fetch_schema_is_nested_by_schema():
         "sales": {"orders": {"id": "integer", "status": "text"}},
         "staging": {"orders": {"id": "integer"}},
     }
+
+
+def test_table_facts_do_not_alias_across_schemas():
+    rows = {
+        CAP_SCHEMA: [("sales", "orders", "id", "integer"), ("staging", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [
+            ("sales", "orders", 50_000, 1024, 5.0, 0.0, "EVEN", "id", 0.1),
+            ("staging", "orders", 7, 1, 0.0, 0.0, "KEY(id)", "id", 0.0),
+        ],
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    facts = adapter.fetch_table_facts(
+        ("sales", "staging"),
+        frozenset({Relation("sales", "orders"), Relation("staging", "orders")}),
+    )
+    assert facts[Relation("sales", "orders")].row_estimate == 50_000
+    assert facts[Relation("staging", "orders")].row_estimate == 7
+    assert facts[Relation("sales", "orders")].size_bytes == 1024 * 1024 * 1024
+    assert facts[Relation("staging", "orders")].size_bytes == 1 * 1024 * 1024
+
+
+def test_fetch_table_facts_does_not_leak_a_same_named_table_from_another_schema():
+    """Same over-fetch guard `PostgresWorkloadAdapter.fetch_table_facts` documents: the
+    table parameter is bare names, so a same-named table in a schema that was requested but
+    is not itself in `relations` can come back too. It must not appear in the result.
+    """
+    rows = {
+        CAP_SCHEMA: [("sales", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [
+            ("sales", "orders", 100, 1, 0.0, 0.0, "EVEN", "id", 0.0),
+            ("staging", "orders", 9_999, 50, 0.0, 0.0, "EVEN", "id", 0.0),
+        ],
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    facts = adapter.fetch_table_facts(
+        ("sales", "staging"), frozenset({Relation("sales", "orders")})
+    )
+    assert list(facts) == [Relation("sales", "orders")]
+
+
+def test_a_null_tbl_rows_reads_as_an_unknown_row_estimate():
+    """Sentinel 1: `tbl_rows` itself coming back SQL NULL — the row was never populated at
+    all — must read as unknown, not as zero."""
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("public", "orders", None, 100, 0.0, 0.0, "EVEN", "id", 0.0)],
+    }
+    facts = RedshiftWorkloadAdapter(querier=_canned(rows)).fetch_table_facts(
+        ("public",), frozenset({Relation("public", "orders")})
+    )
+    assert facts[Relation("public", "orders")].row_estimate is None
+    # size is a separate sentinel (see below) and must be unaffected by this one.
+    assert facts[Relation("public", "orders")].size_bytes == 100 * 1024 * 1024
+
+
+def test_a_null_size_reads_as_an_unknown_size_bytes():
+    """Sentinel 2: `size` coming back SQL NULL must read as unknown, independently of
+    `tbl_rows`."""
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("public", "orders", 500, None, 0.0, 0.0, "EVEN", "id", 0.0)],
+    }
+    facts = RedshiftWorkloadAdapter(querier=_canned(rows)).fetch_table_facts(
+        ("public",), frozenset({Relation("public", "orders")})
+    )
+    assert facts[Relation("public", "orders")].size_bytes is None
+    assert facts[Relation("public", "orders")].row_estimate == 500
+
+
+def test_stats_off_100_reads_tbl_rows_and_size_as_unknown_despite_present_values():
+    """Sentinel 3, the central lesson this task exists to apply: Redshift's own version of
+    `pg_class.reltuples = -1`. At `stats_off = 100` — statistics never refreshed by
+    ANALYZE — `tbl_rows`/`size` are non-NULL but meaningless; reading them as facts is
+    exactly what silently suppressed every Postgres proposal for a freshly-loaded table.
+    """
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("public", "orders", 3, 1, 0.0, 100.0, "EVEN", "id", 0.0)],
+    }
+    facts = RedshiftWorkloadAdapter(querier=_canned(rows)).fetch_table_facts(
+        ("public",), frozenset({Relation("public", "orders")})
+    )
+    assert facts[Relation("public", "orders")].row_estimate is None
+    assert facts[Relation("public", "orders")].size_bytes is None
+
+
+def test_a_null_stats_off_does_not_suppress_a_real_row_estimate():
+    """The control for sentinel 3: `stats_off` itself coming back NULL is unknown
+    staleness, not proven-stale, and must not be treated as "never analyzed" — otherwise
+    every table whose staleness this adapter cannot see would silently lose its row
+    estimate and size too.
+    """
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("public", "orders", 42, 7, None, None, None, None, None)],
+    }
+    facts = RedshiftWorkloadAdapter(querier=_canned(rows)).fetch_table_facts(
+        ("public",), frozenset({Relation("public", "orders")})
+    )
+    assert facts[Relation("public", "orders")].row_estimate == 42
+    assert facts[Relation("public", "orders")].size_bytes == 7 * 1024 * 1024
+
+
+def test_physical_facts_are_stashed_on_the_adapter_keyed_by_relation():
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [
+            ("public", "orders", 1000, 10, 12.5, 3.0, "KEY(customer_id)", "created_at", 0.4)
+        ],
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    physical = adapter.physical_facts[Relation("public", "orders")]
+    assert physical.unsorted == 12.5
+    assert physical.stats_off == 3.0
+    assert physical.diststyle == "KEY(customer_id)"
+    assert physical.sortkey1 == "created_at"
+    assert physical.skew_rows == 0.4
+
+
+def test_a_relation_absent_from_svv_table_info_is_absent_from_the_facts_dict():
+    """`svv_columns` carries external (Spectrum) tables; `svv_table_info` does not. A
+    Spectrum relation must be simply missing from both results — not present with every
+    field forced to `None` — so a later task's SORTKEY/DISTKEY rules can tell
+    "structurally cannot have one" apart from "not analysed yet." See
+    `fetch_table_facts`'s docstring.
+    """
+    rows = {
+        CAP_SCHEMA: [
+            ("public", "orders", "id", "integer"),
+            ("spectrum", "events", "id", "integer"),
+        ],
+        CAP_TABLE_FACTS: [("public", "orders", 1000, 10, 0.0, 0.0, "EVEN", "id", 0.0)],
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    facts = adapter.fetch_table_facts(
+        ("public", "spectrum"),
+        frozenset({Relation("public", "orders"), Relation("spectrum", "events")}),
+    )
+    assert Relation("public", "orders") in facts
+    assert Relation("spectrum", "events") not in facts
+    assert Relation("spectrum", "events") not in adapter.physical_facts
+    # The columns are still there for qualification purposes (see fetch_schema).
+    schema = adapter.fetch_schema(("public", "spectrum"))
+    assert "events" in schema["spectrum"]
+
+
+def _select_list(sql: str) -> str:
+    """The text between `SELECT` and the first `FROM`. See the identical helper in
+    `tests/test_workload_postgres.py`."""
+    match = re.search(r"select\s+(.*?)\s+from\b", sql, re.IGNORECASE | re.DOTALL)
+    assert match, f"no SELECT ... FROM found in statement: {sql!r}"
+    return match.group(1)
+
+
+def _select_list_arity(sql: str) -> int:
+    """Number of columns in a statement's SELECT list, ignoring a comma nested inside
+    parentheses (none of today's statements have one in the select list, but a naive comma
+    count would silently miscount one if it ever did)."""
+    depth = 0
+    arity = 1
+    for ch in _select_list(sql):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            arity += 1
+    return arity
+
+
+def _dummy_row(width: int) -> tuple:
+    """A row exactly as wide as the statement's own SELECT list, so unpacking it exercises
+    the real arity rather than a fixture written to match the unpacking — see the module
+    docstring's provenance warning."""
+    return tuple(range(width))
+
+
+@pytest.mark.parametrize(
+    ("capability", "fetch"),
+    [
+        (CAP_WORKLOAD, lambda a: a.fetch_workload(None, 10)),
+        (CAP_SCHEMA, lambda a: a.fetch_schema(("public",))),
+        (CAP_TABLE_FACTS, lambda a: a.fetch_table_facts(("public",), frozenset())),
+    ],
+    ids=["workload", "schema", "table_facts"],
+)
+def test_select_list_arity_matches_its_consumers_unpacking(capability, fetch):
+    """Batch 2 shipped a column-count mismatch between a statement's SELECT list and its
+    Python unpacking that no fixture caught, because the fixture was written to match the
+    unpacking rather than the statement. This derives the row width from the SQL text
+    itself and feeds it through the real consumer method, so a future edit to either side
+    that the other does not follow raises `ValueError` here — one parametrized case per
+    capability, so a mismatch in one does not hide behind the other two passing.
+    """
+    width = _select_list_arity(RedshiftWorkloadAdapter.SQL[capability])
+    querier = _canned({capability: [_dummy_row(width)]})
+    fetch(RedshiftWorkloadAdapter(querier=querier))  # must not raise ValueError
+
+
+def test_advisor_select_list_arity_is_pinned_for_its_future_consumer():
+    """`CAP_ADVISOR` has no consumer yet — `propose()` is Task 5/6's job — so there is no
+    unpacking to compare against today. This pins the SELECT list's current arity so
+    whoever builds that consumer inherits a known, deliberate number instead of discovering
+    a drift between the statement and their own unpacking after the fact.
+    """
+    assert _select_list_arity(RedshiftWorkloadAdapter.SQL[CAP_ADVISOR]) == 6
 
 
 class _FakeCursor:

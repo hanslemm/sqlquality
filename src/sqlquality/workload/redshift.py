@@ -37,6 +37,7 @@ degradation rather than a hard failure — is documented on `connect()` itself.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlquality.models import (
@@ -129,6 +130,87 @@ def _as_float(value: object) -> float:
     return float(value)  # type: ignore[arg-type]
 
 
+#: `svv_table_info.stats_off`: a 0-100 staleness gauge for a table's statistics, where 0
+#: is current and 100 means the statistics have never been refreshed by ANALYZE. Compared
+#: with `>=` rather than `==` so a value the driver reports fractionally above 100 (not
+#: documented as possible, but not documented as impossible either) still reads as fully
+#: stale rather than silently passing a stricter equality check.
+_STATS_FULLY_STALE = 100.0
+
+#: `svv_table_info.size` is documented in 1 MB blocks; `TableFacts.size_bytes` is bytes.
+_MB_BYTES = 1024 * 1024
+
+
+def _never_analyzed(stats_off: object) -> bool:
+    """True when `stats_off` says this table's statistics have never been refreshed.
+
+    `stats_off is None` (the statement was denied, or the column itself came back NULL for
+    a reason this adapter cannot see) is deliberately *not* treated as "never analyzed" —
+    that would be inventing a fact from an absence, the same conflation `_row_estimate` and
+    `_size_bytes` exist to avoid on the other side. It reads as merely unknown, and the raw
+    `tbl_rows`/`size` value — if present — passes through unchanged.
+    """
+    return stats_off is not None and _as_float(stats_off) >= _STATS_FULLY_STALE
+
+
+def _row_estimate(tbl_rows: object, stats_off: object) -> int | None:
+    """`svv_table_info.tbl_rows`, with Redshift's own never-analyzed sentinel translated to
+    unknown.
+
+    This is Redshift's version of the bug Postgres's `_row_estimate` was written to fix:
+    `pg_class.reltuples = -1` meaning "never analyzed" being read as "tiny table," which
+    silently suppressed every index proposal for that table with no message. Redshift does
+    not reuse a negative number for the same meaning — `tbl_rows` is a plain count — so the
+    signal instead lives in the sibling column `stats_off`: at 100 the row count (and the
+    size below) reflect statistics that have never been refreshed by ANALYZE, which is
+    exactly the freshly-loaded-table-with-slow-queries moment someone reaches for `advise`
+    in the first place. `None` already means "unknown" throughout — a rule proposes at LOW
+    and says the row count could not be checked — so translating the sentinel here is the
+    whole fix. A NULL `tbl_rows` (the row was never populated at all) translates the same
+    way.
+    """
+    if tbl_rows is None or _never_analyzed(stats_off):
+        return None
+    return _as_int(tbl_rows)
+
+
+def _size_bytes(size: object, stats_off: object) -> int | None:
+    """`svv_table_info.size` (1 MB blocks) converted to bytes, gated by the same
+    never-analyzed sentinel `_row_estimate` translates — see that function's docstring.
+    """
+    if size is None or _never_analyzed(stats_off):
+        return None
+    return _as_int(size) * _MB_BYTES
+
+
+@dataclass(frozen=True)
+class RedshiftTableFacts:
+    """Redshift's own physical-design facts, which `TableFacts` deliberately does not
+    model — see that dataclass's docstring: it is engine-neutral, and SORTKEY/DISTKEY/
+    staleness are Redshift-specific levers. Held in the adapter, keyed by `Relation`, the
+    way `postgres.py` holds `PgIndex`.
+
+    Every field is `None` only when its own source value was SQL NULL — `unsorted`,
+    `diststyle`, `sortkey1` and `skew_rows` carry no sentinel of their own the way
+    `tbl_rows`/`size` do, so they are not gated by `stats_off`; see `_row_estimate` for the
+    one translation this adapter does perform.
+
+    A relation absent entirely from the dict this is stored in (`RedshiftWorkloadAdapter
+    .physical_facts`) is a *distinct* condition from every field here being `None`: absence
+    means the relation never appeared in `svv_table_info` at all, which is what a Spectrum
+    (external) table looks like — `svv_columns` sees it (so `fetch_schema` can qualify a
+    query against it) but `svv_table_info` does not, since an external table cannot carry a
+    SORTKEY or a DISTSTYLE. A later task proposing either must check for the relation's
+    absence from this dict, not merely for `None` fields on a present entry.
+    """
+
+    unsorted: float | None
+    stats_off: float | None
+    diststyle: str | None
+    sortkey1: str | None
+    skew_rows: float | None
+
+
 class RedshiftWorkloadAdapter(WorkloadAdapter):
     engine = "redshift"
 
@@ -178,9 +260,14 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # both stay double-quoted so the statement parses at all; dropping either quote
         # breaks the statement (verified with sqlglot's redshift dialect — see
         # test_every_statement_parses_as_redshift_sql). `tbl_rows` and `size` are the row
-        # estimate and size-in-MB columns per AWS's documentation.
+        # estimate and size-in-MB columns per AWS's documentation; `unsorted`, `stats_off`,
+        # `diststyle`, `sortkey1` and `skew_rows` are the physical-design evidence ADV103
+        # (DISTSTYLE ALL) and ADV104 (VACUUM/ANALYZE) need — see `RedshiftTableFacts`.
+        # `stats_off` doubles as the never-analyzed sentinel `_row_estimate`/`_size_bytes`
+        # translate to unknown.
         CAP_TABLE_FACTS: """
-            SELECT "schema", "table", tbl_rows, size
+            SELECT "schema", "table", tbl_rows, size, unsorted, stats_off, diststyle,
+                   sortkey1, skew_rows
             FROM svv_table_info
             WHERE "schema" = ANY(%s) AND "table" = ANY(%s)
         """,
@@ -204,6 +291,12 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         #: would append two identical entries to `degraded` when it was denied. Mirrors
         #: `PostgresWorkloadAdapter`'s identical cache.
         self._schema_cache: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
+        #: Redshift-specific physical facts from the most recent `fetch_table_facts` call,
+        #: keyed the same way as its `TableFacts` return value — see `RedshiftTableFacts`.
+        #: A later task's SORTKEY/DISTKEY rules read this directly rather than through a
+        #: second introspection round trip, since one CAP_TABLE_FACTS query already carries
+        #: both the engine-neutral and the Redshift-specific columns.
+        self.physical_facts: dict[Relation, RedshiftTableFacts] = {}
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -355,7 +448,62 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
     def fetch_table_facts(
         self, schemas: tuple[str, ...], relations: frozenset[Relation]
     ) -> dict[Relation, TableFacts]:
-        raise NotImplementedError("Redshift fetch_table_facts() is not implemented yet.")
+        """Row estimates, sizes and columns — plus Redshift's own physical-design facts,
+        stashed on `self.physical_facts` for a later task (see `RedshiftTableFacts`).
+
+        Deliberately does **not** create an entry for every relation in `relations`, unlike
+        `PostgresWorkloadAdapter.fetch_table_facts`. `svv_columns` includes external
+        (Spectrum) tables and `svv_table_info` does not (see `fetch_schema`'s docstring),
+        so a relation named in `relations` can legitimately never appear in this method's
+        `svv_table_info` rows at all. Forcing an entry anyway — every field `None` — would
+        make "this is an external table, structurally incapable of SORTKEY/DISTKEY" look
+        identical to "this is a real table whose statistics simply have not been analysed
+        yet," which is exactly the conflation `_row_estimate` and `_size_bytes` exist to
+        prevent on the *value* side. A relation's simple absence from the returned dict (and
+        from `self.physical_facts`) is the signal a later task's SORTKEY/DISTKEY rules must
+        check for instead.
+        """
+        wanted = sorted({relation.table for relation in relations})
+        columns: dict[Relation, list[str]] = {}
+        for schema_name, table, column, _type in self._schema_rows(schemas):
+            relation = Relation(schema=str(schema_name), table=str(table))
+            if relation in relations:
+                columns.setdefault(relation, []).append(str(column))
+
+        facts: dict[Relation, TableFacts] = {}
+        physical: dict[Relation, RedshiftTableFacts] = {}
+        for (
+            schema_name,
+            table,
+            tbl_rows,
+            size,
+            unsorted,
+            stats_off,
+            diststyle,
+            sortkey1,
+            skew_rows,
+        ) in self._run(CAP_TABLE_FACTS, (list(schemas), wanted)):
+            relation = Relation(schema=str(schema_name), table=str(table))
+            # Same over-fetch guard `PostgresWorkloadAdapter.fetch_table_facts` documents:
+            # the table parameter is bare names, so a same-named table in a *different*
+            # requested schema that is not itself in `relations` can come back too.
+            if relation not in relations:
+                continue
+            facts[relation] = TableFacts(
+                relation=relation,
+                row_estimate=_row_estimate(tbl_rows, stats_off),
+                size_bytes=_size_bytes(size, stats_off),
+                columns=tuple(columns.get(relation, ())),
+            )
+            physical[relation] = RedshiftTableFacts(
+                unsorted=_as_float(unsorted) if unsorted is not None else None,
+                stats_off=_as_float(stats_off) if stats_off is not None else None,
+                diststyle=str(diststyle) if diststyle is not None else None,
+                sortkey1=str(sortkey1) if sortkey1 is not None else None,
+                skew_rows=_as_float(skew_rows) if skew_rows is not None else None,
+            )
+        self.physical_facts = physical
+        return facts
 
     def propose(
         self,
