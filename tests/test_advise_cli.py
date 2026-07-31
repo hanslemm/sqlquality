@@ -1456,3 +1456,156 @@ def test_the_no_manifest_run_contains_no_dbt_conditional_element_anywhere(monkey
             assert token not in text, f"{token!r} leaked into {name} on a dbt-free run"
     for proposal in payload["proposals"]:
         assert not any(k.startswith("dbt") for k in proposal["evidence"]), proposal
+
+
+def test_redshift_read_only_degradation_reaches_stderr_end_to_end(monkeypatch):
+    """The carried-forward item from Tasks 2-4: `connect()`'s read-only degradation was
+    recorded correctly from the start, but could never reach a user because `propose()`
+    raised `NotImplementedError` before `cli.py` ever got to the loop that prints
+    `adapter.degraded` to stderr — see `RedshiftWorkloadAdapter.propose`'s docstring and
+    `tests/test_workload_redshift.py`'s `test_the_read_only_degradation_survives_past_
+    fetch_workload`, which proved only that `fetch_workload` no longer crashed, and said so
+    explicitly rather than claiming the full run worked.
+
+    Now that ADV101-105 make `propose()` a real method, a full `advise` run against a
+    Redshift adapter whose `connect()` recorded a read-only degradation must complete and
+    print it — this is the first test that exercises `cli.py` end to end for that engine
+    rather than stopping at `fetch_workload`.
+    """
+    from sqlquality.workload.redshift import DEGRADATION_READ_ONLY, RedshiftWorkloadAdapter
+
+    def fake_connect(self, params, timeout_s):
+        def query(sql, bind):
+            return []
+
+        self._query = query
+        self.degraded.append(
+            (
+                DEGRADATION_READ_ONLY,
+                "the session could not be proven read-only (belt-and-braces guard refused) — ***",
+            )
+        )
+
+    monkeypatch.setattr(RedshiftWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0, result.output
+    assert f"reduced coverage — {DEGRADATION_READ_ONLY}:" in result.stderr
+    assert "could not be proven read-only" in result.stderr
+
+
+def test_redshift_advise_run_with_no_degradation_prints_none(monkeypatch):
+    """Guards the test above: a clean `connect()` must not print a `reduced coverage` line
+    at all, so the assertion above is attributable to the recorded degradation, not to
+    `cli.py` always printing something regardless of `adapter.degraded`'s contents."""
+    from sqlquality.workload.redshift import RedshiftWorkloadAdapter
+
+    def fake_connect(self, params, timeout_s):
+        self._query = lambda sql, bind: []
+
+    monkeypatch.setattr(RedshiftWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0, result.output
+    assert "reduced coverage" not in result.stderr
+
+
+def _redshift_dbt_run(monkeypatch, *, extra_args=()):
+    """A full `advise --engine redshift` run over a fake querier, on the dbt fixture's
+    `main.orders` (a `table`-materialized model), returning the CliRunner result.
+
+    The rows are shaped for the real statements: one hot range predicate on
+    `main.orders.created_at` so ADV101 fires, and `svv_table_info` facts saying the table is
+    sorted on a *different* column so the proposal is not suppressed.
+    """
+    from sqlquality.workload.redshift import (
+        CAP_ADVISOR,
+        CAP_SCHEMA,
+        CAP_TABLE_FACTS,
+        CAP_WORKLOAD,
+        RedshiftWorkloadAdapter,
+    )
+
+    rows = {
+        CAP_WORKLOAD: [("select id from main.orders where created_at > '2026-01-01'", 5_000_000)],
+        CAP_SCHEMA: [
+            ("main", "orders", "id", "integer"),
+            ("main", "orders", "created_at", "timestamp"),
+        ],
+        CAP_TABLE_FACTS: [("main", "orders", 10_000, 50, 0.0, 0.0, "EVEN", "id", 0.0)],
+        CAP_ADVISOR: [],
+    }
+
+    def fake_connect(self, params, timeout_s):
+        def query(sql, bind):
+            for capability, canned in rows.items():
+                if RedshiftWorkloadAdapter.SQL[capability] in sql:
+                    return canned
+            return []
+
+        self._query = query
+
+    monkeypatch.setattr(RedshiftWorkloadAdapter, "connect", fake_connect)
+    return runner.invoke(
+        app,
+        [
+            "advise",
+            "--engine",
+            "redshift",
+            "--dsn",
+            "postgresql://u@h/db",
+            "--schema",
+            "main",
+            *extra_args,
+        ],
+    )
+
+
+def test_redshift_dbt_enrichment_is_disclosed_in_the_terminal_end_to_end(monkeypatch):
+    """dbt enrichment must not be invisible to a terminal-only user on Redshift.
+
+    `describe_rewrites` counted only ADV302's config-block rewrite, and no Redshift proposal
+    can reach that path — nothing this adapter emits is a `CREATE INDEX` — so the stderr line
+    never appeared: the terminal row for an enriched ADV101 was byte-identical to the same
+    proposal from a dbt-free run (same code, same confidence, same cost share, same title),
+    while the warning that `dbt run` will undo an hours-long full-table rewrite sat in
+    `rationale` and in the `--ddl` note, neither of which the terminal prints. This pins the
+    whole chain end to end — the evidence flag, the count, and `cli.py`'s echo — rather than
+    only the counting function, because each link in it has been broken separately before.
+    """
+    result = _redshift_dbt_run(monkeypatch, extra_args=("--manifest", str(DBT_FIXTURE)))
+    assert result.exit_code == 0, result.output
+    assert "ADV101" in result.stdout, "a vacuous run would satisfy the assertion below"
+    assert "cannot be expressed as dbt config" in result.stderr
+    assert "may undo it" in result.stderr
+
+
+def test_redshift_run_without_a_manifest_says_nothing_about_dbt(monkeypatch):
+    """Control for the test above: the same run with no manifest must print no enrichment
+    line at all, so the disclosure is attributable to dbt enrichment rather than to
+    `cli.py` always printing something."""
+    result = _redshift_dbt_run(monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert "ADV101" in result.stdout
+    assert "dbt" not in result.stderr
+    assert "cannot be expressed" not in result.stderr
+
+
+def test_redshift_dry_run_prints_all_four_statements_and_never_connects(monkeypatch):
+    """Task 8's proof that a user can inspect Redshift's introspection SQL — every column
+    name unverified against a live cluster (see `redshift.py`'s module docstring) — before
+    trusting it with a real connection. Mirrors `test_dry_run_prints_statements_and_never_
+    connects` above, for the engine whose SQL genuinely needs this escape hatch most.
+    """
+
+    def explode(*args, **kwargs):
+        raise AssertionError("--dry-run must not connect")
+
+    monkeypatch.setattr("sqlquality.workload.redshift.RedshiftWorkloadAdapter.connect", explode)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    for marker in ("sys_query_history", "svv_columns", "svv_table_info", "svv_alter_table"):
+        assert marker in result.stdout
+
+
+def test_redshift_dry_run_needs_no_credentials():
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dry-run"])
+    assert result.exit_code == 0, result.output

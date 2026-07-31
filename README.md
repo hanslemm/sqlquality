@@ -268,9 +268,30 @@ optimizations — indexes to add, indexes to drop, partial indexes, non-sargable
 predicates, and hot `SELECT *`. Output is an advisory report plus a DDL file for you to
 review. **`advise` never writes to your database and never executes DDL.**
 
-Only **Postgres** is implemented today; Redshift and Snowflake are designed but not built
-— see [Limitations](#limitations). An optional dbt manifest enriches the same analysis —
-see [dbt enrichment](#dbt-enrichment-optional) below.
+**Postgres** and **Redshift** are implemented; Snowflake is designed but not built — see
+[Limitations](#limitations). An optional dbt manifest enriches the same analysis — see
+[dbt enrichment](#dbt-enrichment-optional) below.
+
+**What is proven for Redshift, and what is not — read this before pointing `--engine
+redshift` at a production cluster.** There is no Redshift container available for
+development, and Postgres — where every other engine's introspection SQL gets exercised
+during tests — does not implement Redshift's `svv_*`/`sys_*` system views at all, so
+nothing in this adapter can be run against a real Redshift cluster before release. What
+*is* verified: the **connection path** (Redshift speaks the PostgreSQL wire protocol, so
+the read-only session, the statement timeout and secret scrubbing are exercised live
+against a real Postgres server); every introspection **statement's syntax**, checked with
+sqlglot's `redshift` dialect; and every statement's **bindability** — that its parameters
+can actually be prepared and sent over the wire — proven live against stand-in tables
+shaped like the real views. What is **not** verified: the **column names and the
+semantics of the resulting proposals**. Those come from AWS's published system-view
+documentation, not from an observed row, and have never been executed against a live
+cluster. A wrong column name degrades one capability (recorded in `degraded`, never a
+crash — see the Redshift section below), but it can still mean thin or wrong evidence.
+Run `sqlquality advise --engine redshift --dry-run` first: it prints every statement this
+adapter can issue, with no connection at all, so you can review it — or hand it to a DBA
+— before `advise` ever touches your cluster. If you run this against a real cluster,
+please [open an issue](https://github.com/hanslemm/sqlquality/issues) with what you found;
+the first user with a cluster is part of closing this gap, not just a consumer of it.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics
@@ -308,7 +329,7 @@ missing driver degrades with an install hint instead of a traceback.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--engine` | inferred | `postgres` is the only engine implemented today. |
+| `--engine` | inferred | `postgres` or `redshift`. See the Redshift section below for what is and is not proven on that engine. |
 | `--dsn` | — | Database URL. Overrides `SQLQUALITY_DSN`. |
 | `--profile` | — | dbt profile name, read from `profiles.yml`. |
 | `--target` | — | dbt target within the profile. |
@@ -317,7 +338,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--manifest` | — | Path to a dbt `manifest.json`. Overrides `--project-dir`. |
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
-| `--limit` | `500` | Max query-history rows to read. |
+| `--limit` | `500` | Max query-history rows to read. **On Redshift this counts *executions*, not query groups** — see the Redshift section below. |
 | `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 — the last only with `--project-dir`/`--manifest`); the index-hygiene rules **ADV002 and ADV003**, and **ADV303** (its evidence is absence, not cost, so there is no share to threshold), carry no cost evidence and are reported whatever the threshold. ADV303 has its own non-threshold suppression: it emits nothing at all when no query usage could be extracted, since then every model would look untouched by definition. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
@@ -347,7 +368,12 @@ SELECT stats_reset
 ```
 
 (truncated here; the real output also lists the `schema`, `table_facts`, `ndv` and
-`indexes` capabilities). `--json` is honored on `--dry-run` too, so the statement list can
+`indexes` capabilities). `sqlquality advise --engine redshift --dry-run` works exactly the
+same way — no credentials needed, no connection made — and is the recommended way to
+review Redshift's introspection SQL yourself (or hand it to a DBA) before trusting it with
+a real cluster; see the note at the top of the [Redshift
+section](#redshift---engine-redshift) for what is and is not verified about it. `--json`
+is honored on `--dry-run` too, so the statement list can
 be diffed or fed into review tooling.
 
 **Data protection.** Query history routinely contains personal data inside predicates
@@ -422,6 +448,94 @@ ADV302 rewrote. See [dbt enrichment](#dbt-enrichment-optional).
 
 Every proposal's evidence renders inline (cost share, calls, fingerprints, row estimate,
 NDV, existing index state) so it can be judged from the report alone.
+
+#### Redshift (`--engine redshift`)
+
+Redshift has no indexes at all, so none of ADV001–ADV008 apply. Its physical-design
+levers are different, and so is the blast radius: **ADV101, ADV102 and ADV103 each
+rewrite the entire table.** Redshift copies every row, holds a lock on the table for the
+whole rewrite, and needs roughly the table's own size again in free disk space while it
+runs — on a large table that is hours, not seconds. Unlike a Postgres `CREATE INDEX
+CONCURRENTLY`, **there is no concurrent-build escape on Redshift**: none of the three can
+be applied alongside normal traffic. Schedule them for a maintenance window; do not run
+them ad hoc. `--ddl`'s generated script says this loudly, at the top of the file, not only
+beside each individual statement.
+
+| Code | Proposal | Table rewrite? | Evidence |
+|---|---|---|---|
+| ADV101 | `ALTER TABLE ... ALTER SORTKEY`: sort the table on its hottest range/equality predicate column, capped at MEDIUM | **Yes** | cost share, current sort key, `stats_off` staleness |
+| ADV102 | `ALTER TABLE ... ALTER DISTKEY`: distribute the table on its hottest join predicate column, capped at MEDIUM | **Yes** | cost share, current distribution style, `skew_rows`, `stats_off` |
+| ADV103 | `ALTER TABLE ... ALTER DISTSTYLE ALL`: replicate a small (≤1,000,000-row), frequently-joined dimension to every node, capped at MEDIUM | **Yes** | cost share, row estimate, current distribution style |
+| ADV104 | `VACUUM` (unsorted region ≥20%) and/or `ANALYZE` (stale statistics ≥20%), each its own proposal | **No** — reclaims sort order or refreshes statistics in place; no exclusive lock for its duration | `unsorted`, `stats_off` (direct catalog measurements) |
+| ADV105 | Amazon Redshift Advisor's own SORTKEY/DISTSTYLE recommendation, relayed verbatim | Whatever Advisor recommends — read its own `note` | attributed as Advisor's, not sqlquality's |
+
+**ADV101, ADV102 and ADV103 can never reach HIGH confidence, by design, not merely by
+current implementation.** Whether a SORTKEY, DISTKEY or DISTSTYLE ALL change is actually
+worth its rewrite depends on the predicate's selectivity and the table's distribution
+skew — and Redshift exposes no per-column distinct-value statistics (no `pg_stats
+.n_distinct` equivalent) to measure either. Claiming HIGH would assert something about
+data distribution this tool cannot see, while recommending a statement that rewrites the
+whole table. ADV104 is the exception: `unsorted`/`stats_off` are direct catalog
+measurements, not an inference about data this tool cannot see, and its remediation does
+not rewrite anything — so it is also the only Redshift rule that can reach HIGH.
+
+**ADV105 is Redshift Advisor's own recommendation, never sqlquality's inference — and it
+says so everywhere a reader might look.** Its title, rationale, evidence
+(`evidence.source == "amazon_redshift_advisor"`) and `note` all attribute it explicitly,
+and the DDL script marks its header line `(Amazon Redshift Advisor — not sqlquality)` on
+top of that — someone skimming only header lines, never the prose, still cannot mistake
+an Advisor statement for one this tool generated. When ADV101/102/103 and an Advisor row
+agree on the same table and category, the sqlquality proposal's rationale says so as an
+added sentence; the two stay separate proposals rather than merging, so it is always
+clear which conclusion is whose. When ADV103 (DISTSTYLE ALL) and ADV102 (DISTKEY) both
+fire for the same table, only ADV103 survives — replicating to every node already removes
+redistribution for every join, which strictly subsumes any single-column DISTKEY choice —
+and the surviving proposal says so.
+
+A relation with a hot predicate but absent from Redshift's own physical-design catalog
+(`svv_table_info`) gets **no** ADV101/102/103 proposal at all, and the run discloses how
+many relations this affected (`reduced coverage — physical_facts_gap: ...`) rather than
+silently dropping them: that absence cannot, by itself, tell an external Spectrum table
+(which cannot carry a SORTKEY/DISTKEY/DISTSTYLE) apart from a genuinely empty local one,
+and proposing a rewrite for something that might not even support one is worse than
+proposing nothing.
+
+**The workload can come back silently partial — grant `SYSLOG ACCESS UNRESTRICTED` first.**
+`advise` reads `sys_query_history`, and without that privilege Redshift does not deny the
+read: it returns **only the connecting user's own queries**. There is no error, no denied
+capability and nothing in `degraded` — a cluster whose whole workload is invisible to your
+read-only role looks exactly like a quiet cluster with little traffic, and every proposal is
+then built from one user's slice of it. Grant it before your first run:
+
+```sql
+ALTER USER <your_readonly_user> SYSLOG ACCESS UNRESTRICTED;  -- superuser-only
+```
+
+`--dry-run` prints this same warning beside the statement it applies to, and the hint is
+also recorded in `degraded` **if** the read is refused outright — but the failure described
+here is precisely the one that is never refused, so the hint alone is not disclosure. This
+is the same class of trap as Postgres's `pg_stats`, and unlike a missing grant it costs you
+coverage rather than a capability.
+
+**`--limit` means executions on Redshift, not query groups.** `sys_query_history` is one
+row per *execution*, where Postgres's `pg_stat_statements` is already aggregated per
+normalised statement — so `--limit 500` reads the 500 most expensive **executions**, and 500
+executions of one bad query is a legal outcome that leaves every other statement unseen.
+The `window:` line names what was actually read ("the 500 most expensive successful queries
+…"); raise `--limit` if the coverage line shows fewer query groups than you expect.
+
+**dbt interaction.** [ADV302](#dbt-enrichment-optional) rewrites `CREATE INDEX`
+proposals into dbt `indexes:` config, which has no Redshift equivalent (SORTKEY/DISTKEY
+have no comparable dbt config key modeled by this tool). Rather than leave a dbt-managed
+Redshift model's table-rewrite proposal silently unwarned — which would be worse than the
+Postgres case ADV302 exists to fix, since the wasted work is hours rather than seconds —
+`enrich_proposals`'s existing generic path (built for any DDL that is not `CREATE INDEX`
+or `DROP INDEX`) already recognises ADV101–105 and attaches a warning to both the
+proposal's `rationale` **and** its `--ddl` `note`: that the relation is dbt-managed, that
+the statement is not expressed as dbt config, and that it may not survive the model's next
+rebuild. This is not the same thing as the `adapter_type` mismatch warning: a Redshift dbt
+project correctly records `adapter_type: redshift`, so that check does not fire — this is
+a separate, always-on warning specific to table-rewrite and maintenance statements.
 
 **How overlapping proposals are reconciled.** The rules above are evaluated independently,
 but their output is not shipped independently: two of them can reach the same index from
@@ -1013,10 +1127,47 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   Qualify the table in the query, or run `advise` once per `--schema`, to recover it.
   Generated DDL is qualified with the schema it was read from, so it does not depend on the
   applying session's `search_path`.
-- **Redshift and Snowflake are designed but not implemented.** `advise` supports Postgres
-  only today; passing another `--engine` fails with a clear error rather than silently
-  degrading. Optional dbt enrichment (`--project-dir`/`--manifest`, see
-  [dbt enrichment](#dbt-enrichment-optional)) is implemented for Postgres.
+- **Snowflake is designed but not implemented.** `advise` supports `postgres` and
+  `redshift` today; passing `--engine snowflake` (or anything else unrecognised) fails
+  with a clear error rather than silently degrading.
+- **Redshift's catalog SQL has not been executed against a live Redshift cluster.** See
+  the prominent note at the top of the [Redshift section](#redshift---engine-redshift):
+  the connection path is verified live (Redshift speaks the Postgres wire protocol), every
+  statement's syntax and bindability are verified live, but the column names and the
+  resulting proposals' semantics come from AWS documentation, not an observed row. Run
+  `--dry-run` first and review before connecting to a production cluster.
+- **Redshift declares no NDV and no index capability**, deliberately: Redshift exposes no
+  `pg_stats.n_distinct` equivalent, and it has no indexes at all — its levers are SORTKEY,
+  DISTKEY/DISTSTYLE and VACUUM/ANALYZE staleness. This is why ADV101/102/103 can never
+  reach HIGH confidence (see the [Redshift section](#redshift---engine-redshift)), not a
+  gap left for a later release.
+- **A relation absent from `svv_table_info` is ambiguous, not conclusive.** Redshift omits
+  both external (Spectrum) tables and genuinely empty local tables from that view, and
+  nothing else this adapter reads can tell the two apart — so a relation missing from it
+  gets no ADV101/102/103 proposal at all rather than a guess either way, and the run
+  discloses how many relations this affected.
+- **Redshift's workload is silently partial without `SYSLOG ACCESS UNRESTRICTED`.**
+  `sys_query_history` returns only the connecting user's own queries to a role lacking that
+  privilege, and it does so with **no error at all** — so a cluster whose traffic your
+  read-only role cannot see is indistinguishable from a quiet one, and every `cost_share` is
+  computed over one user's slice. This is the one Redshift failure mode with no signal
+  anywhere in the run; see the [Redshift section](#redshift---engine-redshift) for the grant.
+- **`--limit` counts executions on Redshift and query groups on Postgres.**
+  `sys_query_history` is per-execution; `pg_stat_statements` is pre-aggregated per normalised
+  statement. So on Redshift `--limit 500` means "the 500 most expensive executions", and 500
+  executions of a single bad query is a legal outcome that hides every other statement. The
+  `window:` line always says which was read.
+- **Identifier case and attached comments can split one Redshift statement into several
+  query groups.** `sys_query_history` stores the *verbatim* text the client sent, unlike
+  `pg_stat_statements`, which Postgres has already parsed and re-serialised (identifiers
+  folded to lowercase) before storing. So two executions of what is semantically one
+  statement still fingerprint separately when they differ only in identifier case or in an
+  attached comment — an ORM query tag, for instance. That inflates the number of query groups
+  the window's total cost is spread over, which shrinks every `cost_share` and makes
+  `--min-cost-share` correspondingly stricter, in the same way the `cost_share` and PL/pgSQL
+  caveats above do. Not "fixed" by case-folding before fingerprinting: nothing there can tell
+  an unquoted (case-insensitive) identifier from a deliberately quoted, case-sensitive one, so
+  a general fold risks collapsing a real distinction instead of a spurious one.
 - **dbt enrichment trusts the manifest as of its last `dbt compile`.** ADV302 rewrites DDL
   based on a model's materialization as the manifest records it; a materialization changed
   without a fresh `dbt compile` produces a stale — but traceable, since the disclosed

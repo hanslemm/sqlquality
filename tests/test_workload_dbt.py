@@ -1294,6 +1294,91 @@ def test_describe_rewrites_reports_both_rewritten_and_folded_proposals():
     assert "\n" not in line, "one stderr line"
 
 
+def _non_index_proposal(relation, *, code="ADV101", note=None):
+    """A proposal whose DDL is neither `CREATE INDEX` nor `DROP INDEX` — the shape every
+    Redshift rule emits (`ALTER TABLE ... ALTER SORTKEY`, `VACUUM`, Advisor's own DDL), and
+    the only shape that reaches `_classify`'s generic path."""
+    return Proposal(
+        code=code,
+        title=f"Consider SORTKEY on {relation}(created_at)",
+        rationale="hot range predicate.",
+        evidence={"schema": relation.schema, "table": relation.table, "cost_share": 0.5},
+        confidence=Confidence.MEDIUM,
+        ddl=f'ALTER TABLE "{relation.schema}"."{relation.table}" ALTER SORTKEY ("created_at");',
+        note=note,
+    )
+
+
+def test_describe_rewrites_reports_a_statement_that_cannot_be_expressed_as_dbt_config():
+    """Counting only ADV302's config-block rewrite made this function return `None` for every
+    Redshift run — nothing Redshift emits is a `CREATE INDEX`, so all of ADV101-105 take
+    `_classify`'s generic path instead. Enrichment fired, the warning went into `rationale`
+    and `note`, and the terminal row stayed byte-identical to a dbt-free run: exactly the
+    failure mode this line exists to prevent, on the engine where the undone work is hours
+    of full-table rewrite rather than seconds of index build.
+    """
+    context = DbtContext.from_project(_project())
+    out = enrich_proposals([_non_index_proposal(Relation("main", "orders"))], context)
+    line = describe_rewrites(out)
+    assert line is not None
+    assert "1 proposal(s)" in line
+    assert "cannot be expressed as dbt config" in line
+    assert "next `dbt run` may undo it" in line
+    assert "\n" not in line, "one stderr line"
+
+
+def test_describe_rewrites_is_still_silent_for_an_unmanaged_non_index_proposal():
+    """Control for the test above: the new count must depend on `DbtContext.model_for`
+    actually matching, not merely on a proposal whose DDL is not an index."""
+    context = DbtContext.from_project(_project())
+    out = enrich_proposals([_non_index_proposal(Relation("public", "unmanaged"))], context)
+    assert describe_rewrites(out) is None
+
+
+def test_describe_rewrites_reports_both_kinds_in_one_line():
+    """A mixed run (a Postgres index proposal and a non-index one for the same dbt model)
+    must disclose both, since they call for different actions: one DDL is config to paste,
+    the other is runnable SQL that may not survive the next rebuild."""
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    out = enrich_proposals([_index_proposal(relation), _non_index_proposal(relation)], context)
+    line = describe_rewrites(out)
+    assert line is not None
+    assert "ADV302 expressed 1 index proposal(s)" in line
+    assert "1 proposal(s) target a dbt-managed relation" in line
+
+
+def test_prepend_note_keeps_the_existing_note_first_and_emits_the_dbt_note_once():
+    """Order and non-duplication, neither of which was pinned: losing the existing note was
+    caught by two tests, but swapping the concatenation order and emitting the dbt warning
+    twice both left the whole suite green. The existing note is the proposal's own statement
+    about its own DDL — ADV105's "this DDL came from Redshift, not sqlquality" — and the dbt
+    warning is a caveat on it, so it belongs after, once.
+    """
+    context = DbtContext.from_project(_project())
+    existing = "Source: Amazon Redshift Advisor, not sqlquality's own analysis."
+    (out,) = enrich_proposals(
+        [_non_index_proposal(Relation("main", "orders"), note=existing)], context
+    )
+    note = out.note or ""
+    assert note.startswith(existing)
+    assert "dbt WARNING" in note
+    assert note.index(existing) < note.index("dbt WARNING")
+    assert note.count("dbt WARNING") == 1
+
+
+def test_prepend_note_is_idempotent():
+    """Enriching an already-enriched proposal must not stack a second copy of the same dbt
+    warning onto its note. Not reachable from `cli.py`, which enriches once — pinned because
+    the fix's own name and docstring claim it cannot duplicate a note, and because a note
+    that grows on every pass is the kind of thing only a test notices."""
+    context = DbtContext.from_project(_project())
+    (once,) = enrich_proposals([_non_index_proposal(Relation("main", "orders"))], context)
+    (twice,) = enrich_proposals([once], context)
+    assert twice.note == once.note
+    assert (twice.note or "").count("dbt WARNING") == 1
+
+
 def test_resolve_manifest_path_prefers_an_explicit_manifest_over_a_project_dir():
     """One function, because this precedence used to exist twice — in `load_dbt_context` and
     again in the CLI's payload builder — and swapping it in either copy alone left the whole

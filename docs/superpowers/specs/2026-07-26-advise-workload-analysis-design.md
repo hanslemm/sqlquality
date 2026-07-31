@@ -468,6 +468,10 @@ records why they changed.
 
 ### Redshift
 
+Shipped in Batch 3b (2026-07-28 to 2026-07-31), with rule renumbering, capability and
+workload-path differences from what this subsection originally specified — see
+"Deviations from the spec (Batch 3b: Redshift adapter)" below for what changed and why.
+
 Workload from `SYS_QUERY_HISTORY` when available, falling back to `STL_QUERY` plus
 `SVL_STATEMENTTEXT` reassembled in `sequence` order. The fallback path is subject to
 `STL_QUERY.querytxt` truncation, which the report discloses. Facts from `SVV_TABLE_INFO`
@@ -646,6 +650,106 @@ subsection above originally specified.
     writes one, and warning on "different" while staying silent on "unknown" would make silence
     mean either "consistent" or "unchecked". Warned rather than suppressed, since the fix is in
     the user's invocation and dropping all dbt output would hide it.
+
+## Deviations from the spec (Batch 3b: Redshift adapter)
+
+Found and agreed while implementing `--engine redshift` (Tasks 1–8 of Batch 3b). The
+"Redshift" subsection above, written before any of this was built, described a different
+shape in several places; recorded here rather than silently edited in place, so a reader
+comparing spec to shipped code can see what changed and why.
+
+1. **Rule numbering and content do not match the original table.** The spec assigned
+   ADV101 to DISTKEY, ADV102 to SORTKEY, ADV103 to VACUUM/ANALYZE, ADV104 to disk-based
+   spill attribution, and ADV105 to DISTSTYLE ALL. The shipped adapter instead assigns
+   **ADV101 to SORTKEY, ADV102 to DISTKEY, ADV103 to DISTSTYLE ALL, ADV104 to
+   VACUUM/ANALYZE**, and ADV105 to relaying Redshift Advisor's own recommendation verbatim
+   (`svv_alter_table_recommendations`) — a proposal the spec did not separately number at
+   all, only mentioning Advisor agreement as a confidence input to the other rules. The
+   reordering followed the same logic Batch 3a used for ADV302 (see that section's
+   deviation 1): SORTKEY is listed first because it is the more commonly reached-for lever
+   (zone maps apply to any hot range/equality predicate; DISTKEY only helps a join), and
+   Advisor's relay earned its own code once it became clear the honest way to present the
+   cluster's own opinion is as a separate, clearly-attributed proposal — never merged into
+   an ADV101/102/103 proposal as though sqlquality had produced it (see `propose_advisor`
+   and `_disclose_advisor_agreement` in `redshift.py`).
+2. **No `STL_QUERY`/`SVL_STATEMENTTEXT` fallback, and no disk-spill attribution
+   (`SVL_QUERY_SUMMARY`).** The spec's workload path falls back to reassembling
+   `STL_QUERY.querytxt` when `SYS_QUERY_HISTORY` is unavailable, and its ADV104 attributes
+   disk-based spill to the query group that caused it. Neither shipped: `SYS_QUERY_HISTORY`
+   alone is what Task 1 implemented, kept single-path so the one statement per capability
+   claim (`introspection_sql()` returning exactly `--dry-run`'s output) stays true, and
+   `SVL_QUERY_SUMMARY`-based spill attribution was descoped as a distinct capability this
+   plan's four (`CAP_WORKLOAD`, `CAP_SCHEMA`, `CAP_TABLE_FACTS`, `CAP_ADVISOR`) do not
+   cover. Both are legitimate future work, not abandoned by oversight — recorded here so a
+   later batch does not have to rediscover that the fallback and the spill rule were never
+   built rather than quietly removed.
+3. **`svv_columns`, not the spec's `SVV_REDSHIFT_COLUMNS`.** `svv_columns` additionally
+   covers external (Spectrum) tables, which a query joining one needs to qualify; `SVV_
+   REDSHIFT_COLUMNS` covers only local tables and would have silently dropped any statement
+   touching a Spectrum table as unqualifiable. Accepted as a Task 1 deviation and re-affirmed
+   through every later task — see deviation 4 below for the consequence this creates.
+4. **Deliberately no `CAP_NDV`, no `CAP_INDEXES`.** Redshift exposes no equivalent of
+   `pg_stats.n_distinct` — there is no per-column distinct-value statistic anywhere in its
+   system catalog — and it has no indexes at all, so an "existing index" capability would
+   have nothing to model. Declaring either capability anyway would invite a rule to assume
+   evidence that structurally cannot exist on this engine: a `CAP_NDV`-shaped capability
+   that always came back empty is indistinguishable, to a rule reading it, from "every
+   column has terrible selectivity," which is a confident, wrong signal rather than an
+   honest absence. Redshift's physical-design levers — SORTKEY, DISTKEY/DISTSTYLE, and
+   VACUUM/ANALYZE staleness — are read entirely through `CAP_TABLE_FACTS` and `CAP_ADVISOR`
+   instead (see `RedshiftTableFacts` and the module docstring in `redshift.py`).
+5. **Why ADV101, ADV102 and ADV103 can never reach HIGH — a direct consequence of
+   deviation 4, not a separate design choice.** Every one of the three proposes a
+   full-table rewrite (`ALTER SORTKEY`/`ALTER DISTKEY`/`ALTER DISTSTYLE ALL`), and whether
+   that rewrite is actually worth its cost depends on the underlying predicate's
+   selectivity (SORTKEY) or the table's distribution skew (DISTKEY, DISTSTYLE ALL) —
+   exactly the two things `CAP_NDV`'s absence means this adapter cannot measure. Claiming
+   HIGH would assert something about data distribution the tool cannot see while
+   recommending the single most expensive class of statement in this whole feature.
+   Structurally enforced, not merely undocumented: no `Confidence.HIGH` literal appears in
+   `propose_sortkey`, `propose_distkey` or `propose_diststyle_all`, and agreement with an
+   Amazon Redshift Advisor recommendation (`_disclose_advisor_agreement`) adds a rationale
+   sentence, never raises the cap. ADV104 (VACUUM/ANALYZE) is the one rule that reaches
+   HIGH, because its evidence (`unsorted`, `stats_off`) is a direct catalog measurement
+   about the table's own current state, not an inference about data this tool cannot see,
+   and its remediation does not rewrite anything.
+6. **The connection path is verified live; the catalog path is not, and the honesty gap
+   between them is the central risk this batch accepts.** Redshift speaks the PostgreSQL
+   wire protocol through psycopg, so `connect()` — the read-only session, the statement
+   timeout clamp, and secret scrubbing — is exercised for real against the same
+   `postgres:16` container every other engine's tests use (Task 2; live-tested further in
+   Task 8, including the timeout clamp actually taking effect on the server). Every
+   introspection statement is additionally syntax-checked with sqlglot's `redshift`
+   dialect and proven *bindable* — that its parameters can be prepared and sent over the
+   wire — against same-shaped stand-in tables built specifically because Postgres's
+   analyzer resolves table references before parameter types, so testing an unbindable
+   statement against a genuinely missing view produces only `UndefinedTable` regardless of
+   whether the bug being tested for is even present (see
+   `tests/integration/test_redshift_introspection_bindable_live.py`'s module docstring).
+   None of that proves the **column names or the resulting proposals' semantics** are
+   correct: `svv_*`/`sys_*` do not exist in Postgres, there is no Redshift container
+   available for development, and every column name in this adapter comes from AWS's
+   published system-view documentation rather than an observed row. A wrong name degrades
+   exactly one capability (`self.degraded` names the statement, never a traceback) rather
+   than the whole run, `--dry-run` lets a user inspect every statement before ever
+   connecting, and the README says which half of this is proven — but that is honestly
+   weaker than every other adapter this project has shipped, and the first user who points
+   this at a real cluster is part of closing that gap, not merely a consumer of a finished
+   feature.
+7. **A relation absent from `svv_table_info` cannot be told apart from a Spectrum
+   (external) table — an ambiguity this adapter declines rather than guesses through.**
+   AWS documents `svv_table_info` as omitting both external (Spectrum) tables, which
+   cannot carry a SORTKEY, DISTKEY or DISTSTYLE at all, and genuinely empty local tables.
+   Nothing else this adapter reads distinguishes the two cases, and Tasks 5–6 considered
+   adding a further introspection capability to do so out of scope (`propose()`'s inputs
+   were fixed by that point in the plan). So a relation carrying a hot RANGE/EQUALITY/JOIN
+   predicate but absent from `physical_facts` gets **no** ADV101/102/103 proposal at all —
+   proposing a rewrite for something that might not even support one would be worse than
+   proposing nothing — and the count of relations this affected is disclosed through the
+   same `self.degraded` channel a denied capability uses
+   (`DEGRADATION_PHYSICAL_FACTS_GAP`), not silently absorbed. This is recorded as an open
+   gap, not a solved one: a future task with a real cluster to test against could add a
+   `svv_external_tables` cross-reference to resolve it.
 
 ## Confidence model
 

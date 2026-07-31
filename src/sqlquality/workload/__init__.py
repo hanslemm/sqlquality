@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from sqlquality.workload.base import WorkloadAdapter
 from sqlquality.workload.postgres import PostgresWorkloadAdapter
+from sqlquality.workload.redshift import RedshiftWorkloadAdapter
 
 _ADAPTERS: dict[str, type[WorkloadAdapter]] = {
     "postgres": PostgresWorkloadAdapter,
+    "redshift": RedshiftWorkloadAdapter,
 }
 
 

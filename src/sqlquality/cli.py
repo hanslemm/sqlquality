@@ -761,11 +761,15 @@ def advise(
         help=(
             "Suppress proposals below this share of workload cost. Applies to the "
             "cost-weighted rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 "
-            "-- the last only with --project-dir/--manifest); the index-hygiene rules "
-            "ADV002 and ADV003, and ADV303 (its evidence is absence, not cost, so there is "
-            "no share to threshold), carry no cost evidence and are reported whatever the "
-            "threshold. ADV303 has its own non-threshold suppression: it emits nothing when "
-            "no query usage could be extracted at all."
+            "-- the last only with --project-dir/--manifest -- and, on Redshift, ADV101 "
+            "SORTKEY, ADV102 DISTKEY, ADV103 DISTSTYLE ALL); the index-hygiene rules "
+            "ADV002 and ADV003, ADV303 (its evidence is absence, not cost, so there is "
+            "no share to threshold), and, on Redshift, ADV104 VACUUM/ANALYZE (its evidence "
+            "is a catalog measurement about the table itself, not the workload) and ADV105 "
+            "(Redshift Advisor's own recommendations, not ours to threshold), carry no "
+            "cost evidence and are reported whatever the threshold. ADV303 has its own "
+            "non-threshold suppression: it emits nothing when no query usage could be "
+            "extracted at all."
         ),
     ),
     keep_literals: bool = typer.Option(
