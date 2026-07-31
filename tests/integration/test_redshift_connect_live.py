@@ -9,10 +9,32 @@ here calls `fetch_workload`, `fetch_schema`, `fetch_table_facts`, or `propose`.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit, urlunsplit
+
 import pytest
 
 from sqlquality.models import ConnectionParams
 from sqlquality.workload.redshift import RedshiftWorkloadAdapter
+
+
+def _with_wrong_password(dsn: str) -> str:
+    """Swap whatever password a DSN carries for a wrong one, however it is shaped.
+
+    A DSN-shaped string substitution (``dsn.replace(":sqlquality@", ":wr0ng-p4ss@")``) is
+    a silent no-op whenever the real password is not literally ``sqlquality`` — exactly
+    the normal case here: host port 55432 is frequently held by an unrelated container on
+    this machine, so this suite is routinely run against a custom
+    ``SQLQUALITY_TEST_DSN`` with different credentials. Parsing the DSN's authority
+    component and re-encoding it with a substituted password works for whatever DSN is
+    handed in, not only the one hardcoded default.
+    """
+    parts = urlsplit(dsn)
+    user = parts.username or ""
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port is not None else ""
+    userinfo = f"{user}:wr0ng-p4ss@" if user else "wr0ng-p4ss@"
+    netloc = f"{userinfo}{host}{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 @pytest.mark.integration
@@ -33,7 +55,8 @@ def test_redshift_adapter_connects_over_the_postgres_wire_protocol(live_dsn):
 @pytest.mark.integration
 def test_a_wrong_password_leaks_nothing(live_dsn):
     adapter = RedshiftWorkloadAdapter()
-    bad = live_dsn.replace(":sqlquality@", ":wr0ng-p4ss@")
+    bad = _with_wrong_password(live_dsn)
+    assert bad != live_dsn, "the password substitution must actually change the DSN"
     params = ConnectionParams(engine="redshift", dsn=bad, fields={}, source="test")
     with pytest.raises(ConnectionError) as exc:
         adapter.connect(params, timeout_s=5)
