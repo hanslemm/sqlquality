@@ -45,6 +45,13 @@ from sqlquality.workload.redshift import (
     propose_sortkey,
 )
 
+# Sibling test module, not a package import: `tests/` has no `__init__.py`, so pytest puts it
+# on `sys.path` and its modules are importable by bare name. Imported rather than copied
+# because two hand-maintained lists of invisible control characters are two lists free to
+# drift apart, and the reason this file asserts the same property again is that the *call site*
+# differs (each adapter's `render_ddl` calls the shared guard separately), not the character set.
+from test_workload_rules import EXTRA_LINE_BREAKS  # noqa: E402
+
 R = Relation(schema="public", table="orders")
 R2 = Relation(schema="public", table="customers")
 
@@ -1413,6 +1420,32 @@ def test_render_ddl_never_emits_a_bare_uncommented_line_for_a_hostile_identifier
     )
     script = RedshiftWorkloadAdapter().render_ddl([proposal])
     assert "NOT RENDERED" in script
+    assert _uncommented(script) == [], script
+
+
+@pytest.mark.parametrize(
+    ("char", "name"), EXTRA_LINE_BREAKS, ids=[name for _char, name in EXTRA_LINE_BREAKS]
+)
+def test_every_splitlines_line_break_in_an_identifier_reaches_the_not_rendered_fallback(char, name):
+    """The same hole, closed on this adapter too, and pinned here rather than only on the
+    Postgres side: the guard is shared code (`_has_line_break`, imported from `postgres.py`),
+    but the two `render_ddl` implementations call it in two separate places, so a fix applied
+    to one is not a fix applied to both. The codepoint list is imported from the Postgres
+    renderer's tests deliberately — two copies would be free to drift apart, and this file's
+    whole reason for asserting it again is that the *call site* is different, not the set.
+    """
+    ddl = f'ALTER TABLE "public"."or{char}ders" ALTER SORTKEY ("created_at");'
+    assert len(ddl.splitlines()) == 2, f"{name} is not a splitlines boundary"
+    proposal = Proposal(
+        code="ADV101",
+        title="Consider SORTKEY on public.orders(created_at)",
+        rationale="r",
+        evidence={"schema": "public", "table": "orders", "cost_share": 0.4},
+        confidence=Confidence.MEDIUM,
+        ddl=ddl,
+    )
+    script = RedshiftWorkloadAdapter().render_ddl([proposal])
+    assert "NOT RENDERED" in script, name
     assert _uncommented(script) == [], script
 
 

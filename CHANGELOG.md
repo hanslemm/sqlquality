@@ -88,12 +88,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI now runs the 23 live-Postgres integration tests, in a job with a `postgres:16` service
+  container that has `pg_stat_statements` preloaded. Until now they ran only on a contributor's
+  own machine, while this feature's live suite was repeatedly the only thing that caught a
+  whole class of bug — a `reltuples = -1` sentinel that suppressed every proposal, redaction
+  dismembering `$N` placeholders, a `toplevel` filter that produced confidently-wrong advice,
+  and a workload statement that failed on the wire for every default run. The job fails if the
+  suite skipped or executed nothing, since every one of those tests skips itself when no server
+  answers and `pytest` exits 0 on a skip.
+- The integration compose file publishes host port 27432 instead of 55432, which collided with
+  an unrelated container in practice — and because `docker compose up` neither binds nor fails
+  in that case, the suite silently talked to whatever else was listening. The fixture now also
+  verifies which server answered (database name, and `pg_stat_statements` in
+  `shared_preload_libraries`) and fails naming a port collision as the likely cause, rather
+  than trusting that a successful connection reached the right database.
+- `--ddl`'s guarantee that every line of the generated script is either an intended statement
+  or a `--` comment now holds for all ten codepoints `str.splitlines()` treats as a line
+  boundary, on both the Postgres and Redshift renderers. The guard tested only `\n` and `\r`,
+  while everything that splits the text uses `splitlines()`, so an introspected identifier
+  containing `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `U+2028` or `U+2029` — all legal
+  inside a quoted Postgres identifier — produced a second physical line the guard never
+  examined, and the tail of the statement was emitted looking like a bare statement of its own.
+- ADV004 (partial index) now consults the existing-index list, which it was alone among the
+  index-creating rules in never doing. A plain index leading with the guarded column now
+  suppresses the proposal — that index already serves the lookup, and the partial index's only
+  advantage is a size saving this tool cannot measure against a second index's write cost (and
+  which ADV003 would never flag as redundant, since its prefix check is restricted to plain
+  indexes). Where a check genuinely could not run it is now stated rather than skipped: an
+  unreadable existing-index list caps confidence at LOW and says so, and an existing *partial*
+  or expression index that leads with the same column is named, since sqlquality does not
+  compare index predicates and so cannot tell whether the proposal is already applied. New
+  evidence keys `partial_indexes_not_compared` and `expression_indexes`; deliberately not
+  ADV001's `partial_indexes_skipped`, which records a different fact.
 - dbt enrichment now discloses itself in the terminal on **every** engine. The stderr
   disclosure line counted only ADV302's config-block rewrite, which no Redshift proposal can
   reach (nothing Redshift emits is a `CREATE INDEX`), so a `--project-dir` run on Redshift
   warned in `rationale` and in the `--ddl` note that `dbt run` may undo an hours-long
   full-table rewrite while the terminal row stayed byte-identical to a dbt-free run. Any
-  proposal whose DDL cannot be expressed as dbt config is now counted and reported too.
+  proposal whose DDL cannot be expressed as dbt config is now counted and reported too, as is
+  an index *drop* (ADV002, ADV003) on a dbt-managed relation — the case reachable on Postgres,
+  where a run proposing only drops enriched every one of them and still said nothing, so an
+  operator applied a drop that the next `dbt run` recreated from the model's `indexes:` config.
+  Each of the three outcomes is reported as its own clause, because each calls for a different
+  action: paste a config block, expect a runnable statement not to survive the next rebuild, or
+  delete a config entry as well as running the drop.
 - `IS NOT NULL` predicates were classified as `IS NULL` when sqlglot 30.13 or newer was
   installed, because that release moved the negation from a wrapping `Not` node onto a
   `negate` flag on the `Is` node itself. Both encodings are now read. This was not cosmetic:
