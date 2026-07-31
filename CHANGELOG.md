@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--ddl`'s guarantee that every line of the generated script is either an intended statement
+  or a `--` comment now holds for all ten codepoints `str.splitlines()` treats as a line
+  boundary, on both the Postgres and Redshift renderers. The guard tested only `\n` and `\r`,
+  while everything that splits the text uses `splitlines()`, so an introspected identifier
+  containing `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `U+2028` or `U+2029` — all legal
+  inside a quoted Postgres identifier — produced a second physical line the guard never
+  examined, and the tail of the statement was emitted looking like a bare statement of its own.
 - ADV004 (partial index) now consults the existing-index list, which it was alone among the
   index-creating rules in never doing. A plain index leading with the guarded column now
   suppresses the proposal — that index already serves the lookup, and the partial index's only

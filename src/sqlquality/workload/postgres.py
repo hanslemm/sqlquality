@@ -1269,6 +1269,30 @@ def _comment_lines(text: str) -> list[str]:
     return [f"-- {line}" for line in text.splitlines()]
 
 
+def _has_line_break(text: str) -> bool:
+    """True when `text` would occupy more than one physical line in the rendered script.
+
+    Defined as "`str.splitlines` disagrees that this is exactly one line" rather than as a
+    membership test against a list of characters, and that is the whole point of the function.
+    Both `render_ddl` implementations used to guard with `"\\n" in ddl or "\\r" in ddl`, while
+    every place that actually splits the text — `_comment_lines`, `_is_fully_commented`, and
+    the tests asserting no bare line is ever emitted — uses `splitlines()`, which also splits
+    on `\\v`, `\\f`, `\\x1c`, `\\x1d`, `\\x1e`, `\\x85`, `\\u2028` and `\\u2029`. An identifier
+    carrying any of those eight produced a second physical line in the file that the guard
+    never examined, so `render_ddl` skipped the NOT-RENDERED fallback and emitted something a
+    reader sees as a bare, statement-shaped line — exactly the invariant this script format
+    states unconditionally. Postgres permits every one of them inside a quoted identifier.
+
+    Deriving the answer from `splitlines` rather than restating its character set keeps the
+    guard and the splitting in lockstep by construction: a future CPython that recognises one
+    more line boundary cannot reopen the hole, and there is no second list to forget to update.
+
+    Empty text is not a line break — it has no lines at all — and is answered False rather
+    than by the raw `splitlines() != [text]` comparison, which would say True for `""`.
+    """
+    return bool(text) and text.splitlines() != [text]
+
+
 def _is_fully_commented(ddl: str) -> bool:
     """True when every physical line of `ddl` already begins with `--`.
 
@@ -2046,9 +2070,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         for proposal in proposals:
             if not proposal.ddl:
                 continue
-            if ("\n" in proposal.ddl or "\r" in proposal.ddl) and not _is_fully_commented(
-                proposal.ddl
-            ):
+            if _has_line_break(proposal.ddl) and not _is_fully_commented(proposal.ddl):
                 # An identifier containing a line break cannot be emitted as a single-line
                 # statement. Quoting already makes it *semantically* safe — psql parses the
                 # whole thing as one quoted identifier, so nothing extra executes — but the

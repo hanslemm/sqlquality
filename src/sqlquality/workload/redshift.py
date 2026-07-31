@@ -81,6 +81,7 @@ from sqlquality.workload.base import (
 from sqlquality.workload.postgres import (
     _by_relation,
     _comment_lines,
+    _has_line_break,
     _is_fully_commented,
     _sentences,
 )
@@ -1531,10 +1532,11 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         tool generated.
 
         Reuses rather than reimplements: `cost_share_of` (bool-safe cost-share formatting)
-        and `_is_fully_commented`'s line-break guard, both imported from `models.py` and
-        `postgres.py` respectively — the same protection that guarantees a hostile
-        identifier (one carrying an embedded newline, `\\r`, or a `--`/`;` sequence) cannot
-        produce a bare, executable-looking line in this script either. See
+        and `_has_line_break`/`_is_fully_commented`'s line-break guard, imported from
+        `models.py` and `postgres.py` respectively — the same protection that guarantees a
+        hostile identifier (one carrying any codepoint `str.splitlines` breaks on, or a
+        `--`/`;` sequence) cannot produce a bare, executable-looking line in this script
+        either. See
         `test_render_ddl_never_emits_a_bare_uncommented_line` in
         `tests/test_workload_redshift_rules.py`.
         """
@@ -1564,9 +1566,7 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         for proposal in proposals:
             if not proposal.ddl:
                 continue
-            if ("\n" in proposal.ddl or "\r" in proposal.ddl) and not _is_fully_commented(
-                proposal.ddl
-            ):
+            if _has_line_break(proposal.ddl) and not _is_fully_commented(proposal.ddl):
                 # Identical guard to `PostgresWorkloadAdapter.render_ddl`: an identifier
                 # carrying a literal line break is already semantically safe once quoted
                 # (the whole thing parses as one identifier), but a raw newline would still
