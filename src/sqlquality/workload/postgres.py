@@ -36,7 +36,15 @@ from sqlquality.workload.base import (
 )
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
 from sqlquality.workload.secrets import secrets_for
-from sqlquality.workload.session import READ_ONLY_SQL, import_psycopg, open_session
+from sqlquality.workload.session import (
+    LIBPQ_FIELD_MAP,
+    LIBPQ_PASSTHROUGH_FIELDS,
+    READ_ONLY_SQL,
+    dropped_libpq_fields,
+    import_psycopg,
+    open_session,
+    translate_libpq_fields,
+)
 
 CAP_WORKLOAD = "workload"
 CAP_STATS_RESET = "stats_reset"
@@ -67,44 +75,6 @@ _HINTS = {
     ),
     CAP_INDEXES: "reads pg_index and pg_stat_user_indexes; world-readable unless revoked",
 }
-
-#: dbt profiles.yml field names -> libpq connection keywords.
-_PG_FIELD_MAP = {
-    "dbname": "dbname",
-    "database": "dbname",
-    "host": "host",
-    "port": "port",
-    "user": "user",
-    "username": "user",
-    "password": "password",
-}
-#: profiles.yml keys forwarded to libpq unchanged, because the name already *is* the libpq
-#: keyword. The TLS group is here for a security reason, not a completeness one: a profile
-#: saying `sslmode: verify-full` that silently connects under libpq's default `prefer`
-#: performs no certificate verification at all, and the user is never told. For a tool
-#: pitched as safe to point at production that is the wrong way to fail.
-_PG_PASSTHROUGH_FIELDS = frozenset(
-    {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
-)
-
-
-def _pg_fields(fields: dict[str, str]) -> dict[str, str]:
-    """Translate profiles.yml keys to libpq keywords, dropping anything unrecognized."""
-    translated = {_PG_FIELD_MAP[k]: v for k, v in fields.items() if k in _PG_FIELD_MAP}
-    translated.update({k: v for k, v in fields.items() if k in _PG_PASSTHROUGH_FIELDS})
-    return translated
-
-
-def _dropped_pg_fields(fields: dict[str, str]) -> tuple[str, ...]:
-    """profiles.yml keys this adapter cannot forward, by name.
-
-    Names only, never values: one of them could be a secret (`sslpassword`), and this text
-    goes to stderr and from there into CI logs.
-    """
-    return tuple(
-        sorted(k for k in fields if k not in _PG_FIELD_MAP and k not in _PG_PASSTHROUGH_FIELDS)
-    )
-
 
 #: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
 #: apart the few hundred query groups one run reads, and short enough to sit in a table cell.
@@ -1372,8 +1342,8 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         psycopg = import_psycopg("Postgres", "postgres")
 
         # Silence is the failure mode being fixed here: a dropped `sslmode` downgrades the
-        # connection with no signal at all. Key names only — see _dropped_pg_fields.
-        dropped = _dropped_pg_fields(params.fields)
+        # connection with no signal at all. Key names only — see `dropped_libpq_fields`.
+        dropped = dropped_libpq_fields(params.fields, LIBPQ_FIELD_MAP, LIBPQ_PASSTHROUGH_FIELDS)
         if dropped:
             print(
                 f"warning: ignoring connection setting(s) not supported by the Postgres "
@@ -1396,7 +1366,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             # unusable keyword, and that message can quote the offending value — which
             # for the `password` keyword is the password.
             conninfo_factory=lambda: (
-                params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
+                params.dsn
+                or psycopg.conninfo.make_conninfo(
+                    **translate_libpq_fields(
+                        params.fields, LIBPQ_FIELD_MAP, LIBPQ_PASSTHROUGH_FIELDS
+                    )
+                )
             ),
             secrets=secrets,
             timeout_s=timeout_s,

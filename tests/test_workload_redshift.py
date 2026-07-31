@@ -126,10 +126,17 @@ class _FakeCursor:
     cursor.execute() that raises on that one statement and succeeds on every other.
     """
 
-    def __init__(self, log: list[tuple] | None = None, *, fail_on: frozenset[str] = frozenset()):
+    def __init__(
+        self,
+        log: list[tuple] | None = None,
+        *,
+        fail_on: frozenset[str] = frozenset(),
+        fail_message: str = "ERROR: {sql!r} is not supported on this cluster",
+    ):
         self.executed: list[tuple] = []
         self._log = log if log is not None else []
         self._fail_on = fail_on
+        self._fail_message = fail_message
 
     def __enter__(self):
         return self
@@ -141,32 +148,44 @@ class _FakeCursor:
         self.executed.append((sql, params))
         self._log.append((sql, params))
         if sql in self._fail_on:
-            raise RuntimeError(f"ERROR: {sql!r} is not supported on this cluster")
+            raise RuntimeError(self._fail_message.format(sql=sql))
 
     def fetchall(self):
         return []
 
 
 class _FakeConnection:
-    def __init__(self, *, fail_on: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on: frozenset[str] = frozenset(),
+        fail_message: str = "ERROR: {sql!r} is not supported on this cluster",
+    ) -> None:
         self.cursors: list[_FakeCursor] = []
         self.log: list[tuple] = []
         self._fail_on = fail_on
+        self._fail_message = fail_message
 
     def cursor(self):
-        cursor = _FakeCursor(self.log, fail_on=self._fail_on)
+        cursor = _FakeCursor(self.log, fail_on=self._fail_on, fail_message=self._fail_message)
         self.cursors.append(cursor)
         return cursor
 
 
-def _install_fake_psycopg(monkeypatch, seen: dict, *, fail_on: frozenset[str] = frozenset()):
+def _install_fake_psycopg(
+    monkeypatch,
+    seen: dict,
+    *,
+    fail_on: frozenset[str] = frozenset(),
+    fail_message: str = "ERROR: {sql!r} is not supported on this cluster",
+):
     """A psycopg that records the conninfo it was handed and connects successfully."""
 
     module = types.ModuleType("psycopg")
 
     def connect(conninfo, **kwargs):
         seen["conninfo"] = conninfo
-        seen["connection"] = _FakeConnection(fail_on=fail_on)
+        seen["connection"] = _FakeConnection(fail_on=fail_on, fail_message=fail_message)
         return seen["connection"]
 
     module.connect = connect  # type: ignore[attr-defined]
@@ -195,6 +214,11 @@ def test_connect_without_psycopg_installed_raises_a_helpful_import_error(monkeyp
     with pytest.raises(ImportError) as exc:
         adapter.connect(params, 30)
     assert "sqlquality[warehouse]" in str(exc.value)
+    # Names the calling engine, not merely the extra: `import_psycopg("Redshift", ...)`
+    # could be miscopied to `import_psycopg("Postgres", ...)` at the Redshift call site
+    # and every existing assertion here would still pass.
+    assert "Redshift" in str(exc.value)
+    assert "Postgres" not in str(exc.value)
 
 
 def test_connect_arms_a_statement_timeout_before_the_querier_is_usable(monkeypatch):
@@ -256,6 +280,39 @@ def test_a_refused_read_only_statement_degrades_rather_than_aborts(monkeypatch):
     # separate, already-pinned guarantee (test_no_statement_writes). What is missing is
     # the extra belt-and-braces defense, and the message must say which.
     assert "belt-and-braces" in reason.lower()
+
+
+def test_the_read_only_degradation_message_is_scrubbed(monkeypatch):
+    """The one path that puts raw driver text into user-facing output.
+
+    `self.degraded` is exactly what `cli.py` prints to stderr and embeds in the JSON and
+    markdown reports, so a secret reaching this message is a real leak, not a theoretical
+    one — unlike the connect-failure path, which is at least caught by a `ConnectionError`
+    the caller might choose not to print. The fake driver's refusal is made to quote the
+    password verbatim, the way a permission-denied message naming the failed session
+    setting sometimes echoes surrounding context; `scrub()` must still remove it.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(
+        monkeypatch,
+        seen,
+        fail_on=frozenset({READ_ONLY_SQL}),
+        fail_message="ERROR: {sql!r} refused for connection password=hunter2",
+    )
+    adapter = RedshiftWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(
+            engine="redshift",
+            dsn=None,
+            fields={"host": "db", "user": "hans", "password": "hunter2"},
+            source="profiles.yml",
+        ),
+        30,
+    )
+    assert len(adapter.degraded) == 1
+    _capability, reason = adapter.degraded[0]
+    assert "hunter2" not in reason
+    assert "***" in reason
 
 
 def test_a_successful_read_only_statement_reports_no_degradation(monkeypatch):
@@ -365,3 +422,46 @@ def test_forwarded_and_mapped_keys_are_not_reported_as_dropped(monkeypatch, caps
     )
     RedshiftWorkloadAdapter().connect(params, 30)
     assert capsys.readouterr().err == ""
+
+
+def test_profile_fields_are_translated_and_forwarded_to_the_driver(monkeypatch):
+    """Pins the actual conninfo content, not just the dropped-keys warning.
+
+    A previous version of this suite recorded `seen["conninfo"]` and never asserted on
+    it, so scrambling the field map's targets, dropping the `database`/`username`
+    aliases, or cutting the TLS passthrough set down to just `sslmode` all left the whole
+    suite green. This test mirrors Postgres's
+    `test_profile_tls_settings_are_forwarded_to_the_driver` for exactly that reason: the
+    TLS group is not cosmetic — a profile saying `sslmode: verify-full` that silently
+    connects under libpq's default `prefer` performs no certificate verification at all,
+    and the user is never told.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="redshift",
+        dsn=None,
+        fields={
+            "host": "db",
+            "database": "mydb",  # alias for dbname
+            "username": "hans",  # alias for user
+            "password": "hunter2",
+            "sslmode": "verify-full",
+            "sslrootcert": "/etc/ssl/ca.crt",
+            "sslcert": "/etc/ssl/client.crt",
+            "sslkey": "/etc/ssl/client.key",
+            "connect_timeout": "10",
+        },
+        source="profiles.yml",
+    )
+    RedshiftWorkloadAdapter().connect(params, 30)
+    conninfo = seen["conninfo"]
+    assert "host=db" in conninfo
+    assert "dbname=mydb" in conninfo
+    assert "user=hans" in conninfo
+    assert "password=hunter2" in conninfo
+    assert "sslmode=verify-full" in conninfo
+    assert "sslrootcert=/etc/ssl/ca.crt" in conninfo
+    assert "sslcert=/etc/ssl/client.crt" in conninfo
+    assert "sslkey=/etc/ssl/client.key" in conninfo
+    assert "connect_timeout=10" in conninfo

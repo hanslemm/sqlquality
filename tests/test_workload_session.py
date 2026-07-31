@@ -13,10 +13,13 @@ shared helper rather than left to be an accident of which adapter happens to tes
 
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
 
+from sqlquality.models import ConnectionParams
+from sqlquality.workload.postgres import PostgresWorkloadAdapter
 from sqlquality.workload.session import READ_ONLY_SQL, open_session
 
 
@@ -153,6 +156,55 @@ def test_conninfo_factory_runs_inside_the_scrubbing_envelope():
     assert "hunter2" not in str(exc.value)
     assert "***" in str(exc.value)
     assert exc.value.__context__ is None
+
+
+def test_postgres_adapter_aborts_when_its_read_only_statement_is_refused(monkeypatch):
+    """Pins `postgres.py`'s own call site, not just the shared helper.
+
+    `postgres.py`'s `connect()` passes `read_only_required=True` as a literal at its one
+    call to `open_session`. Nothing forces that literal to stay `True`: flip it to
+    `False` and every existing Postgres unit test still passes, because none of them
+    makes the read-only statement itself fail — the fake cursor those tests use always
+    lets it through. Under that flip, Postgres would continue *silently* on a refused
+    read-only statement, discarding the returned degradation, which is exactly the "we
+    never write" promise on the engine that actually ships. This goes through
+    `PostgresWorkloadAdapter.connect()` itself (via a `psycopg` planted in `sys.modules`,
+    since that is how the adapter imports it) rather than through `open_session`
+    directly, so a regression at the call site — not just in the helper — fails it.
+    """
+
+    class _FailingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            if sql == READ_ONLY_SQL:
+                raise RuntimeError("ERROR: read-only not supported in this configuration")
+
+        def fetchall(self):
+            return []
+
+    class _FailingConnection:
+        def cursor(self):
+            return _FailingCursor()
+
+    module = types.ModuleType("psycopg")
+    module.connect = lambda conninfo, **kwargs: _FailingConnection()  # type: ignore[attr-defined]
+    module.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", module)
+
+    adapter = PostgresWorkloadAdapter()
+    params = ConnectionParams(engine="postgres", dsn="postgresql:///x", fields={}, source="--dsn")
+    with pytest.raises(ConnectionError) as exc:
+        adapter.connect(params, 30)
+    assert "read-only" in str(exc.value)
+    # Not silently continued: no querier was ever installed.
+    assert adapter._query is None
 
 
 def test_the_timeout_is_clamped_with_the_caller_supplied_bounds():

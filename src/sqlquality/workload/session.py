@@ -28,6 +28,31 @@ from sqlquality.workload.secrets import clamp_timeout_ms, scrub
 #: `open_session`'s `read_only_required` parameter for how each engine treats a refusal.
 READ_ONLY_SQL = "SET default_transaction_read_only = on"
 
+#: dbt profiles.yml field names -> libpq connection keywords, shared by every
+#: libpq-speaking adapter. One definition, not one per adapter: Postgres's and
+#: Redshift's dbt profiles use the identical field names for the keywords that matter
+#: here, and two copies of this table is exactly the kind of credential-handling drift
+#: this module's own docstring exists to prevent. If an engine ever needs a genuinely
+#: different mapping, that is a reason to pass a different table into
+#: `translate_libpq_fields`/`dropped_libpq_fields`, not to fork this one.
+LIBPQ_FIELD_MAP = {
+    "dbname": "dbname",
+    "database": "dbname",
+    "host": "host",
+    "port": "port",
+    "user": "user",
+    "username": "user",
+    "password": "password",
+}
+#: profiles.yml keys forwarded to libpq unchanged, because the name already *is* the
+#: libpq keyword. The TLS group is here for a security reason, not a completeness one: a
+#: profile saying `sslmode: verify-full` that silently connects under libpq's default
+#: `prefer` performs no certificate verification at all, and the user is never told. For
+#: a tool pitched as safe to point at production that is the wrong way to fail.
+LIBPQ_PASSTHROUGH_FIELDS = frozenset(
+    {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
+)
+
 
 def import_psycopg(engine_label: str, extra: str) -> Any:
     """Import psycopg, or raise an ImportError naming the extra to install.

@@ -57,6 +57,8 @@ from sqlquality.workload.base import (
 )
 from sqlquality.workload.secrets import secrets_for
 from sqlquality.workload.session import (
+    LIBPQ_FIELD_MAP,
+    LIBPQ_PASSTHROUGH_FIELDS,
     READ_ONLY_SQL,
     dropped_libpq_fields,
     import_psycopg,
@@ -75,27 +77,13 @@ CAP_ADVISOR = "advisor"
 #: from every real `CAP_*` so a report reader cannot mistake it for a denied SELECT.
 DEGRADATION_READ_ONLY = "read_only"
 
-#: dbt profiles.yml field names -> libpq connection keywords, for a Redshift target.
-#: Redshift's dbt adapter accepts the same core keywords Postgres does — see
-#: `translate_libpq_fields` in `session.py`, which this and `postgres.py`'s own
-#: `_PG_FIELD_MAP` both feed. IAM-based fields (`cluster_identifier`, `iam`, `region`)
-#: are not psycopg keywords and are deliberately not mapped here; a profile using them
-#: falls through to `dropped_libpq_fields` and is named on stderr rather than silently
-#: dropped.
-_REDSHIFT_FIELD_MAP = {
-    "dbname": "dbname",
-    "database": "dbname",
-    "host": "host",
-    "port": "port",
-    "user": "user",
-    "username": "user",
-    "password": "password",
-}
-#: profiles.yml keys forwarded to libpq unchanged — see `postgres._PG_PASSTHROUGH_FIELDS`
-#: for why the TLS group in particular is here rather than silently dropped.
-_REDSHIFT_PASSTHROUGH_FIELDS = frozenset(
-    {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
-)
+#: Redshift's dbt adapter accepts the same core libpq keywords Postgres does, so field
+#: translation uses the one shared table in `session.py` (`LIBPQ_FIELD_MAP` /
+#: `LIBPQ_PASSTHROUGH_FIELDS`) rather than a second, Redshift-named copy of the same
+#: data — exactly the drift the brief for this adapter warned against. IAM-based fields
+#: (`cluster_identifier`, `iam`, `region`) are not psycopg keywords and are deliberately
+#: not in that table; a profile using them falls through to `dropped_libpq_fields` and is
+#: named on stderr rather than silently dropped.
 
 #: What to tell the user when a capability's statement is refused. These strings are what
 #: someone hands their DBA, so each one names the actual failure mode rather than a generic
@@ -229,9 +217,7 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # Silence is the failure mode being fixed here: a dropped `sslmode` downgrades
         # the connection with no signal at all. Key names only — see
         # `dropped_libpq_fields`.
-        dropped = dropped_libpq_fields(
-            params.fields, _REDSHIFT_FIELD_MAP, _REDSHIFT_PASSTHROUGH_FIELDS
-        )
+        dropped = dropped_libpq_fields(params.fields, LIBPQ_FIELD_MAP, LIBPQ_PASSTHROUGH_FIELDS)
         if dropped:
             print(
                 f"warning: ignoring connection setting(s) not supported by the Redshift "
@@ -255,7 +241,7 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
                 params.dsn
                 or psycopg.conninfo.make_conninfo(
                     **translate_libpq_fields(
-                        params.fields, _REDSHIFT_FIELD_MAP, _REDSHIFT_PASSTHROUGH_FIELDS
+                        params.fields, LIBPQ_FIELD_MAP, LIBPQ_PASSTHROUGH_FIELDS
                     )
                 )
             ),
