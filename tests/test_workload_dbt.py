@@ -1348,6 +1348,100 @@ def test_describe_rewrites_reports_both_kinds_in_one_line():
     assert "1 proposal(s) target a dbt-managed relation" in line
 
 
+def _drop_proposal(relation, *, code="ADV002", index="idx_cold"):
+    """An index-drop proposal — the shape ADV002 (unused) and ADV003 (redundant) emit, and the
+    only shape that reaches `_classify`'s `DROP INDEX` branch."""
+    return Proposal(
+        code=code,
+        title=f"Drop unused index {index} on {relation}",
+        rationale="no scans.",
+        evidence={
+            "schema": relation.schema,
+            "table": relation.table,
+            "index": index,
+            "columns": ("status",),
+        },
+        confidence=Confidence.MEDIUM,
+        ddl=f'DROP INDEX "{relation.schema}"."{index}";',
+    )
+
+
+def test_describe_rewrites_reports_an_index_drop_that_a_dbt_run_may_recreate():
+    """The third enrichment outcome, and the one reachable on the adapter this module was
+    written for. A Postgres run whose only proposals for dbt-managed relations are ADV002 /
+    ADV003 drops enriches every one of them — rationale *and* note — and the terminal said
+    nothing at all, because only the config-block rewrite and the generic non-index warning
+    were counted. The operator then applies a drop that the next `dbt run` puts straight back
+    from the model's `indexes:` config, and this tool proposes the same drop again next run.
+    """
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+    out = enrich_proposals(
+        [
+            _drop_proposal(relation, code="ADV002", index="idx_cold"),
+            _drop_proposal(relation, code="ADV003", index="idx_narrow"),
+        ],
+        context,
+    )
+    assert [p.ddl for p in out] == [
+        'DROP INDEX "main"."idx_cold";',
+        'DROP INDEX "main"."idx_narrow";',
+    ], "the drops themselves are unchanged; only the disclosure is new"
+    line = describe_rewrites(out)
+    assert line is not None
+    assert "2 index drop(s)" in line
+    assert "`indexes:` config" in line
+    assert "does not stick" in line
+    assert "\n" not in line, "one stderr line"
+
+
+def test_describe_rewrites_is_still_silent_for_an_unmanaged_index_drop():
+    """Control for the test above: the new count must depend on `DbtContext.model_for`
+    actually matching, not merely on a proposal whose DDL is a `DROP INDEX`."""
+    context = DbtContext.from_project(_project())
+    out = enrich_proposals([_drop_proposal(Relation("public", "unmanaged"))], context)
+    assert describe_rewrites(out) is None
+
+
+def test_describe_rewrites_counts_the_drop_branch_separately_from_the_other_two():
+    """The count has to discriminate *this* branch, not merely be non-zero when enrichment
+    fired. A flag set in `_classify`'s generic non-index path (or read off the same key as the
+    config rewrite) would satisfy a bare "the line mentions drops" assertion while reporting
+    the wrong number for a mixed run, and would report drops on a run that had none.
+
+    All three outcomes call for different actions, which is why they are three clauses: paste
+    a config block, expect a runnable statement not to last, or delete a config entry as well.
+    """
+    context = DbtContext.from_project(_project())
+    relation = Relation("main", "orders")
+
+    only_drops = enrich_proposals([_drop_proposal(relation)], context)
+    line = describe_rewrites(only_drops)
+    assert line is not None
+    assert "1 index drop(s)" in line
+    assert "ADV302" not in line, "a drop is not expressed as an `indexes` config block"
+    assert "cannot be expressed as dbt config" not in line, "that is the generic branch"
+
+    # The other two branches must not be counted as drops.
+    for other in (
+        enrich_proposals([_index_proposal(relation)], context),
+        enrich_proposals([_non_index_proposal(relation)], context),
+    ):
+        other_line = describe_rewrites(other)
+        assert other_line is not None
+        assert "index drop(s)" not in other_line, other_line
+
+    all_three = enrich_proposals(
+        [_index_proposal(relation), _non_index_proposal(relation), _drop_proposal(relation)],
+        context,
+    )
+    mixed = describe_rewrites(all_three)
+    assert mixed is not None
+    assert "ADV302 expressed 1 index proposal(s)" in mixed
+    assert "1 proposal(s) target a dbt-managed relation" in mixed
+    assert "1 index drop(s)" in mixed
+
+
 def test_prepend_note_keeps_the_existing_note_first_and_emits_the_dbt_note_once():
     """Order and non-duplication, neither of which was pinned: losing the existing note was
     caught by two tests, but swapping the concatenation order and emitting the dbt warning

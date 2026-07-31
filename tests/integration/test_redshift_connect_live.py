@@ -22,10 +22,11 @@ def _with_wrong_password(dsn: str) -> str:
     """Swap whatever password a DSN carries for a wrong one, however it is shaped.
 
     A DSN-shaped string substitution (``dsn.replace(":sqlquality@", ":wr0ng-p4ss@")``) is
-    a silent no-op whenever the real password is not literally ``sqlquality`` — exactly
-    the normal case here: host port 55432 is frequently held by an unrelated container on
-    this machine, so this suite is routinely run against a custom
-    ``SQLQUALITY_TEST_DSN`` with different credentials. Parsing the DSN's authority
+    a silent no-op whenever the real password is not literally ``sqlquality`` — a case that
+    has to keep working: the published host port can be held by an unrelated container (which
+    is why it moved off 55432 and why ``live_dsn`` now verifies which server answered), so
+    this suite is routinely run against a custom ``SQLQUALITY_TEST_DSN`` with different
+    credentials. Parsing the DSN's authority
     component and re-encoding it with a substituted password works for whatever DSN is
     handed in, not only the one hardcoded default.
     """

@@ -14,18 +14,110 @@ already been selected.
 Bring the server up with:
     docker compose -f tests/integration/docker-compose.yml up -d
     uv run pytest -m integration
+
+`live_dsn` verifies it reached the server compose started rather than trusting the
+connection — a published port that is already taken makes `docker compose up` a silent no-op.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import pytest
 
-DEFAULT_DSN = "postgresql://postgres:sqlquality@127.0.0.1:55432/sqlquality_test"
+from sqlquality.workload.secrets import scrub
+
+#: Must match the host port `docker-compose.yml` publishes — see the comment there for why it
+#: is 27432 and not 55432.
+DEFAULT_PORT = 27432
+#: The database `docker-compose.yml` creates. Checked, not assumed: see `live_dsn`.
+EXPECTED_DATABASE = "sqlquality_test"
+DEFAULT_DSN = f"postgresql://postgres:sqlquality@127.0.0.1:{DEFAULT_PORT}/{EXPECTED_DATABASE}"
 
 _PACKAGE_DIR = Path(__file__).parent
+
+
+def describe_dsn(dsn: str) -> str:
+    """`host:port/database` — where we connected, with the credentials left out.
+
+    These messages are printed by CI now, and `SQLQUALITY_TEST_DSN` can point anywhere, so the
+    DSN itself must not be echoed: the project's rule that no credential appears in any output
+    applies to a fixture's failure text as much as to the tool's.
+
+    A keyword-form DSN (`host=... password=...`) is not a URL, and `urlparse` puts the whole
+    string — password included — in `path`, so anything but a recognised URI scheme with a
+    hostname is described generically rather than picked apart. Host and port are safe by
+    construction; `path` is only ever the database name once a scheme parsed.
+    """
+    parsed = urlparse(dsn)
+    if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
+        return "the server SQLQUALITY_TEST_DSN points at"
+    database = (parsed.path or "").lstrip("/") or "(no database in the DSN)"
+    return f"{parsed.hostname}:{parsed.port or 5432}/{database}"
+
+
+def dsn_secrets(dsn: str) -> tuple[str, ...]:
+    """The DSN's password, in both the encoded and decoded forms a driver may echo.
+
+    Same reasoning as `sqlquality.workload.secrets.secrets_for`, which cannot be reused
+    directly: it takes a `ConnectionParams`, and reconstructing one here to reach one field
+    would couple this fixture to a model it has no other use for. The *scrubbing* is reused —
+    only the token extraction is local.
+    """
+    encoded = urlparse(dsn).password
+    if not encoded:
+        return ()
+    decoded = unquote(encoded)
+    return (encoded, decoded) if decoded != encoded else (encoded,)
+
+
+def server_mismatches(database: str, preloaded: str) -> list[str]:
+    """Every reason the server we reached is not the one this suite needs, or `[]`.
+
+    A module-level function rather than inline fixture code so it can be exercised without
+    Docker: the whole point is what happens when the server is *wrong*, and a check that only
+    runs when the server is right is a check nobody ever sees run.
+
+    Both facts are cheap single-round-trip reads and both discriminate a stranger's Postgres
+    from this suite's. `shared_preload_libraries` is the one that matters most: without
+    `pg_stat_statements` preloaded, `CREATE EXTENSION` still succeeds and every later read of
+    its view fails, deep inside a test, with an error that says nothing about the real cause.
+    """
+    problems = []
+    if database != EXPECTED_DATABASE:
+        problems.append(f"connected to database {database!r}, expected {EXPECTED_DATABASE!r}")
+    if "pg_stat_statements" not in preloaded:
+        problems.append(
+            "the server has no pg_stat_statements in shared_preload_libraries "
+            f"(it reports {preloaded!r}), so the workload tests cannot read query history"
+        )
+    return problems
+
+
+def collision_hint(dsn: str, problems: list[str]) -> str:
+    """The failure message for a server that answered but is the wrong one.
+
+    It names a port collision explicitly. That is not a guess dressed up as a diagnosis: it is
+    the *only* way this state is normally reached, and the reason it cost four people time was
+    that the symptom (a password-authentication failure, or an unexpected schema) points
+    anywhere but at the port. It also says *how to look*, since the collision is invisible from
+    compose's own output.
+
+    The DSN is described, not printed — see `describe_dsn`.
+    """
+    return (
+        f"reached a Postgres at {describe_dsn(dsn)}, but it is not this suite's server:\n"
+        + "\n".join(f"  - {p}" for p in problems)
+        + f"\nThe likely cause is a port collision: something else already holds {DEFAULT_PORT}, "
+        "and `docker compose up` neither binds nor fails in that case, so the suite connects to "
+        "whatever is listening.\n"
+        f"Check `docker ps --filter publish={DEFAULT_PORT}`, then either free the port or point "
+        "SQLQUALITY_TEST_DSN at the right server.\n"
+        "Bring the intended one up with: "
+        "docker compose -f tests/integration/docker-compose.yml up -d"
+    )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -43,7 +135,30 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 @pytest.fixture(scope="session")
 def live_dsn() -> str:
-    """A reachable Postgres, or skip with an actionable message."""
+    """A reachable Postgres that is verifiably *this* suite's server, or skip.
+
+    **Connecting is not the same as connecting to the right server, and the difference is not
+    cosmetic.** A published host port that is already taken does not stop `docker compose up`:
+    compose reports success, the port keeps belonging to whatever bound it first, and every
+    test in this package silently talks to a stranger's database. That happened for the whole
+    of this feature's development — an unrelated `postgres:16` container held the old 55432 —
+    and it surfaced as a password-authentication failure that three reviewers and the author
+    all read as a code bug.
+
+    So two cheap facts are checked before any test runs, and a mismatch is a hard **failure**,
+    not a skip: a skip is how the original problem stayed invisible, and by the time this
+    fixture runs the caller has explicitly asked for `-m integration`.
+
+    * the database name, which pins that this is the server compose created rather than one
+      that merely answers on the port;
+    * `shared_preload_libraries`, because `pg_stat_statements` cannot be loaded by `CREATE
+      EXTENSION` alone. Without it the extension installs and then every read of its view
+      fails deep inside a test, which says nothing about the real cause.
+
+    An unreachable port stays a *skip*: "no Docker" is the documented, supported state for a
+    contributor running the default suite. Only a server that answers and is the wrong one
+    fails.
+    """
     psycopg = pytest.importorskip(
         "psycopg", reason="integration tests need the postgres extra: uv sync --extra postgres"
     )
@@ -52,12 +167,26 @@ def live_dsn() -> str:
     try:
         with psycopg.connect(dsn, connect_timeout=3) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1")
+                cur.execute(
+                    "SELECT current_database(), current_setting('shared_preload_libraries')"
+                )
+                database, preloaded = cur.fetchone()
     except Exception as exc:  # driver-specific; the message is what matters
+        # The driver's own text is scrubbed with the project's own helper before being shown:
+        # the most common real connect failure *is* an authentication failure, and this message
+        # now reaches CI logs.
         pytest.skip(
-            f"no Postgres at {dsn}: {exc}\n"
-            "start one with: docker compose -f tests/integration/docker-compose.yml up -d"
+            f"no Postgres at {describe_dsn(dsn)}: {scrub(str(exc), dsn_secrets(dsn))}\n"
+            "start one with: docker compose -f tests/integration/docker-compose.yml up -d\n"
+            f"if that was already running, something else may hold port {DEFAULT_PORT}: compose "
+            "neither binds an already-taken port nor fails, so this can equally be a stranger's "
+            f"server rejecting our credentials. Check `docker ps --filter publish={DEFAULT_PORT}` "
+            f"and `lsof -nP -iTCP:{DEFAULT_PORT} -sTCP:LISTEN`."
         )
+
+    problems = server_mismatches(database, preloaded)
+    if problems:
+        pytest.fail(collision_hint(dsn, problems))
     return dsn
 
 

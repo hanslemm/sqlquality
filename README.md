@@ -410,7 +410,7 @@ statement is not valid SQL to copy out and run.
 | ADV001 | Composite index candidate: hot equality columns, then one range/sort column, arity ≤ 3, and only columns some single query group filters on *together* | cost share, NDV, row estimate, joint co-occurring fingerprint count, absence of a covering index |
 | ADV002 | Drop an index with zero recorded scans (excludes unique/primary-key indexes) | scans since last stats reset, size |
 | ADV003 | Drop an index whose column list is a strict prefix of a wider index | both column lists |
-| ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count |
+| ADV004 | Partial index: a hot equality column guarded by a hot, co-occurring `IS [NOT] NULL` check | cost share, co-occurring fingerprint count, absence of a plain index leading with the guarded column |
 | ADV005 | Non-sargable predicate — a cast/function on a column, or a leading-wildcard `LIKE` | cost share |
 | ADV006 | Hot `SELECT *` on a wide table (≥15 columns) | cost share, column count |
 | ADV007 | Add index on a hot join key with no existing index leading with it | cost share, NDV, row estimate, absence of a covering index |

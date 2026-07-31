@@ -62,4 +62,11 @@ docker compose -f tests/integration/docker-compose.yml down
 
 These are deselected by default, so `uv run pytest` stays green without Docker. Point them
 at your own server with `SQLQUALITY_TEST_DSN`. They need the `postgres` extra
-(`uv sync --extra postgres`).
+(`uv sync --extra postgres`), and a server with `pg_stat_statements` in
+`shared_preload_libraries` — `CREATE EXTENSION` alone is not enough, which is why the compose
+file passes it as a server flag.
+
+The compose file publishes host port **27432**. If something else already holds it, `docker
+compose up` neither binds nor fails, and the suite would talk to whatever is listening — so
+the fixture checks which server answered and fails with that diagnosis rather than producing
+a puzzle. Free the port (`docker ps --filter publish=27432`) or set `SQLQUALITY_TEST_DSN`.

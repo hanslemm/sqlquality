@@ -59,6 +59,121 @@ jobs:
             exit 1
           fi
 
+  # The 23 tests under tests/integration/ are deselected by default and, until this job
+  # existed, ran only on a contributor's own machine. That is not a theoretical gap: this
+  # feature's live suite repeatedly found bugs no fixture could reach — a `reltuples = -1`
+  # sentinel that read as "tiny table" and silently suppressed every proposal, redaction
+  # dismembering `$N` placeholders, a `toplevel` filter that made a hot function-wrapped query
+  # vanish while leaving confidently-wrong advice in its place, and a workload statement that
+  # failed on the wire for every default run. Each was invisible to `pytest` and to review.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # Started with `docker run` rather than a `services:` container, and that is the whole
+      # reason this step exists in this shape. `pg_stat_statements` must be loaded by the
+      # postmaster at startup, but a service container cannot be given a command — GitHub's
+      # `services:` schema has no `command` key, and `options` is passed to `docker create`
+      # before the image, so the `-c shared_preload_libraries=...` flags cannot be expressed
+      # there at all.
+      #
+      # The first attempt worked around that with `ALTER SYSTEM` plus a restart, and it failed
+      # on the real runner: `ALTER SYSTEM SET pg_stat_statements.track` is rejected with
+      # "unrecognized configuration parameter" because that setting does not exist until the
+      # library is loaded, which is precisely what the restart was meant to achieve. Ordering
+      # the two calls correctly would need two restarts. Running the container directly is
+      # simpler, and — more importantly — takes the same flags as
+      # tests/integration/docker-compose.yml, so the server this job tests against is
+      # configured from one description rather than two that can drift.
+      - name: Start Postgres with pg_stat_statements preloaded
+        run: |
+          set -euo pipefail
+          docker run -d --name sqlquality-ci-pg \
+            -e POSTGRES_PASSWORD=sqlquality \
+            -e POSTGRES_DB=sqlquality_test \
+            -p 27432:5432 \
+            postgres:16 \
+            postgres -c shared_preload_libraries=pg_stat_statements \
+                     -c pg_stat_statements.track=all
+          # No health check gates a plain `docker run`, so wait explicitly. Failing here rather
+          # than letting the suite skip is the point: a server that never came up must not read
+          # as a pass, which is what the final step enforces.
+          for _ in $(seq 1 45); do
+            if docker exec sqlquality-ci-pg pg_isready -U postgres -d sqlquality_test; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec sqlquality-ci-pg pg_isready -U postgres -d sqlquality_test
+          # Prove both settings took effect before any test runs, so a misconfiguration names
+          # itself here instead of surfacing as an error deep inside a fixture.
+          docker exec sqlquality-ci-pg psql -U postgres -d sqlquality_test -tAc \
+            "SELECT current_setting('shared_preload_libraries')" | grep -q pg_stat_statements
+          test "$(docker exec sqlquality-ci-pg psql -U postgres -d sqlquality_test -tAc \
+            "SELECT current_setting('pg_stat_statements.track')")" = "all"
+      # The `postgres` extra, since psycopg is what the live tests connect with. Not
+      # `--all-extras`: nothing here needs the llm extra.
+      - run: uv sync --extra postgres
+      - name: Run the integration suite
+        env:
+          # The fixture's own default DSN is this exact string, but it is set explicitly so a
+          # change to either side is a visible change here rather than a silent switch to
+          # whatever the fixture happens to default to.
+          SQLQUALITY_TEST_DSN: postgresql://postgres:sqlquality@127.0.0.1:27432/sqlquality_test
+        # `--strict-markers` catches a typo'd `integration` marker, which would otherwise
+        # select nothing. The junit XML is what the next step reads: pytest's own
+        # machine-readable count, not a regex over text meant for humans.
+        run: uv run pytest -m integration -q -rs --strict-markers --junitxml=integration.xml
+      # `pytest` exits 0 on skips, and every one of these tests skips itself when the server is
+      # unreachable — so a service that never became ready, a wrong port, or a marker typo would
+      # otherwise produce a green run that executed nothing at all. Same discipline as the
+      # `no-extras` job above, which refuses a skip for the same reason: an invariant that is
+      # only ever asserted by a test that did not run is not asserted.
+      #
+      # `if: always()` so a failing suite still reports *why* — a run that skipped everything
+      # and a run that genuinely failed need different fixes.
+      - name: Fail if the integration suite skipped or ran nothing
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("integration.xml")
+          if not report.exists():
+              # Reachable because this step is `if: always()`: the pytest step can die before
+              # writing a report. Say so plainly rather than raising a traceback over it.
+              sys.exit(
+                  "::error::integration.xml was never written, so the previous step did not "
+                  "get as far as running tests. Its own log has the reason."
+              )
+          root = ET.parse(report).getroot()
+          suites = root.findall("testsuite") or ([root] if root.tag == "testsuite" else [])
+          if not suites:
+              sys.exit("::error::integration.xml has no testsuite element; pytest wrote nothing")
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+          executed = total - skipped
+          print(f"collected={total} executed={executed} skipped={skipped} failed={failures}")
+          if skipped:
+              sys.exit(
+                  f"::error::{skipped} integration test(s) skipped. These tests skip themselves "
+                  "when no Postgres answers, so a skip here means the service container never "
+                  "became ready, the published port does not match SQLQUALITY_TEST_DSN, or the "
+                  "server is not the one this suite expects. A skip must not read as a pass."
+              )
+          if executed == 0:
+              sys.exit(
+                  "::error::zero integration tests ran. Either the `integration` marker no "
+                  "longer selects them or the package collected nothing."
+              )
+          PY
+
   # `uv sync` installs what uv.lock pins, so every job above tests exactly one point in the
   # dependency ranges pyproject declares. A user running `pip install sqlquality` gets the
   # *newest* release satisfying those ranges instead — and that difference has already shipped
