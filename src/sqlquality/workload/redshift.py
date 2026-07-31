@@ -54,7 +54,7 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from sqlquality.models import (
@@ -216,12 +216,60 @@ class RedshiftTableFacts:
     skew_rows: float | None
 
 
+@dataclass(frozen=True)
+class RedshiftAdvisorRow:
+    """One row of `svv_alter_table_recommendations` — Amazon Redshift Advisor's own
+    output, not this adapter's inference. See `propose_advisor` (ADV105): it is presented
+    as the engine's opinion, attributed as such, and never folded into an ADV101/102/103
+    proposal as though sqlquality had produced it itself.
+
+    `rec_type` and `recommended_ddl` are read defensively like every other column in this
+    module (see the module docstring's provenance warning): AWS documents `type` as
+    naming either a sort-key or a distribution-style recommendation, but that has not been
+    observed against a live cluster, so `_advisor_category` treats anything it does not
+    recognize as unclassified rather than raising or guessing.
+    """
+
+    relation: Relation
+    rec_type: str
+    current_ddl: str | None
+    recommended_ddl: str | None
+
+
+#: Ceiling, not floor: unlike Postgres's `MIN_ROWS_FOR_INDEX`, a DISTSTYLE ALL candidate
+#: must be a *small* dimension. Above this row count, replicating the whole table to every
+#: node multiplies its storage per node and amplifies every write against it — worse than
+#: the redistribution it would remove. A heuristic, not a documented Redshift limit; AWS
+#: publishes no specific number, only the directional guidance that ALL suits a "small"
+#: table.
+MAX_ROWS_FOR_DISTSTYLE_ALL = 1_000_000
+
+#: `svv_table_info.unsorted`/`.stats_off` are 0-100 percentages (see `RedshiftTableFacts`).
+#: At or above this, the table has drifted far enough from sorted/analyzed that flagging
+#: VACUUM/ANALYZE is worth an operator's attention. A heuristic threshold — Redshift's own
+#: documentation gives directional guidance ("run VACUUM as the unsorted region grows"),
+#: not a specific number.
+UNSORTED_PCT_THRESHOLD = 20.0
+STATS_OFF_PCT_THRESHOLD = 20.0
+
 #: Matches `KEY(column)`, whether bare or nested inside `AUTO(...)` — the shapes
 #: `svv_table_info.diststyle` takes when the table has an explicit distribution key. Not
 #: verified against a live cluster (see the module docstring); parsing is defensive and
 #: case-insensitive, matching this whole module's discipline for column *values* it cannot
 #: exercise locally.
 _DISTSTYLE_KEY_RE = re.compile(r"KEY\(\s*([^)]+?)\s*\)", re.IGNORECASE)
+
+#: The three shapes an ADV101/102/103 proposal or an Advisor row can agree on. Keyed by
+#: `Proposal.code` so `_disclose_advisor_agreement` can look a proposal's category up
+#: without re-deriving it from evidence.
+_CATEGORY_SORTKEY = "sortkey"
+_CATEGORY_DISTKEY = "distkey"
+_CATEGORY_DISTSTYLE_ALL = "diststyle_all"
+_PROPOSAL_CATEGORY = {
+    "ADV101": _CATEGORY_SORTKEY,
+    "ADV102": _CATEGORY_DISTKEY,
+    "ADV103": _CATEGORY_DISTSTYLE_ALL,
+}
 
 
 def _diststyle_key_column(diststyle: str) -> str | None:
@@ -512,6 +560,376 @@ def propose_distkey(
             )
         )
     return proposals
+
+
+def propose_diststyle_all(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[Relation, TableFacts],
+    physical: Mapping[Relation, RedshiftTableFacts],
+    *,
+    min_cost_share: float,
+    max_rows: int = MAX_ROWS_FOR_DISTSTYLE_ALL,
+) -> list[Proposal]:
+    """ADV103 — DISTSTYLE ALL for a small, frequently-joined dimension.
+
+    Replicating a small table to every node removes redistribution for every join against
+    it, at every future query, rather than co-locating on one join key at a time the way
+    `propose_distkey` does — the natural proposal for a dimension joined from several
+    directions, where no single DISTKEY could serve every join.
+
+    Gated on a row-count *ceiling*, the inverse of the floor Postgres's index rules use
+    (`MIN_ROWS_FOR_INDEX` in `postgres.py`): an index below that floor is wasted write
+    overhead, but DISTSTYLE ALL above this ceiling is wasted — and amplified — storage and
+    write cost. The failure direction inverts along with the gate.
+
+    **Confidence is capped at MEDIUM, deliberately, with no HIGH branch** — the same
+    reasoning `propose_sortkey` and `propose_distkey` give: this rule's ceiling is a
+    row-count heuristic, not a measurement of the storage or write cost this table will
+    actually incur once replicated, and Redshift's lack of per-column NDV means no sharper
+    number is available either.
+
+    Every proposal states the cost plainly, at every confidence rung: storage is
+    multiplied by the cluster's node count, and every write against this table is now
+    replicated to all of them too.
+    """
+    proposals: list[Proposal] = []
+    for relation, items in sorted(_by_relation(usage).items()):
+        joins = [i for i in items if i.role is ColumnRole.JOIN]
+        if not joins:
+            continue
+        cost_share = max(i.cost_share for i in joins)
+        if cost_share < min_cost_share:
+            continue
+
+        table_facts = facts.get(relation)
+        rows = table_facts.row_estimate if table_facts else None
+        phys = physical.get(relation)
+        if phys is None:
+            continue
+        if rows is not None and rows > max_rows:
+            continue
+
+        diststyle = phys.diststyle
+        if diststyle is not None and _diststyle_is_all(diststyle):
+            continue
+
+        if rows is None and diststyle is None:
+            confidence = Confidence.LOW
+            rationale = (
+                f"{relation} is joined by queries carrying a hot share of workload cost. "
+                f"Its row count could not be verified against this rule's "
+                f"{max_rows:,}-row ceiling, and its current distribution style could not "
+                "be read either, so whether it is already DISTSTYLE ALL is unknown — "
+                "confirm both before applying."
+            )
+        elif rows is None:
+            confidence = Confidence.LOW
+            rationale = (
+                f"{relation} is joined by queries carrying a hot share of workload cost, "
+                f"and its current distribution style is {diststyle!r}, not ALL. Its row "
+                f"count could not be verified against this rule's {max_rows:,}-row "
+                "ceiling for a 'small' dimension — confirm it before applying."
+            )
+        elif diststyle is None:
+            confidence = Confidence.LOW
+            rationale = (
+                f"{relation} is joined by queries carrying a hot share of workload cost "
+                f"and has an estimated {rows:,} rows, at or under this rule's "
+                f"{max_rows:,}-row ceiling for a 'small' dimension. Its current "
+                "distribution style could not be read, so whether it is already "
+                "DISTSTYLE ALL is unknown — confirm before applying."
+            )
+        else:
+            confidence = Confidence.MEDIUM
+            rationale = (
+                f"{relation} is joined by queries carrying a hot share of workload cost, "
+                f"has an estimated {rows:,} rows (at or under this rule's "
+                f"{max_rows:,}-row ceiling for a 'small' dimension), and its current "
+                f"distribution style is {diststyle!r}, not ALL. Replicating it to every "
+                "node removes redistribution for every join against it, not just one "
+                "column's worth."
+            )
+        rationale += (
+            " Confidence is capped at MEDIUM for the same reason ADV101/ADV102 are: this "
+            "rule's row-count ceiling is a heuristic, not a measurement of the storage and "
+            "write cost this table will actually incur once replicated."
+        )
+        rationale += (
+            " DISTSTYLE ALL multiplies this table's storage by the cluster's node count, "
+            "and every INSERT/UPDATE/DELETE against it is now replicated to every node too "
+            "— confirm both are acceptable before applying."
+        )
+        if phys.stats_off is not None and phys.stats_off > 0:
+            rationale += (
+                f" This table's planner statistics are {phys.stats_off:.0f}% stale "
+                "(stats_off) — treat the row estimate above with that in mind."
+            )
+
+        proposals.append(
+            Proposal(
+                code="ADV103",
+                title=f"Consider DISTSTYLE ALL on {relation}",
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "cost_share": cost_share,
+                    "calls": max(i.calls for i in joins),
+                    "row_estimate": rows,
+                    "current_diststyle": diststyle,
+                    "stats_off": phys.stats_off,
+                },
+                confidence=confidence,
+                ddl=(
+                    f"ALTER TABLE {_qualified(relation.schema, relation.table)} "
+                    "ALTER DISTSTYLE ALL;"
+                ),
+                note=(
+                    "ALTER DISTSTYLE ALL rewrites the entire table: Redshift copies every "
+                    "row to every node, holding a lock for the duration, and needs disk "
+                    "space on every node for the copy. There is no CONCURRENTLY "
+                    "equivalent. After this runs, storage for this table is multiplied by "
+                    "the node count and every write to it is replicated to every node — "
+                    "confirm both are acceptable, and run this in a maintenance window."
+                ),
+            )
+        )
+    return proposals
+
+
+def propose_maintenance(
+    physical: Mapping[Relation, RedshiftTableFacts],
+    facts: Mapping[Relation, TableFacts],
+    *,
+    unsorted_threshold: float = UNSORTED_PCT_THRESHOLD,
+    stats_off_threshold: float = STATS_OFF_PCT_THRESHOLD,
+) -> list[Proposal]:
+    """ADV104 — VACUUM (unsorted region) and ANALYZE (stale statistics), from direct
+    measurement.
+
+    The one Redshift rule in this adapter whose remediation does not rewrite the table:
+    VACUUM reclaims sort order in place and ANALYZE only refreshes planner statistics. That
+    is also why it is the only one that can reasonably reach HIGH — `unsorted` and
+    `stats_off` are direct measurements Redshift already computed (see
+    `RedshiftTableFacts`'s docstring), not an inference this rule makes about data it
+    cannot see, which is what ADV101-103's MEDIUM cap is about. It is also the cheapest
+    thing an operator can act on, which is why the default ranking (highest confidence
+    first, see `WorkloadAdapter.ranking_key`) puts it near the top of a report without this
+    rule needing to do anything special.
+
+    `stats_off` is a staleness *percentage*, not Postgres's never-analyzed sentinel — see
+    `RedshiftTableFacts`'s docstring and `_row_estimate`'s. This is the rule that turns it
+    into a proposal in its own right, rather than merely a caveat riding along with
+    someone else's evidence, which ADV101-103 each still disclose it as.
+
+    No cost-share gating: unlike ADV101-103, this rule's evidence is a catalog measurement
+    about the table's own physical state, not about how the workload uses it, so
+    `--min-cost-share` cannot filter it — the same reasoning `cli.py`'s help text already
+    gives for ADV002 and ADV003 on the Postgres side.
+
+    A relation whose `unsorted`/`stats_off` value is itself unmeasured (SQL NULL) yields no
+    proposal for that specific check: there is no measurement to disclose a gap about, and
+    "maybe you should VACUUM" without one would be exactly the confident-but-wrong claim
+    this whole rule set exists to avoid making about something else.
+    """
+    proposals: list[Proposal] = []
+    for relation in sorted(physical):
+        phys = physical[relation]
+        table_facts = facts.get(relation)
+        rows = table_facts.row_estimate if table_facts else None
+
+        if phys.unsorted is not None and phys.unsorted >= unsorted_threshold:
+            proposals.append(
+                Proposal(
+                    code="ADV104",
+                    title=f"Run VACUUM on {relation}",
+                    rationale=(
+                        f"{phys.unsorted:.0f}% of {relation} is in the unsorted region "
+                        f"(svv_table_info.unsorted), at or above this rule's "
+                        f"{unsorted_threshold:.0f}% threshold. VACUUM reclaims sort order "
+                        "so zone maps and merge joins can work again; unlike a SORTKEY or "
+                        "DISTKEY change, it does not rewrite the table's distribution or "
+                        "column definitions, only its physical row order."
+                    ),
+                    evidence={
+                        "schema": relation.schema,
+                        "table": relation.table,
+                        "unsorted": phys.unsorted,
+                        "row_estimate": rows,
+                    },
+                    confidence=Confidence.HIGH,
+                    ddl=f"VACUUM {_qualified(relation.schema, relation.table)};",
+                    note=(
+                        "VACUUM is heavy: it reads and rewrites the unsorted portion of "
+                        "the table and competes with other cluster activity for I/O. It "
+                        "does not need a maintenance-window lock the way ALTER "
+                        "SORTKEY/DISTKEY/DISTSTYLE do, but it can still run for a long "
+                        "time on a large table — consider VACUUM SORT ONLY if reclaiming "
+                        "deleted-row space is not also needed."
+                    ),
+                )
+            )
+
+        if phys.stats_off is not None and phys.stats_off >= stats_off_threshold:
+            proposals.append(
+                Proposal(
+                    code="ADV104",
+                    title=f"Run ANALYZE on {relation}",
+                    rationale=(
+                        f"{relation}'s planner statistics are {phys.stats_off:.0f}% stale "
+                        "(svv_table_info.stats_off), at or above this rule's "
+                        f"{stats_off_threshold:.0f}% threshold. ANALYZE refreshes them; it "
+                        "does not rewrite the table at all."
+                    ),
+                    evidence={
+                        "schema": relation.schema,
+                        "table": relation.table,
+                        "stats_off": phys.stats_off,
+                        "row_estimate": rows,
+                    },
+                    confidence=Confidence.HIGH,
+                    ddl=f"ANALYZE {_qualified(relation.schema, relation.table)};",
+                    note=(
+                        "ANALYZE reads a sample of the table to refresh planner "
+                        "statistics; it takes no exclusive lock and does not rewrite any "
+                        "row, but it is still real I/O against the cluster."
+                    ),
+                )
+            )
+    return proposals
+
+
+def _advisor_category(row: RedshiftAdvisorRow) -> str | None:
+    """Best-effort classification of one Advisor row into the same category
+    `propose_sortkey`/`propose_distkey`/`propose_diststyle_all` each propose in, so
+    `_disclose_advisor_agreement` can detect agreement. `None` when neither `rec_type` nor
+    `recommended_ddl` can be read as one of them — an unclassified row is still surfaced by
+    `propose_advisor`, it simply cannot be cross-referenced against our own rules.
+
+    This classification drives *only* the agreement disclosure, never `propose_advisor`'s
+    own confidence (always HIGH — see its docstring) and never ADV101/102/103's confidence
+    cap: it is a guess about which of our rules an Advisor row corresponds to, not a fact
+    either rule's confidence should turn on.
+    """
+    rec_type = row.rec_type.lower()
+    if "sort" in rec_type:
+        return _CATEGORY_SORTKEY
+    if "dist" in rec_type:
+        ddl = (row.recommended_ddl or "").upper()
+        return _CATEGORY_DISTSTYLE_ALL if "ALL" in ddl else _CATEGORY_DISTKEY
+    return None
+
+
+def propose_advisor(rows: Sequence[RedshiftAdvisorRow]) -> list[Proposal]:
+    """ADV105 — surface Amazon Redshift Advisor's own recommendations, clearly attributed.
+
+    This is the one signal in this whole adapter that comes from the cluster's own
+    analysis rather than from sqlquality's inference over the workload — see the module
+    docstring's `CAP_ADVISOR` note and the plan's "why the rules are not the Postgres
+    rules renamed" section. Confidence is HIGH unconditionally: unlike ADV101-103, this
+    proposal makes no claim of our own about distribution skew or predicate selectivity —
+    it relays a conclusion Redshift's own optimizer already reached, which sqlquality did
+    not derive and has not independently verified.
+
+    `note` says so explicitly, in the field `render_ddl` (Task 7) prints directly above the
+    DDL: this is the one proposal in the whole adapter whose DDL sqlquality did not
+    generate, and that must stay visible to whoever is about to run it, not only to whoever
+    reads `rationale`.
+
+    Never folded into an ADV101/102/103 proposal here or elsewhere — see
+    `_disclose_advisor_agreement`, which appends a sentence to a *matching* proposal's
+    rationale instead of merging the two into one object, so a reader can always tell which
+    conclusion is ours and which is Advisor's.
+    """
+    proposals: list[Proposal] = []
+    for row in sorted(rows, key=lambda r: (r.relation.schema, r.relation.table, r.rec_type)):
+        relation = row.relation
+        rationale = (
+            "Amazon Redshift Advisor (svv_alter_table_recommendations) recommends this "
+            "change based on its own analysis of the cluster — sqlquality did not "
+            "generate or verify this recommendation, it only relays it. Advisor's "
+            "analysis may reflect an earlier snapshot of this table's usage, so confirm "
+            "it still applies before acting on it."
+        )
+        if row.current_ddl:
+            rationale += f" Current: {row.current_ddl}."
+        if row.recommended_ddl:
+            rationale += f" Recommended: {row.recommended_ddl}."
+
+        proposals.append(
+            Proposal(
+                code="ADV105",
+                title=(
+                    f"Amazon Redshift Advisor recommends a {row.rec_type} change for {relation}"
+                ),
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "recommendation_type": row.rec_type,
+                    "current_ddl": row.current_ddl,
+                    "recommended_ddl": row.recommended_ddl,
+                },
+                confidence=Confidence.HIGH,
+                ddl=row.recommended_ddl,
+                note=(
+                    "Source: Amazon Redshift Advisor, not sqlquality's own analysis — "
+                    "this statement was generated by Redshift itself and is relayed "
+                    "verbatim. Review it exactly as you would a recommendation found "
+                    "directly on the Redshift console."
+                ),
+            )
+        )
+    return proposals
+
+
+def _disclose_advisor_agreement(
+    proposals: list[Proposal], advisor_rows: Sequence[RedshiftAdvisorRow]
+) -> list[Proposal]:
+    """Append a sentence to an ADV101/102/103 proposal when Advisor independently
+    recommends the same category of change for the same relation.
+
+    Agreement is scoped to (relation, category) — not to the exact column or DDL text —
+    because Advisor's DDL and ours are generated independently and are not expected to be
+    byte-identical; a column-level match would silently miss genuine agreement over a
+    cosmetic difference in how the two describe it. This is the strongest evidence this
+    adapter can produce, since Advisor's signal comes from the cluster itself rather than
+    from sqlquality's inference — see the module docstring and `propose_advisor`.
+
+    Disclosed as an extra sentence in the existing proposal's rationale — never by raising
+    its `Confidence` past the documented MEDIUM cap (see `propose_sortkey`,
+    `propose_distkey`, `propose_diststyle_all`), and never by merging the Advisor row into
+    this proposal, which stays a separate ADV105 entry so a reader can always tell whose
+    conclusion is whose.
+    """
+    agreeing: set[tuple[Relation, str]] = set()
+    for row in advisor_rows:
+        category = _advisor_category(row)
+        if category is not None:
+            agreeing.add((row.relation, category))
+
+    if not agreeing:
+        return proposals
+
+    updated: list[Proposal] = []
+    for proposal in proposals:
+        category = _PROPOSAL_CATEGORY.get(proposal.code)
+        relation = Relation(
+            schema=str(proposal.evidence.get("schema")),
+            table=str(proposal.evidence.get("table")),
+        )
+        if category is not None and (relation, category) in agreeing:
+            proposal = replace(
+                proposal,
+                rationale=proposal.rationale
+                + " Amazon Redshift Advisor independently recommends the same kind of "
+                "change for this table (see its own ADV105 proposal for the exact "
+                "wording) — agreement between the two is the strongest evidence this "
+                "adapter can produce, since Advisor's signal comes from the cluster "
+                "itself.",
+            )
+        updated.append(proposal)
+    return updated
 
 
 class RedshiftWorkloadAdapter(WorkloadAdapter):
@@ -860,6 +1278,39 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         self.physical_facts = physical
         return facts
 
+    def _advisor_rows(
+        self, schemas: tuple[str, ...], relations: frozenset[Relation]
+    ) -> list[RedshiftAdvisorRow]:
+        """CAP_ADVISOR rows for the given relations — ADV105's raw material.
+
+        Same over-fetch guard as `fetch_table_facts`: the statement filters on bare table
+        names, so a same-named table in a different requested schema can come back too and
+        must be dropped here rather than misattributed to a relation that never asked for
+        it.
+        """
+        wanted = sorted({relation.table for relation in relations})
+        rows: list[RedshiftAdvisorRow] = []
+        for (
+            _database_name,
+            schema_name,
+            table,
+            rec_type,
+            current_ddl,
+            recommended_ddl,
+        ) in self._run(CAP_ADVISOR, (list(schemas), wanted)):
+            relation = Relation(schema=str(schema_name), table=str(table))
+            if relation not in relations:
+                continue
+            rows.append(
+                RedshiftAdvisorRow(
+                    relation=relation,
+                    rec_type=str(rec_type),
+                    current_ddl=str(current_ddl) if current_ddl is not None else None,
+                    recommended_ddl=(str(recommended_ddl) if recommended_ddl is not None else None),
+                )
+            )
+        return rows
+
     def propose(
         self,
         aggregation: Aggregation,
@@ -868,7 +1319,26 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         *,
         min_cost_share: float,
     ) -> list[Proposal]:
-        raise NotImplementedError("Redshift propose() is not implemented yet.")
+        """ADV101-105 — see each `propose_*` function's own docstring for its rule.
+
+        `workload` is accepted (the ABC requires it uniformly across engines) but unused
+        here: unlike Postgres's ADV005/ADV006, no Redshift rule in this task reads raw
+        query text — every one of ADV101-104 works from `aggregation.usage` and
+        `self.physical_facts`, and ADV105 works from Advisor's own catalog rows.
+        """
+        physical = self.physical_facts
+        proposals = [
+            *propose_sortkey(aggregation.usage, facts, physical, min_cost_share=min_cost_share),
+            *propose_distkey(aggregation.usage, facts, physical, min_cost_share=min_cost_share),
+            *propose_diststyle_all(
+                aggregation.usage, facts, physical, min_cost_share=min_cost_share
+            ),
+            *propose_maintenance(physical, facts),
+        ]
+        advisor_rows = self._advisor_rows(self.schemas, aggregation.tables)
+        proposals = proposals + propose_advisor(advisor_rows)
+        proposals = _disclose_advisor_agreement(proposals, advisor_rows)
+        return sorted(proposals, key=self.ranking_key)
 
     def render_ddl(self, proposals: list[Proposal]) -> str:
         raise NotImplementedError("Redshift render_ddl() is not implemented yet.")
