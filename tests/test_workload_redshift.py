@@ -1,17 +1,22 @@
 import re
+import sys
+import types
 
 import sqlglot
 import pytest
 
 from sqlquality.models import Aggregation, ConnectionParams, Workload
 from sqlquality.workload import get_workload_adapter
+from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.redshift import (
     CAP_ADVISOR,
     CAP_SCHEMA,
     CAP_TABLE_FACTS,
     CAP_WORKLOAD,
+    DEGRADATION_READ_ONLY,
     RedshiftWorkloadAdapter,
 )
+from sqlquality.workload.session import READ_ONLY_SQL
 
 EXPECTED_CAPABILITIES = {CAP_WORKLOAD, CAP_SCHEMA, CAP_TABLE_FACTS, CAP_ADVISOR}
 
@@ -79,10 +84,11 @@ def test_there_is_no_ndv_or_index_capability():
 #: reaches it. Named individually rather than discovered by reflection: a later task that
 #: implements one of these must delete its entry here, which is a visible, reviewable edit —
 #: whereas a reflective sweep would silently stop covering whatever got implemented.
+#:
+#: `connect` is deliberately absent: Task 2 implements it (see the tests below) because
+#: Redshift speaks the same PostgreSQL wire protocol Postgres does, so it is the one
+#: method genuinely exercisable without a live Redshift cluster.
 UNIMPLEMENTED = {
-    "connect": lambda a: a.connect(
-        ConnectionParams(engine="redshift", dsn="postgresql://h/d", fields={}, source="test"), 30
-    ),
     "fetch_workload": lambda a: a.fetch_workload(None, 10),
     "fetch_schema": lambda a: a.fetch_schema(("public",)),
     "fetch_table_facts": lambda a: a.fetch_table_facts(("public",), frozenset()),
@@ -109,3 +115,253 @@ def test_unimplemented_methods_say_so_rather_than_returning_empty(method):
     adapter = RedshiftWorkloadAdapter()
     with pytest.raises(NotImplementedError):
         UNIMPLEMENTED[method](adapter)
+
+
+class _FakeCursor:
+    """Enough of a psycopg cursor for connect()'s session-setup statements.
+
+    `fail_on` lets a test make exactly one statement (identified by its SQL text) raise,
+    which is how the read-only degradation path is exercised without a live cluster: a
+    real Redshift refusing `SET default_transaction_read_only` looks, from here, like a
+    cursor.execute() that raises on that one statement and succeeds on every other.
+    """
+
+    def __init__(self, log: list[tuple] | None = None, *, fail_on: frozenset[str] = frozenset()):
+        self.executed: list[tuple] = []
+        self._log = log if log is not None else []
+        self._fail_on = fail_on
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        self._log.append((sql, params))
+        if sql in self._fail_on:
+            raise RuntimeError(f"ERROR: {sql!r} is not supported on this cluster")
+
+    def fetchall(self):
+        return []
+
+
+class _FakeConnection:
+    def __init__(self, *, fail_on: frozenset[str] = frozenset()) -> None:
+        self.cursors: list[_FakeCursor] = []
+        self.log: list[tuple] = []
+        self._fail_on = fail_on
+
+    def cursor(self):
+        cursor = _FakeCursor(self.log, fail_on=self._fail_on)
+        self.cursors.append(cursor)
+        return cursor
+
+
+def _install_fake_psycopg(monkeypatch, seen: dict, *, fail_on: frozenset[str] = frozenset()):
+    """A psycopg that records the conninfo it was handed and connects successfully."""
+
+    module = types.ModuleType("psycopg")
+
+    def connect(conninfo, **kwargs):
+        seen["conninfo"] = conninfo
+        seen["connection"] = _FakeConnection(fail_on=fail_on)
+        return seen["connection"]
+
+    module.connect = connect  # type: ignore[attr-defined]
+    module.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", module)
+    return module
+
+
+def test_connect_without_psycopg_installed_raises_a_helpful_import_error(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_psycopg(name, *args, **kwargs):
+        if name == "psycopg":
+            raise ImportError("No module named 'psycopg'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_psycopg)
+    adapter = RedshiftWorkloadAdapter()
+    params = ConnectionParams(
+        engine="redshift", dsn="postgresql://u@h/db", fields={}, source="--dsn"
+    )
+    with pytest.raises(ImportError) as exc:
+        adapter.connect(params, 30)
+    assert "sqlquality[warehouse]" in str(exc.value)
+
+
+def test_connect_arms_a_statement_timeout_before_the_querier_is_usable(monkeypatch):
+    """Mirrors the Postgres unit test of the same shape: session setup must precede any
+    later query, and the relative order is only observable on the connection-wide log."""
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    adapter = RedshiftWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="redshift", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+
+    setup = seen["connection"].log[:]
+    assert setup == [
+        (READ_ONLY_SQL, None),
+        ("SELECT set_config('statement_timeout', %s, false)", ("30000ms",)),
+    ], setup
+    assert adapter.degraded == []
+
+    adapter._query("SELECT 1", ())
+    assert seen["connection"].log[:2] == setup
+    assert seen["connection"].log[2] == ("SELECT 1", ())
+
+
+def test_an_out_of_range_timeout_is_clamped_before_it_reaches_the_session(monkeypatch):
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    RedshiftWorkloadAdapter().connect(
+        ConnectionParams(engine="redshift", dsn="postgresql:///x", fields={}, source="--dsn"), 7200
+    )
+    assert seen["connection"].log[1][1] == (f"{MAX_TIMEOUT_S * 1000}ms",)
+
+
+def test_a_refused_read_only_statement_degrades_rather_than_aborts(monkeypatch):
+    """The Redshift-specific difference from Postgres: `SET default_transaction_read_only`
+    is not accepted in every configuration. A refusal must not be silently treated as
+    success — the whole "sqlquality never writes" promise rests on the operator being
+    told, not on the tool assuming the best."""
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen, fail_on=frozenset({READ_ONLY_SQL}))
+    adapter = RedshiftWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="redshift", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+
+    # The connection still succeeds and the statement timeout is still armed —
+    # a refused read-only guard is not a reason to abandon the rest of setup.
+    assert adapter._query is not None
+    assert seen["connection"].log[1] == (
+        "SELECT set_config('statement_timeout', %s, false)",
+        ("30000ms",),
+    )
+
+    assert len(adapter.degraded) == 1
+    capability, reason = adapter.degraded[0]
+    assert capability == DEGRADATION_READ_ONLY
+    assert "could not be proven read-only" in reason
+    # Not "we might write" — the four SELECT-only statements this adapter issues are a
+    # separate, already-pinned guarantee (test_no_statement_writes). What is missing is
+    # the extra belt-and-braces defense, and the message must say which.
+    assert "belt-and-braces" in reason.lower()
+
+
+def test_a_successful_read_only_statement_reports_no_degradation(monkeypatch):
+    """Guards the guard above: without a forced failure, the same setup reports nothing,
+    so the degradation in the previous test is attributable to the refusal, not to
+    `connect()` always degrading regardless of what the driver does."""
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    adapter = RedshiftWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="redshift", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+    assert adapter.degraded == []
+
+
+def test_connect_scrubs_a_password_from_a_driver_failure(monkeypatch):
+    """psycopg is not believed to echo a password, but the auth-failure path cannot be
+    exercised without a live server, so the secret is scrubbed rather than trusted —
+    the same reasoning `test_workload_postgres.py`'s identical test gives."""
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def explode(conninfo, **kwargs):
+        raise RuntimeError(f"connection failed for conninfo {conninfo}")
+
+    fake_psycopg.connect = explode  # type: ignore[attr-defined]
+    fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+        make_conninfo=lambda **kw: " ".join(f"{k}={v}" for k, v in kw.items())
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    params = ConnectionParams(
+        engine="redshift",
+        dsn=None,
+        fields={"host": "db", "user": "hans", "password": "hunter2"},
+        source="profiles.yml",
+    )
+    with pytest.raises(ConnectionError) as exc:
+        RedshiftWorkloadAdapter().connect(params, 30)
+    assert "hunter2" not in str(exc.value)
+    assert "***" in str(exc.value)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+
+
+def test_a_conninfo_build_failure_is_scrubbed_like_a_connect_failure(monkeypatch):
+    """make_conninfo runs inside the scrubbing envelope: it can itself raise on an
+    unusable keyword, and that message can quote the offending value."""
+
+    module = types.ModuleType("psycopg")
+
+    def never_called(conninfo, **kwargs):
+        raise AssertionError("must not reach connect() when the conninfo cannot be built")
+
+    def explode(**kwargs):
+        raise RuntimeError(f"invalid connection option: {sorted(kwargs.items())}")
+
+    module.connect = never_called  # type: ignore[attr-defined]
+    module.conninfo = types.SimpleNamespace(make_conninfo=explode)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", module)
+
+    params = ConnectionParams(
+        engine="redshift",
+        dsn=None,
+        fields={"host": "db", "user": "hans", "password": "hunter2"},
+        source="profiles.yml",
+    )
+    with pytest.raises(ConnectionError) as exc:
+        RedshiftWorkloadAdapter().connect(params, 30)
+    assert "hunter2" not in str(exc.value)
+    assert "***" in str(exc.value)
+    assert exc.value.__context__ is None
+
+
+def test_dropped_profile_keys_are_named_on_stderr(monkeypatch, capsys):
+    """A key we cannot forward must be reported, not discarded in silence."""
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="redshift",
+        dsn=None,
+        fields={
+            "host": "db",
+            "user": "hans",
+            "password": "hunter2",
+            "cluster_identifier": "my-cluster",
+            "iam": "true",
+        },
+        source="profiles.yml",
+    )
+    RedshiftWorkloadAdapter().connect(params, 30)
+    warning = capsys.readouterr().err
+    assert "cluster_identifier" in warning
+    assert "iam" in warning
+    # Key names only — never a value, since one of them could be a secret.
+    assert "hunter2" not in warning
+    assert "my-cluster" not in warning
+
+
+def test_forwarded_and_mapped_keys_are_not_reported_as_dropped(monkeypatch, capsys):
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen)
+    params = ConnectionParams(
+        engine="redshift",
+        dsn=None,
+        fields={"host": "db", "dbname": "x", "user": "u", "password": "p", "sslmode": "require"},
+        source="profiles.yml",
+    )
+    RedshiftWorkloadAdapter().connect(params, 30)
+    assert capsys.readouterr().err == ""

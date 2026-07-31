@@ -1,4 +1,4 @@
-"""Redshift workload adapter: sys_/svv_ system-view introspection, --dry-run only so far.
+"""Redshift workload adapter: sys_/svv_ system-view introspection, connect() is real.
 
 **Provenance warning.** None of the SQL in this module has been executed against a live
 Redshift cluster: there is no Redshift container available for development, and Postgres —
@@ -19,15 +19,24 @@ would invite a later rule to assume evidence that cannot exist on this engine. T
 are read through `CAP_ADVISOR` below and turned into proposals (ADV101-ADV105) by a later
 task; this module is the skeleton — the capability set, the statements, and registration.
 
-Every method beyond `introspection_sql()` raises `NotImplementedError` here on purpose. A
-`fetch_*` method that silently returned empty results would be indistinguishable from a
-healthy cluster running no workload at all, which is a worse failure mode than an explicit
-"not implemented yet" — see `WorkloadAdapter`'s docstring on `--dry-run`, the one thing this
-task must actually deliver.
+Every method beyond `introspection_sql()` and `connect()` raises `NotImplementedError` here
+on purpose. A `fetch_*` method that silently returned empty results would be
+indistinguishable from a healthy cluster running no workload at all, which is a worse
+failure mode than an explicit "not implemented yet" — see `WorkloadAdapter`'s docstring on
+`--dry-run`, the thing Task 1 delivered.
+
+`connect()` is the exception, and deliberately so: Redshift speaks the PostgreSQL wire
+protocol through psycopg, so it is the one part of this adapter genuinely exercisable
+against the `postgres:16` container the rest of the suite already runs against — see
+`tests/integration/test_redshift_connect_live.py`. Its session setup is shared with
+`PostgresWorkloadAdapter.connect` via `workload/session.py`, and the one behavioral
+difference — Redshift refusing `SET default_transaction_read_only` is a recorded
+degradation rather than a hard failure — is documented on `connect()` itself.
 """
 
 from __future__ import annotations
 
+import sys
 from datetime import timedelta
 
 from sqlquality.models import (
@@ -39,12 +48,54 @@ from sqlquality.models import (
     Workload,
     WorkloadFetch,
 )
-from sqlquality.workload.base import IntrospectionStatement, Querier, WorkloadAdapter
+from sqlquality.workload.base import (
+    MAX_TIMEOUT_S,
+    MIN_TIMEOUT_S,
+    IntrospectionStatement,
+    Querier,
+    WorkloadAdapter,
+)
+from sqlquality.workload.secrets import secrets_for
+from sqlquality.workload.session import (
+    READ_ONLY_SQL,
+    dropped_libpq_fields,
+    import_psycopg,
+    open_session,
+    translate_libpq_fields,
+)
 
 CAP_WORKLOAD = "workload"
 CAP_SCHEMA = "schema"
 CAP_TABLE_FACTS = "table_facts"
 CAP_ADVISOR = "advisor"
+
+#: Pseudo-capability name `connect()` uses to record a read-only degradation in
+#: `self.degraded` — not one of `introspection_sql()`'s four statements, since arming
+#: read-only intent happens once at connect time rather than per fetch. Named distinctly
+#: from every real `CAP_*` so a report reader cannot mistake it for a denied SELECT.
+DEGRADATION_READ_ONLY = "read_only"
+
+#: dbt profiles.yml field names -> libpq connection keywords, for a Redshift target.
+#: Redshift's dbt adapter accepts the same core keywords Postgres does — see
+#: `translate_libpq_fields` in `session.py`, which this and `postgres.py`'s own
+#: `_PG_FIELD_MAP` both feed. IAM-based fields (`cluster_identifier`, `iam`, `region`)
+#: are not psycopg keywords and are deliberately not mapped here; a profile using them
+#: falls through to `dropped_libpq_fields` and is named on stderr rather than silently
+#: dropped.
+_REDSHIFT_FIELD_MAP = {
+    "dbname": "dbname",
+    "database": "dbname",
+    "host": "host",
+    "port": "port",
+    "user": "user",
+    "username": "user",
+    "password": "password",
+}
+#: profiles.yml keys forwarded to libpq unchanged — see `postgres._PG_PASSTHROUGH_FIELDS`
+#: for why the TLS group in particular is here rather than silently dropped.
+_REDSHIFT_PASSTHROUGH_FIELDS = frozenset(
+    {"sslmode", "sslcert", "sslkey", "sslrootcert", "connect_timeout"}
+)
 
 #: What to tell the user when a capability's statement is refused. These strings are what
 #: someone hands their DBA, so each one names the actual failure mode rather than a generic
@@ -155,9 +206,69 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             return []
 
     def connect(self, params: ConnectionParams, timeout_s: int) -> None:
-        raise NotImplementedError(
-            "Redshift connect() is not implemented yet; --dry-run works without it."
+        """Open a read-only session over the PostgreSQL wire protocol.
+
+        Redshift speaks libpq through psycopg exactly as Postgres does, so the whole
+        session-setup mechanism — driver import, conninfo construction inside the
+        scrubbing envelope, the statement timeout, secret scrubbing on a driver failure —
+        is shared with `PostgresWorkloadAdapter.connect` via `open_session`; see
+        `session.py`'s module docstring for why it lives there rather than being copied.
+
+        The one thing this adapter does differently is what a refused
+        `SET default_transaction_read_only = on` means: Redshift does not accept that
+        statement in every configuration, and unlike Postgres its refusal here does not
+        abort the connection. It is recorded in `self.degraded` instead, so the report
+        says plainly that the session could not be proven read-only — continuing
+        silently as though the statement had succeeded would misstate the one guarantee
+        this tool exists to keep. The connection is still safe to use regardless: this
+        adapter only ever issues the four `SELECT` statements in `SQL` above, pinned by
+        `test_no_statement_writes`.
+        """
+        psycopg = import_psycopg("Redshift", "warehouse")
+
+        # Silence is the failure mode being fixed here: a dropped `sslmode` downgrades
+        # the connection with no signal at all. Key names only — see
+        # `dropped_libpq_fields`.
+        dropped = dropped_libpq_fields(
+            params.fields, _REDSHIFT_FIELD_MAP, _REDSHIFT_PASSTHROUGH_FIELDS
         )
+        if dropped:
+            print(
+                f"warning: ignoring connection setting(s) not supported by the Redshift "
+                f"adapter: {', '.join(dropped)}. Pass --dsn if you need them.",
+                file=sys.stderr,
+            )
+
+        # Everything we know to be secret, so a driver exception can be proven clean
+        # rather than trusted.
+        secrets = secrets_for(params)
+
+        # `read_only_required=False`: a refusal here is recorded as a degradation, not
+        # raised — see this method's own docstring and `open_session`'s parameter of the
+        # same name.
+        query, degradation = open_session(
+            psycopg=psycopg,
+            # Inside the scrubbing envelope: psycopg raises from make_conninfo on an
+            # unusable keyword, and that message can quote the offending value — which
+            # for the `password` keyword is the password.
+            conninfo_factory=lambda: (
+                params.dsn
+                or psycopg.conninfo.make_conninfo(
+                    **translate_libpq_fields(
+                        params.fields, _REDSHIFT_FIELD_MAP, _REDSHIFT_PASSTHROUGH_FIELDS
+                    )
+                )
+            ),
+            secrets=secrets,
+            timeout_s=timeout_s,
+            min_timeout_s=MIN_TIMEOUT_S,
+            max_timeout_s=MAX_TIMEOUT_S,
+            read_only_sql=READ_ONLY_SQL,
+            read_only_required=False,
+        )
+        self._query = query
+        if degradation is not None:
+            self.degraded.append((DEGRADATION_READ_ONLY, degradation))
 
     def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
         raise NotImplementedError("Redshift fetch_workload() is not implemented yet.")
