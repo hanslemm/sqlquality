@@ -93,7 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach (nothing Redshift emits is a `CREATE INDEX`), so a `--project-dir` run on Redshift
   warned in `rationale` and in the `--ddl` note that `dbt run` may undo an hours-long
   full-table rewrite while the terminal row stayed byte-identical to a dbt-free run. Any
-  proposal whose DDL cannot be expressed as dbt config is now counted and reported too.
+  proposal whose DDL cannot be expressed as dbt config is now counted and reported too, as is
+  an index *drop* (ADV002, ADV003) on a dbt-managed relation — the case reachable on Postgres,
+  where a run proposing only drops enriched every one of them and still said nothing, so an
+  operator applied a drop that the next `dbt run` recreated from the model's `indexes:` config.
+  Each of the three outcomes is reported as its own clause, because each calls for a different
+  action: paste a config block, expect a runnable statement not to survive the next rebuild, or
+  delete a config entry as well as running the drop.
 - `IS NOT NULL` predicates were classified as `IS NULL` when sqlglot 30.13 or newer was
   installed, because that release moved the negation from a wrapping `Not` node onto a
   `negate` flag on the `Is` node itself. Both encodings are now read. This was not cosmetic:
