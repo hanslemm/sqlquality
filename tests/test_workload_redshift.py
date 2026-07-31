@@ -82,32 +82,12 @@ def test_there_is_no_ndv_or_index_capability():
     assert not any("ndv" in c or "index" in c for c in capabilities)
 
 
-#: Every `WorkloadAdapter` method this task deliberately leaves unbuilt, with a call that
-#: reaches it. Named individually rather than discovered by reflection: a later task that
-#: implements one of these must delete its entry here, which is a visible, reviewable edit —
-#: whereas a reflective sweep would silently stop covering whatever got implemented.
-#:
-#: `connect` is deliberately absent: Task 2 implements it (see the tests below) because
-#: Redshift speaks the same PostgreSQL wire protocol Postgres does, so it is the one
-#: method genuinely exercisable without a live Redshift cluster.
-UNIMPLEMENTED = {
-    "render_ddl": lambda a: a.render_ddl([]),
-}
-
-
-@pytest.mark.parametrize("method", sorted(UNIMPLEMENTED))
-def test_unimplemented_methods_say_so_rather_than_returning_empty(method):
-    """A half-built adapter that returns nothing looks exactly like a healthy cluster with
-    no workload, which is the worst possible failure mode for this command.
-
-    Every unbuilt method is covered, not just one. Task 1 originally pinned `fetch_schema`
-    alone, which would have let a later task implement `fetch_workload` and silently leave
-    `fetch_table_facts` returning `[]` — the run would then report a healthy cluster with no
-    catalog facts rather than an unfinished adapter.
-    """
-    adapter = RedshiftWorkloadAdapter()
-    with pytest.raises(NotImplementedError):
-        UNIMPLEMENTED[method](adapter)
+# Every `WorkloadAdapter` method this feature once left deliberately unbuilt — including
+# `render_ddl`, the last one — is now implemented. See git history for the
+# `UNIMPLEMENTED`/`test_unimplemented_methods_say_so_rather_than_returning_empty` machinery
+# this section used to carry: it named each unbuilt method individually (rather than
+# discovering them by reflection) precisely so implementing the last one forced a visible,
+# reviewable deletion here rather than an empty parametrisation quietly passing forever.
 
 
 class FakeQuerier:
