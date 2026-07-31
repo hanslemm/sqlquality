@@ -51,13 +51,18 @@ degradation rather than a hard failure — is documented on `connect()` itself.
 
 from __future__ import annotations
 
+import re
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlquality.models import (
     Aggregation,
+    ColumnRole,
+    ColumnUsage,
     ConnectionParams,
+    Confidence,
     Proposal,
     RawQueryRow,
     Relation,
@@ -72,6 +77,7 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
+from sqlquality.workload.postgres import _by_relation
 from sqlquality.workload.secrets import secrets_for
 from sqlquality.workload.session import (
     LIBPQ_FIELD_MAP,
@@ -208,6 +214,304 @@ class RedshiftTableFacts:
     diststyle: str | None
     sortkey1: str | None
     skew_rows: float | None
+
+
+#: Matches `KEY(column)`, whether bare or nested inside `AUTO(...)` — the shapes
+#: `svv_table_info.diststyle` takes when the table has an explicit distribution key. Not
+#: verified against a live cluster (see the module docstring); parsing is defensive and
+#: case-insensitive, matching this whole module's discipline for column *values* it cannot
+#: exercise locally.
+_DISTSTYLE_KEY_RE = re.compile(r"KEY\(\s*([^)]+?)\s*\)", re.IGNORECASE)
+
+
+def _diststyle_key_column(diststyle: str) -> str | None:
+    """The column name inside `KEY(column)` (or `AUTO(KEY(column))`), or `None`.
+
+    `svv_table_info` carries no separate "DISTKEY column" field — the column name is
+    embedded in `diststyle`'s text, in one of AWS's documented shapes ('KEY(col)', 'EVEN',
+    'ALL', or any of those wrapped in `AUTO(...)`). Parsed rather than string-matched
+    verbatim so `propose_distkey` can tell "already distributed on this column" apart from
+    "distributed on a different one" without a second introspection round trip.
+    """
+    match = _DISTSTYLE_KEY_RE.search(diststyle)
+    return match.group(1).strip() if match else None
+
+
+def _diststyle_is_all(diststyle: str) -> bool:
+    """True for Redshift's own `ALL` or `AUTO(ALL)` diststyle text.
+
+    Checked as "names ALL and no KEY column" rather than an exact match against the finite
+    AWS-documented value set, because `AUTO(...)` wraps any of the other shapes too and
+    telling those apart needs `_diststyle_key_column`'s parsing either way.
+    """
+    return "ALL" in diststyle.upper() and _diststyle_key_column(diststyle) is None
+
+
+def _quote_ident(name: str) -> str:
+    """Quote an identifier, doubling any embedded double quote.
+
+    See `postgres.py`'s identical helper. Duplicated rather than imported: DDL quoting is
+    each adapter's own small, self-contained concern, and it is not on the reuse list this
+    module was given (`_by_relation`, `_is_prefix`, `cost_share_of`, `ranking_key`, the
+    proposal-collapse machinery) — those are the pieces of shared *logic*, not this
+    engine-agnostic one-liner.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _qualified(schema: str, name: str) -> str:
+    """`"schema"."name"`, both parts quoted. See `postgres.py`'s identical helper."""
+    return f"{_quote_ident(schema)}.{_quote_ident(name)}"
+
+
+def propose_sortkey(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[Relation, TableFacts],
+    physical: Mapping[Relation, RedshiftTableFacts],
+    *,
+    min_cost_share: float,
+) -> list[Proposal]:
+    """ADV101 — a SORTKEY candidate from the table's hottest RANGE/EQUALITY predicate.
+
+    Redshift's zone maps store a min/max per 1MB block for the sort key column, so a scan
+    can skip whole blocks when the predicate is on that column. A time-series column under
+    a range predicate is the canonical win, but a hot equality predicate benefits the same
+    way, so both roles are pooled into one candidate list.
+
+    **Confidence is capped at MEDIUM and there is deliberately no HIGH branch — do not add
+    one for symmetry with a Postgres index rule.** A SORTKEY change is only worth its
+    rewrite if the predicate is *selective*, and selectivity is exactly what cannot be
+    measured without per-column NDV, which Redshift does not expose at all (see the module
+    docstring's `CAP_NDV` note). Claiming HIGH here would assert something about data
+    distribution this tool cannot see, while recommending `ALTER TABLE ... ALTER SORTKEY`,
+    which rewrites the entire table. See `propose_distkey` for the DISTKEY-specific version
+    of the same argument, and ADV008 in `postgres.py` for the precedent this follows.
+
+    Suppressed when the table's existing `sortkey1` already *is* the candidate column — the
+    SORTKEY equivalent of `postgres.py`'s `_covered`. If `sortkey1` itself could not be
+    read (its source value was SQL NULL), the claim "the table is not already sorted on
+    this column" is unknowable, so confidence drops to LOW and the rationale names the gap
+    — the same trap `_covered`'s docstring describes for an unreadable index catalog.
+
+    A relation entirely absent from `physical` — as opposed to present with `sortkey1 is
+    None` — is a different, and materially worse, gap: `svv_table_info` omits both external
+    (Spectrum) tables, which cannot carry a SORTKEY at all, and genuinely empty local
+    tables, and nothing available anywhere in this adapter distinguishes the two (see
+    `RedshiftTableFacts`'s docstring). Proposing a table rewrite for something that might
+    not even support one is worse than proposing nothing, so this rule does not propose for
+    it at all — a documented gap, not a silent one, and not a guess either way.
+
+    `facts` is accepted but not read: this rule's absence-of-evidence gate is entirely
+    `physical`'s (`RedshiftTableFacts` carries `sortkey1`; the engine-neutral `TableFacts`
+    row estimate has nothing this rule needs), kept in the signature so every ADV10x
+    proposal function takes the same four-argument shape from `propose()`'s call sites.
+    """
+    proposals: list[Proposal] = []
+    for relation, items in sorted(_by_relation(usage).items()):
+        candidates = sorted(
+            (i for i in items if i.role in (ColumnRole.RANGE, ColumnRole.EQUALITY)),
+            key=lambda i: (-i.cost_ms, i.column),
+        )
+        if not candidates:
+            continue
+        best = candidates[0]
+        if best.cost_share < min_cost_share:
+            continue
+
+        phys = physical.get(relation)
+        if phys is None:
+            # Cannot tell a Spectrum table from a genuinely empty one — see this
+            # function's own docstring. Not proposed, and not a silent skip: the reasoning
+            # lives above rather than in a per-run message, the same discipline this
+            # module already uses for every other documented gap.
+            continue
+
+        if phys.sortkey1 is not None and phys.sortkey1 == best.column:
+            continue
+
+        if phys.sortkey1 is None:
+            confidence = Confidence.LOW
+            rationale = (
+                f"{best.column} carries the table's hottest range/equality predicate. "
+                "The table's existing sort key could not be read, so whether it is "
+                "already sorted on this column is unknown — confirm before applying."
+            )
+        else:
+            confidence = Confidence.MEDIUM
+            rationale = (
+                f"{best.column} carries the table's hottest range/equality predicate, and "
+                f"the table is currently sorted on {phys.sortkey1!r}, not this column. "
+                "Zone maps let a scan skip whole 1MB blocks when the predicate matches the "
+                "sort key, which the current sort key cannot provide for this predicate."
+            )
+        rationale += (
+            " Confidence is capped at MEDIUM: a SORTKEY change only repays the rewrite if "
+            "this predicate is selective, and Redshift exposes no per-column "
+            "distinct-value statistics to check that."
+        )
+        if phys.stats_off is not None and phys.stats_off > 0:
+            rationale += (
+                f" This table's planner statistics are {phys.stats_off:.0f}% stale "
+                "(stats_off) — treat any row-count-based reasoning elsewhere in this "
+                "report with that in mind."
+            )
+
+        proposals.append(
+            Proposal(
+                code="ADV101",
+                title=f"Consider SORTKEY on {relation}({best.column})",
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "column": best.column,
+                    "role": best.role.value,
+                    "cost_share": best.cost_share,
+                    "calls": best.calls,
+                    "current_sortkey1": phys.sortkey1,
+                    "stats_off": phys.stats_off,
+                },
+                confidence=confidence,
+                ddl=(
+                    f"ALTER TABLE {_qualified(relation.schema, relation.table)} "
+                    f"ALTER SORTKEY ({_quote_ident(best.column)});"
+                ),
+                note=(
+                    "ALTER SORTKEY rewrites the entire table: Redshift copies every row, "
+                    "holding a lock for the duration, and needs roughly the table's own "
+                    "size again in free disk space while the rewrite runs. There is no "
+                    "CONCURRENTLY equivalent — unlike a Postgres index, this cannot be "
+                    "built alongside normal traffic. Run it in a maintenance window and "
+                    "confirm free disk space first."
+                ),
+            )
+        )
+    return proposals
+
+
+def propose_distkey(
+    usage: Sequence[ColumnUsage],
+    facts: Mapping[Relation, TableFacts],
+    physical: Mapping[Relation, RedshiftTableFacts],
+    *,
+    min_cost_share: float,
+) -> list[Proposal]:
+    """ADV102 — a DISTKEY candidate from the table's hottest JOIN predicate.
+
+    A join whose two sides are not distributed on the join key forces Redshift to
+    redistribute rows across the cluster before the join can run — `DS_BCAST_INNER` or the
+    heavier `DS_DIST_BOTH`, the same redistribution markers the offline `RedshiftAdapter`
+    names from an EXPLAIN plan (`sqlquality/adapters/redshift.py`). Distributing both sides
+    on the join key removes that step entirely.
+
+    **Confidence is capped at MEDIUM, deliberately, with no HIGH branch** — see
+    `propose_sortkey`'s docstring for the shared reasoning, and do not add a HIGH branch
+    here either. The DISTKEY-specific version of it: `svv_table_info.skew_rows` describes
+    the table's *current* distribution, not the skew the proposed key would produce, and
+    Redshift exposes no per-column NDV to predict it — a bad DISTKEY choice does not merely
+    cost a slower scan, it can concentrate the whole table onto one node, which is exactly
+    the failure mode this rule cannot see coming.
+
+    Suppressed when the table is already distributed on the candidate column — parsed out
+    of `svv_table_info.diststyle`'s `KEY(column)` (or `AUTO(KEY(column))`) text, since that
+    view carries no separate DISTKEY column (see `_diststyle_key_column`) — or when it is
+    already `DISTSTYLE ALL`, which already avoids redistribution entirely and is a strictly
+    better outcome than any single-column DISTKEY could offer (see `propose_diststyle_all`,
+    which proposes moving *to* ALL under its own, narrower gate).
+
+    See `propose_sortkey` for the absence-from-`physical` handling: identical reasoning,
+    identical outcome — no proposal, not a guess. `facts` is accepted but not read, for the
+    same interface-symmetry reason `propose_sortkey` gives.
+    """
+    proposals: list[Proposal] = []
+    for relation, items in sorted(_by_relation(usage).items()):
+        candidates = sorted(
+            (i for i in items if i.role is ColumnRole.JOIN),
+            key=lambda i: (-i.cost_ms, i.column),
+        )
+        if not candidates:
+            continue
+        best = candidates[0]
+        if best.cost_share < min_cost_share:
+            continue
+
+        phys = physical.get(relation)
+        if phys is None:
+            continue
+
+        diststyle = phys.diststyle
+        if diststyle is not None:
+            if _diststyle_is_all(diststyle):
+                continue
+            existing_key = _diststyle_key_column(diststyle)
+            if existing_key is not None and existing_key == best.column:
+                continue
+
+        if diststyle is None:
+            confidence = Confidence.LOW
+            rationale = (
+                f"{best.column} carries the table's hottest join predicate. The table's "
+                "current distribution style could not be read, so whether it is already "
+                "distributed on this column is unknown — confirm before applying."
+            )
+        else:
+            confidence = Confidence.MEDIUM
+            rationale = (
+                f"{best.column} carries the table's hottest join predicate, and the "
+                f"table's current distribution style is {diststyle!r}, not keyed on this "
+                "column. A join whose sides are not co-located on the join key forces "
+                "Redshift to redistribute rows across the cluster before it can complete "
+                "the join."
+            )
+        rationale += (
+            " Confidence is capped at MEDIUM: distribution skew is what makes a DISTKEY "
+            "choice good or catastrophic, and Redshift exposes no per-column "
+            "distinct-value statistics to predict it."
+        )
+        if phys.skew_rows is not None:
+            rationale += (
+                f" This table's current skew_rows is {phys.skew_rows:.2f}, but that "
+                "describes its *existing* distribution, not the skew this DISTKEY would "
+                "produce, which cannot be predicted from it."
+            )
+        if phys.stats_off is not None and phys.stats_off > 0:
+            rationale += (
+                f" This table's planner statistics are {phys.stats_off:.0f}% stale "
+                "(stats_off) — treat any row-count-based reasoning elsewhere in this "
+                "report with that in mind."
+            )
+
+        proposals.append(
+            Proposal(
+                code="ADV102",
+                title=f"Consider DISTKEY on {relation}({best.column})",
+                rationale=rationale,
+                evidence={
+                    "schema": relation.schema,
+                    "table": relation.table,
+                    "column": best.column,
+                    "role": best.role.value,
+                    "cost_share": best.cost_share,
+                    "calls": best.calls,
+                    "current_diststyle": diststyle,
+                    "skew_rows": phys.skew_rows,
+                    "stats_off": phys.stats_off,
+                },
+                confidence=confidence,
+                ddl=(
+                    f"ALTER TABLE {_qualified(relation.schema, relation.table)} "
+                    f"ALTER DISTKEY {_quote_ident(best.column)};"
+                ),
+                note=(
+                    "ALTER DISTKEY rewrites the entire table: Redshift redistributes and "
+                    "copies every row across every node, holding a lock for the duration, "
+                    "and needs roughly the table's own size again in free disk space while "
+                    "the rewrite runs. There is no CONCURRENTLY equivalent. Run it in a "
+                    "maintenance window and confirm free disk space first."
+                ),
+            )
+        )
+    return proposals
 
 
 class RedshiftWorkloadAdapter(WorkloadAdapter):
