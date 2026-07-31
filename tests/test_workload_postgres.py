@@ -785,6 +785,12 @@ def test_profile_tls_settings_are_forwarded_to_the_driver(monkeypatch):
         dsn=None,
         fields={
             "host": "db",
+            # `database` is dbt's spelling and must be translated to libpq's `dbname`.
+            # Passing it here rather than `dbname` covers the aliasing half of the map: with
+            # neither key present, scrambling `dbname`/`database` in the shared
+            # `LIBPQ_FIELD_MAP` left every Postgres test green and only Redshift's noticed,
+            # which put single-adapter coverage on a credential-path table both engines share.
+            "database": "mydb",
             "user": "hans",
             "password": "hunter2",
             "sslmode": "verify-full",
@@ -797,6 +803,8 @@ def test_profile_tls_settings_are_forwarded_to_the_driver(monkeypatch):
     )
     PostgresWorkloadAdapter().connect(params, 30)
     conninfo = seen["conninfo"]
+    assert "dbname=mydb" in conninfo
+    assert "database=" not in conninfo, "dbt's `database` must be translated, not forwarded"
     assert "sslmode=verify-full" in conninfo
     assert "sslrootcert=/etc/ssl/ca.crt" in conninfo
     assert "sslcert=/etc/ssl/client.crt" in conninfo
