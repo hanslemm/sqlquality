@@ -529,8 +529,19 @@ def _prepend_note(existing: str | None, dbt_note: str) -> str:
     relation also carried an Advisor recommendation. Preserving it first, and appending the
     dbt warning after a blank line, keeps both true statements next to the one DDL line they
     both concern instead of one silently replacing the other.
+
+    Order and non-duplication are both pinned (`test_prepend_note_keeps_the_existing_note
+    _first_and_emits_the_dbt_note_once`, `test_prepend_note_is_idempotent`): the existing
+    note comes first because it is the proposal's own statement about its own DDL and the dbt
+    warning is a caveat *on* it, and `dbt_note` is emitted exactly once — a note already
+    carrying this warning is returned unchanged rather than accumulating a second copy, so a
+    second enrichment pass over an already-enriched proposal cannot double it.
     """
-    return f"{existing}\n\n{dbt_note}" if existing else dbt_note
+    if not existing:
+        return dbt_note
+    if dbt_note in existing:
+        return existing
+    return f"{existing}\n\n{dbt_note}"
 
 
 @dataclass(frozen=True)
@@ -715,6 +726,13 @@ def _classify(proposal: Proposal, model: ModelNode) -> tuple[Proposal | None, _I
                 "expressed as dbt config.",
             ),
         )
+        # A flag, for the same reason `dbt_index_config` is one: the warning above lives in
+        # `rationale` and `note`, and the terminal prints neither, so an enriched row is
+        # byte-identical to the same proposal from a dbt-free run. `describe_rewrites` reads
+        # this to give a terminal-only user the one signal that enrichment fired at all —
+        # which on Redshift, where *every* proposal lands in this branch (nothing it emits
+        # is a CREATE/DROP INDEX), was otherwise the whole disclosure going missing.
+        evidence["dbt_ddl_not_expressed_as_config"] = True
         return dataclasses.replace(
             proposal, rationale=rationale, evidence=evidence, note=note
         ), None
@@ -907,30 +925,54 @@ def _deferred_to_block(
 
 
 def describe_rewrites(proposals: list[Proposal]) -> str | None:
-    """One line saying ADV302 fired, or None when it did not.
+    """One line saying what dbt enrichment actually did to this run's proposals, or None
+    when it did nothing.
 
-    ADV302 is never a proposal `code` — it is a rewrite applied to another rule's proposal —
-    so `code == "ADV302"` matches nothing and an enriched terminal row is byte-identical to
-    the same proposal from a dbt-free run: same code, same confidence, same cost share, same
-    title. The terminal never prints `rationale`, where the whole disclosure lives, so
-    without this line a user who reads only the terminal cannot tell enrichment happened.
-    Counted off the two evidence flags rather than by searching the DDL text for "ADV302",
-    which would depend on the wording of a string meant for humans.
+    Neither thing enrichment does is visible in a terminal row. ADV302 is never a proposal
+    `code` — it is a rewrite applied to another rule's proposal — so `code == "ADV302"`
+    matches nothing, and the generic "not expressed as dbt config" warning lives only in
+    `rationale` and `note`. The terminal prints neither, so an enriched row is byte-identical
+    to the same proposal from a dbt-free run: same code, same confidence, same cost share,
+    same title. Without this line a user who reads only the terminal cannot tell enrichment
+    happened.
+
+    **Both kinds are counted, not only ADV302's.** Counting the config-block rewrite alone
+    made this function return `None` for every Redshift run: nothing Redshift emits is a
+    `CREATE INDEX`, so every Redshift proposal for a dbt-managed relation takes
+    `_classify`'s generic path instead — it gets the warning that `dbt run` may undo an
+    hours-long full-table rewrite, and then the terminal said nothing at all. That is
+    verbatim the failure mode this function exists to prevent, on the engine where the
+    wasted work is hours rather than seconds.
+
+    Counted off evidence flags rather than by searching the DDL or rationale text for
+    "ADV302", which would depend on the wording of a string meant for humans.
     """
     rewritten = sum(1 for p in proposals if p.evidence.get("dbt_index_config") is True)
     merged = sum(1 for p in proposals if "dbt_index_config_reported_with" in p.evidence)
-    if not rewritten and not merged:
-        return None
-    line = (
-        f"ADV302 expressed {rewritten + merged} index proposal(s) as dbt `indexes` config: "
-        "their DDL is a config block to add to the model, not runnable SQL"
+    unexpressed = sum(
+        1 for p in proposals if p.evidence.get("dbt_ddl_not_expressed_as_config") is True
     )
-    if merged:
-        line += (
-            f" ({merged} folded into another proposal's block, since dbt reads one `indexes` "
-            "key per model config)"
+    if not rewritten and not merged and not unexpressed:
+        return None
+    clauses: list[str] = []
+    if rewritten or merged:
+        clause = (
+            f"ADV302 expressed {rewritten + merged} index proposal(s) as dbt `indexes` config: "
+            "their DDL is a config block to add to the model, not runnable SQL"
         )
-    return line
+        if merged:
+            clause += (
+                f" ({merged} folded into another proposal's block, since dbt reads one `indexes` "
+                "key per model config)"
+            )
+        clauses.append(clause)
+    if unexpressed:
+        clauses.append(
+            f"{unexpressed} proposal(s) target a dbt-managed relation and cannot be expressed "
+            "as dbt config: the statement is still runnable, but the next `dbt run` may undo "
+            "it — see each proposal's note in --ddl, or its rationale in --markdown/--json"
+        )
+    return "; ".join(clauses)
 
 
 def propose_materialization(

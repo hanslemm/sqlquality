@@ -2,6 +2,7 @@ import re
 import sys
 import types
 from datetime import timedelta
+from pathlib import Path
 
 import sqlglot
 import pytest
@@ -71,6 +72,81 @@ def test_no_statement_writes(capability):
     lowered = RedshiftWorkloadAdapter.SQL[capability].lower()
     found = {verb for verb in forbidden if re.search(rf"\b{verb}\b", lowered)}
     assert not found, f"{capability} contains write verb(s): {sorted(found)}"
+
+
+def _normalized(sql: str) -> str:
+    """`sql` with every run of whitespace collapsed, so a reformat of the statement cannot
+    break a predicate assertion that is really about the predicate."""
+    return " ".join(sql.lower().split())
+
+
+def test_workload_statement_is_scoped_to_the_current_database():
+    """The same guard `tests/test_workload_postgres.py` carries under this exact name, for
+    the same claim — it was not carried across when this engine was added, and deleting the
+    predicate left the whole suite green.
+
+    Without the scope, an `advise` run against a shared cluster ingests *other databases'*
+    query history: their relation names are attributed to the connected database's schema
+    map, and proposals — including full-table rewrites — are generated for tables the
+    session was never pointed at.
+    """
+    sql = _normalized(RedshiftWorkloadAdapter.SQL[CAP_WORKLOAD])
+    assert "sys_query_history" in sql
+    assert "database_name = current_database()" in sql
+
+
+def test_workload_statement_counts_only_successful_executions():
+    """`sys_query_history` records failed and cancelled executions alongside successful
+    ones, and unlike `pg_stat_statements` it is per-execution rather than pre-aggregated.
+    Without this filter, work that never completed lands in the `cost_share` denominator
+    and dilutes every proposal's share — and an aborted statement's elapsed time measures
+    how long it ran before dying, not the cost of the query it was trying to be.
+    """
+    sql = _normalized(RedshiftWorkloadAdapter.SQL[CAP_WORKLOAD])
+    assert "status = 'success'" in sql
+
+
+@pytest.mark.parametrize("capability", sorted(EXPECTED_CAPABILITIES))
+def test_a_denied_capability_records_its_privilege_hint_in_degraded(capability):
+    """The recorded degradation must carry the capability's privilege hint, not only the
+    driver's message.
+
+    These four hint strings are this adapter's stated mitigation for column names it cannot
+    verify against a cluster ("a wrong name costs one capability, recorded in `degraded`
+    naming the statement"), and they are what someone hands their DBA. Dropping the hint
+    from the message left 904 tests green, so the mitigation could be disconnected in
+    silence. The expected text is read back out of `introspection_sql()` rather than
+    duplicated here, so this cannot drift from the hint a `--dry-run` prints.
+    """
+    hints = {s.capability: s.privilege_hint for s in RedshiftWorkloadAdapter().introspection_sql()}
+    marker = RedshiftWorkloadAdapter.SQL[capability]
+    adapter = RedshiftWorkloadAdapter(querier=FakeQuerier({}, fail_markers=(marker,)))
+    adapter._run(capability, ())
+    assert len(adapter.degraded) == 1
+    recorded_capability, reason = adapter.degraded[0]
+    assert recorded_capability == capability
+    assert "permission denied" in reason, "the driver's own message must survive too"
+    assert hints[capability] in reason
+
+
+def test_the_acquired_redshift_limitations_are_documented_for_users():
+    """Three limitations this engine *acquires* must be documented where a user reads, not
+    only in a docstring or a privilege hint.
+
+    The first is the sharp one: `_HINTS[CAP_WORKLOAD]` describes the `SYSLOG ACCESS
+    UNRESTRICTED` partial-workload trap precisely, and names it as the dangerous class
+    *because* it produces no error — but that string only ever reaches a user through
+    `--dry-run` or a failure, and this failure never happens. A hint that can only be
+    delivered by an event that cannot occur is not disclosure. The other two are the
+    per-execution meaning of `--limit` and the fingerprint split, whose siblings ("`cost_share`
+    is not a partition", the PL/pgSQL double-count) are already in README `## Limitations`.
+    Each claim is asserted separately, so documenting one and omitting another cannot pass.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "SYSLOG ACCESS UNRESTRICTED" in readme
+    assert "only the connecting user's own queries" in readme
+    assert "counts executions on Redshift and query groups on Postgres" in readme
+    assert "Identifier case and attached comments can split one Redshift statement" in readme
 
 
 def test_there_is_no_ndv_or_index_capability():
@@ -495,58 +571,157 @@ def _select_list(sql: str) -> str:
     return match.group(1)
 
 
-def _select_list_arity(sql: str) -> int:
-    """Number of columns in a statement's SELECT list, ignoring a comma nested inside
-    parentheses (none of today's statements have one in the select list, but a naive comma
-    count would silently miscount one if it ever did)."""
+def _select_list_columns(sql: str) -> list[str]:
+    """The SELECT list's column names, in the order the *statement* lists them.
+
+    Double quotes are stripped: `svv_table_info`'s `"schema"` and `"table"` are reserved
+    words that must stay quoted in the SQL, but the name being pinned is the same either
+    way. A comma nested inside parentheses does not split a column — none of today's
+    select lists has one, but a naive `split(",")` would silently miscount if one ever
+    appeared.
+    """
     depth = 0
-    arity = 1
+    names = [""]
     for ch in _select_list(sql):
         if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
-        elif ch == "," and depth == 0:
-            arity += 1
-    return arity
+        if ch == "," and depth == 0:
+            names.append("")
+        else:
+            names[-1] += ch
+    return [name.strip().strip('"') for name in names]
 
 
-def _dummy_row(width: int) -> tuple:
-    """A row exactly as wide as the statement's own SELECT list, so unpacking it exercises
-    the real arity rather than a fixture written to match the unpacking — see the module
-    docstring's provenance warning."""
-    return tuple(range(width))
+#: One canned value per SELECT-list column *name*, per capability, deliberately
+#: distinguishable from every other value in the same row — including from the ones of the
+#: same SQL type, which is the whole point (see
+#: `test_select_list_columns_land_in_the_field_their_consumer_reads`). `tuple(range(width))`
+#: was positionally indistinguishable, so it pinned the column *count* and not their
+#: *positions*, and swapping two same-typed columns in the SQL text left the suite green.
+_CANNED_COLUMN_VALUES: dict[str, dict[str, object]] = {
+    CAP_WORKLOAD: {
+        "query_text": "select id from stand_in where status = 'x'",
+        "elapsed_time": 7_000,
+    },
+    CAP_SCHEMA: {
+        "schema_name": "sch",
+        "table_name": "tbl",
+        "column_name": "col",
+        "data_type": "integer",
+    },
+    CAP_TABLE_FACTS: {
+        "schema": "sch",
+        "table": "tbl",
+        "tbl_rows": 33,
+        "size": 44,
+        "unsorted": 11.0,
+        "stats_off": 22.0,
+        "diststyle": "KEY(dk_col)",
+        "sortkey1": "sk_col",
+        "skew_rows": 55.0,
+    },
+    CAP_ADVISOR: {
+        "database_name": "db",
+        "schema_name": "sch",
+        "table_name": "tbl",
+        "type": "sort key",
+        "current_ddl": "CURRENT: ALTER TABLE x;",
+        "recommended_ddl": "RECOMMENDED: ALTER TABLE y;",
+    },
+}
+
+_CANNED_RELATION = Relation(schema="sch", table="tbl")
+
+
+def _positional_row(capability: str) -> tuple[object, ...]:
+    """One row for `capability`, ordered by the *statement's own* SELECT list.
+
+    Values are keyed by column name and then placed in the order the SQL text puts those
+    names in, which is what makes a swap of two columns in the statement change what the
+    consumer receives: the value for `stats_off` moves to `unsorted`'s position, and the
+    assertions below then read `unsorted == 22.0` instead of `11.0`.
+    """
+    values = _CANNED_COLUMN_VALUES[capability]
+    columns = _select_list_columns(RedshiftWorkloadAdapter.SQL[capability])
+    assert sorted(columns) == sorted(values), (
+        f"{capability}'s SELECT list is {columns}, which no longer matches the columns this "
+        f"test pins ({sorted(values)}) — add the new column and assert where it lands, "
+        "rather than widening the fixture until it stops complaining"
+    )
+    return tuple(values[column] for column in columns)
+
+
+def _check_workload_columns(adapter: RedshiftWorkloadAdapter) -> None:
+    (row,) = adapter.fetch_workload(None, 10).rows
+    assert row.sql == "select id from stand_in where status = 'x'"
+    # elapsed_time is microseconds; total_time_ms is milliseconds.
+    assert row.total_time_ms == pytest.approx(7.0)
+
+
+def _check_schema_columns(adapter: RedshiftWorkloadAdapter) -> None:
+    assert adapter.fetch_schema(("sch",)) == {"sch": {"tbl": {"col": "integer"}}}
+
+
+def _check_table_facts_columns(adapter: RedshiftWorkloadAdapter) -> None:
+    facts = adapter.fetch_table_facts(("sch",), frozenset({_CANNED_RELATION}))
+    assert facts[_CANNED_RELATION].row_estimate == 33
+    assert facts[_CANNED_RELATION].size_bytes == 44 * 1024 * 1024
+    physical = adapter.physical_facts[_CANNED_RELATION]
+    # `unsorted` and `stats_off` are both 0-100 float percentages, so nothing but this
+    # assertion can tell them apart — and swapping them inverts ADV104's remediation
+    # (VACUUM where ANALYZE was needed) at the one confidence rung this adapter reaches
+    # HIGH on. Same for the `diststyle`/`sortkey1` pair, which are both text and gate
+    # ADV101's and ADV102's suppression.
+    assert physical.unsorted == 11.0
+    assert physical.stats_off == 22.0
+    assert physical.diststyle == "KEY(dk_col)"
+    assert physical.sortkey1 == "sk_col"
+    assert physical.skew_rows == 55.0
+
+
+def _check_advisor_columns(adapter: RedshiftWorkloadAdapter) -> None:
+    (row,) = adapter._advisor_rows(("sch",), frozenset({_CANNED_RELATION}))
+    assert row.relation == _CANNED_RELATION
+    assert row.rec_type == "sort key"
+    assert row.current_ddl == "CURRENT: ALTER TABLE x;"
+    assert row.recommended_ddl == "RECOMMENDED: ALTER TABLE y;"
 
 
 @pytest.mark.parametrize(
-    ("capability", "fetch"),
+    ("capability", "check"),
     [
-        (CAP_WORKLOAD, lambda a: a.fetch_workload(None, 10)),
-        (CAP_SCHEMA, lambda a: a.fetch_schema(("public",))),
-        (CAP_TABLE_FACTS, lambda a: a.fetch_table_facts(("public",), frozenset())),
+        (CAP_WORKLOAD, _check_workload_columns),
+        (CAP_SCHEMA, _check_schema_columns),
+        (CAP_TABLE_FACTS, _check_table_facts_columns),
+        (CAP_ADVISOR, _check_advisor_columns),
     ],
-    ids=["workload", "schema", "table_facts"],
+    ids=["workload", "schema", "table_facts", "advisor"],
 )
-def test_select_list_arity_matches_its_consumers_unpacking(capability, fetch):
-    """Batch 2 shipped a column-count mismatch between a statement's SELECT list and its
-    Python unpacking that no fixture caught, because the fixture was written to match the
-    unpacking rather than the statement. This derives the row width from the SQL text
-    itself and feeds it through the real consumer method, so a future edit to either side
-    that the other does not follow raises `ValueError` here — one parametrized case per
-    capability, so a mismatch in one does not hide behind the other two passing.
-    """
-    width = _select_list_arity(RedshiftWorkloadAdapter.SQL[capability])
-    querier = _canned({capability: [_dummy_row(width)]})
-    fetch(RedshiftWorkloadAdapter(querier=querier))  # must not raise ValueError
+def test_select_list_columns_land_in_the_field_their_consumer_reads(capability, check):
+    """Every statement's SELECT list is pinned by *position*, not merely by arity.
 
+    Batch 2 shipped a column-count mismatch between a statement's SELECT list and its
+    Python unpacking that no fixture caught, and the guard added for it derived only the row
+    *width* from the SQL text (`tuple(range(width))`) — so it pinned the count while leaving
+    every column's position unverified. Swapping two same-typed columns in the statement
+    left the whole suite green: `unsorted`/`stats_off` inverts ADV104's remediation for
+    every table on the cluster, `diststyle`/`sortkey1` inverts ADV101's and ADV102's
+    suppression gates, `table_name`/`column_name` mis-keys the schema map, and
+    `query_text`/`elapsed_time` mis-reads the whole workload.
 
-def test_advisor_select_list_arity_is_pinned_for_its_future_consumer():
-    """`CAP_ADVISOR` has no consumer yet — `propose()` is Task 5/6's job — so there is no
-    unpacking to compare against today. This pins the SELECT list's current arity so
-    whoever builds that consumer inherits a known, deliberate number instead of discovering
-    a drift between the statement and their own unpacking after the fact.
+    The fixture row is built by looking each canned value up *by column name* and then
+    placing it at the position the SQL text gives that name — so a swap in the SQL moves
+    the values with it and the assertions below read the wrong field. Arity is still pinned
+    too, and by name rather than by number: `_positional_row` requires the statement's
+    SELECT list to be exactly the set of columns this test knows where to expect.
+
+    One parametrized case per capability, including `CAP_ADVISOR` — whose consumer is
+    `_advisor_rows` — so a mismatch in one cannot hide behind the other three passing.
     """
-    assert _select_list_arity(RedshiftWorkloadAdapter.SQL[CAP_ADVISOR]) == 6
+    querier = _canned({capability: [_positional_row(capability)]})
+    check(RedshiftWorkloadAdapter(querier=querier))
 
 
 class _FakeCursor:

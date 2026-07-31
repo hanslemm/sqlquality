@@ -893,6 +893,36 @@ def test_collapse_discloses_the_withheld_distkey_in_the_survivors_rationale():
     assert "strictly subsumes any single-column DISTKEY choice" in rationale
 
 
+def test_collapse_folds_the_withheld_distkeys_own_caveats_into_the_survivor():
+    """The fold — `if fresh: addition += ...` — is the substance of the collapse, not a
+    flourish, and deleting it left the whole suite green because the existing disclosure
+    test asserts only the fixed `addition` string.
+
+    ADV102 is the *only* proposal that carries the `skew_rows` caveat and its own
+    DISTKEY-specific MEDIUM-cap explanation. Once it is withheld, the surviving ADV103 is
+    the sole remaining proposal for a full-table rewrite of this relation — so without the
+    fold the operator loses both the reason the withheld strategy was withheld and the one
+    measurement that speaks to how risky a distribution change on this table is.
+    """
+    usage = [_usage(R2, "id", ColumnRole.JOIN, cost_share=0.5)]
+    physical = {R2: _phys(diststyle="EVEN", skew_rows=3.75)}
+    (distkey,) = propose_distkey(usage, _facts(R2), physical, min_cost_share=0.1)
+    (diststyle_all,) = propose_diststyle_all(
+        usage, _facts(R2, row_estimate=1_000), physical, min_cost_share=0.1
+    )
+    # Control: these two sentences exist on ADV102 and on nothing else, so finding them on
+    # the survivor can only be the fold's doing.
+    assert "skew_rows is 3.75" in distkey.rationale
+    assert "skew_rows" not in diststyle_all.rationale
+    assert "good or catastrophic" not in diststyle_all.rationale
+
+    (survivor,) = _collapse_diststyle_all_over_distkey([distkey, diststyle_all])
+    assert survivor.code == "ADV103"
+    assert "skew_rows is 3.75" in survivor.rationale
+    assert "not the skew this DISTKEY would produce" in survivor.rationale
+    assert "good or catastrophic" in survivor.rationale
+
+
 def test_collapse_leaves_distkey_alone_when_diststyle_all_does_not_fire_for_it():
     """A relation with only ADV102 (e.g. it failed ADV103's row-count ceiling) must be
     untouched — this function only ever removes an ADV102 that has a matching ADV103 for
@@ -1104,6 +1134,83 @@ def test_propose_wires_diststyle_all_and_suppresses_distkey_for_the_same_relatio
     codes = [p.code for p in proposals]
     assert codes == ["ADV103"]
     assert "ADV102 also proposed a DISTKEY" in proposals[0].rationale
+
+
+def test_propose_collapses_before_disclosing_agreement():
+    """`propose()`'s documented pass order is load-bearing: reversing it fabricates an
+    Advisor agreement Advisor never made.
+
+    The fixture is the worst case for the reversal — a small, hot-join dimension, so ADV102
+    and ADV103 both fire for the same relation and the collapse withholds ADV102, plus one
+    Advisor row whose category is `distkey` (a distribution-key recommendation, not
+    `DISTSTYLE ALL`). Shipped order: the collapse runs first, ADV102 is gone, and the
+    agreement finds no ADV102 to attach to — ADV103's category is `diststyle_all`, which
+    Advisor did *not* recommend, so no agreement is claimed. Reversed: the agreement
+    sentence lands on ADV102, the collapse then folds ADV102's fresh sentences (including
+    that one) into the surviving ADV103, and ADV103 claims Advisor agrees with a `DISTSTYLE
+    ALL` change Advisor never recommended. Presenting Advisor's opinion as ours is the one
+    thing ADV105's whole design exists to prevent, and it is invisible to every other test
+    because both orders produce the same *set* of codes.
+    """
+    querier = _AdvisorQuerier(
+        rows=[
+            (
+                "db",
+                R2.schema,
+                R2.table,
+                "distribution key",
+                None,
+                f'ALTER TABLE "{R2.schema}"."{R2.table}" ALTER DISTKEY "id";',
+            )
+        ]
+    )
+    adapter = RedshiftWorkloadAdapter(querier=querier)
+    adapter.schemas = (R2.schema,)
+    adapter.physical_facts = {R2: _phys(diststyle="EVEN")}
+    usage = [_usage(R2, "id", ColumnRole.JOIN, cost_share=0.5)]
+    proposals = adapter.propose(
+        _bare_aggregation(usage, [R2]),
+        _facts(R2, row_estimate=1_000),
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    by_code = {p.code: p for p in proposals}
+    # The collapse ran: ADV102 is withheld, ADV103 survives, ADV105 relays Advisor's row.
+    assert set(by_code) == {"ADV103", "ADV105"}
+    assert "ADV102 also proposed a DISTKEY" in by_code["ADV103"].rationale
+    # And the surviving proposal claims no agreement, because there is none to claim.
+    assert "independently recommends the same kind of change" not in by_code["ADV103"].rationale
+
+
+def test_propose_fetches_advisor_rows_for_relations_reached_only_through_table_facts():
+    """ADV105's scope must not be narrower than ADV104's.
+
+    `cli.py` fetches table facts for `aggregation.tables | star_tables(...)`, so a relation
+    reached only by a `SELECT *` arrives in `facts`/`physical_facts` without ever appearing
+    in `aggregation.tables` — and ADV104 (which iterates `physical_facts`) will happily
+    propose VACUUM/ANALYZE for it. Scoping the Advisor query to `aggregation.tables` alone
+    meant that same relation could never get an ADV105 relay or an agreement disclosure, so
+    the cluster's own opinion about it was dropped on the floor. The two rules now see the
+    same set.
+    """
+    querier = _AdvisorQuerier(
+        rows=[("db", R2.schema, R2.table, "sort key", None, "ALTER TABLE x;")]
+    )
+    adapter = RedshiftWorkloadAdapter(querier=querier)
+    adapter.schemas = (R2.schema,)
+    adapter.physical_facts = {R2: _phys(unsorted=50.0)}
+    proposals = adapter.propose(
+        # R2 is deliberately absent from `aggregation.tables` — it is only in `facts`.
+        _bare_aggregation([], []),
+        _facts(R2),
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    codes = {p.code for p in proposals}
+    assert "ADV104" in codes, "control: ADV104 already reaches a star-only relation"
+    assert "ADV105" in codes
+    _sql, params = querier.calls[0]
+    assert params == ([R2.schema], [R2.table])
 
 
 def test_propose_discloses_the_physical_facts_gap_in_degraded():

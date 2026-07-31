@@ -338,7 +338,7 @@ missing driver degrades with an install hint instead of a traceback.
 | `--manifest` | — | Path to a dbt `manifest.json`. Overrides `--project-dir`. |
 | `--schema` | `public` | Schema to introspect. Repeat for several: `--schema public --schema sales`. See Limitations for the ambiguity caveat. |
 | `--since` | — | Window, e.g. `7d`. **Not honored on Postgres** — see Prerequisites below. |
-| `--limit` | `500` | Max query-history rows to read. |
+| `--limit` | `500` | Max query-history rows to read. **On Redshift this counts *executions*, not query groups** — see the Redshift section below. |
 | `--min-cost-share` | `0.01` | Suppress proposals below this share of workload cost. Applies to the **cost-weighted** rules (ADV001, ADV004, ADV005, ADV006, ADV007, ADV008, ADV301 — the last only with `--project-dir`/`--manifest`); the index-hygiene rules **ADV002 and ADV003**, and **ADV303** (its evidence is absence, not cost, so there is no share to threshold), carry no cost evidence and are reported whatever the threshold. ADV303 has its own non-threshold suppression: it emits nothing at all when no query usage could be extracted, since then every model would look untouched by definition. |
 | `--keep-literals` | off | Do **not** redact literal values from query text. |
 | `--timeout` | `30` | Statement timeout in seconds (rejected outside 1–3600). |
@@ -499,6 +499,30 @@ silently dropping them: that absence cannot, by itself, tell an external Spectru
 (which cannot carry a SORTKEY/DISTKEY/DISTSTYLE) apart from a genuinely empty local one,
 and proposing a rewrite for something that might not even support one is worse than
 proposing nothing.
+
+**The workload can come back silently partial — grant `SYSLOG ACCESS UNRESTRICTED` first.**
+`advise` reads `sys_query_history`, and without that privilege Redshift does not deny the
+read: it returns **only the connecting user's own queries**. There is no error, no denied
+capability and nothing in `degraded` — a cluster whose whole workload is invisible to your
+read-only role looks exactly like a quiet cluster with little traffic, and every proposal is
+then built from one user's slice of it. Grant it before your first run:
+
+```sql
+ALTER USER <your_readonly_user> SYSLOG ACCESS UNRESTRICTED;  -- superuser-only
+```
+
+`--dry-run` prints this same warning beside the statement it applies to, and the hint is
+also recorded in `degraded` **if** the read is refused outright — but the failure described
+here is precisely the one that is never refused, so the hint alone is not disclosure. This
+is the same class of trap as Postgres's `pg_stats`, and unlike a missing grant it costs you
+coverage rather than a capability.
+
+**`--limit` means executions on Redshift, not query groups.** `sys_query_history` is one
+row per *execution*, where Postgres's `pg_stat_statements` is already aggregated per
+normalised statement — so `--limit 500` reads the 500 most expensive **executions**, and 500
+executions of one bad query is a legal outcome that leaves every other statement unseen.
+The `window:` line names what was actually read ("the 500 most expensive successful queries
+…"); raise `--limit` if the coverage line shows fewer query groups than you expect.
 
 **dbt interaction.** [ADV302](#dbt-enrichment-optional) rewrites `CREATE INDEX`
 proposals into dbt `indexes:` config, which has no Redshift equivalent (SORTKEY/DISTKEY
@@ -1122,6 +1146,28 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   nothing else this adapter reads can tell the two apart — so a relation missing from it
   gets no ADV101/102/103 proposal at all rather than a guess either way, and the run
   discloses how many relations this affected.
+- **Redshift's workload is silently partial without `SYSLOG ACCESS UNRESTRICTED`.**
+  `sys_query_history` returns only the connecting user's own queries to a role lacking that
+  privilege, and it does so with **no error at all** — so a cluster whose traffic your
+  read-only role cannot see is indistinguishable from a quiet one, and every `cost_share` is
+  computed over one user's slice. This is the one Redshift failure mode with no signal
+  anywhere in the run; see the [Redshift section](#redshift---engine-redshift) for the grant.
+- **`--limit` counts executions on Redshift and query groups on Postgres.**
+  `sys_query_history` is per-execution; `pg_stat_statements` is pre-aggregated per normalised
+  statement. So on Redshift `--limit 500` means "the 500 most expensive executions", and 500
+  executions of a single bad query is a legal outcome that hides every other statement. The
+  `window:` line always says which was read.
+- **Identifier case and attached comments can split one Redshift statement into several
+  query groups.** `sys_query_history` stores the *verbatim* text the client sent, unlike
+  `pg_stat_statements`, which Postgres has already parsed and re-serialised (identifiers
+  folded to lowercase) before storing. So two executions of what is semantically one
+  statement still fingerprint separately when they differ only in identifier case or in an
+  attached comment — an ORM query tag, for instance. That inflates the number of query groups
+  the window's total cost is spread over, which shrinks every `cost_share` and makes
+  `--min-cost-share` correspondingly stricter, in the same way the `cost_share` and PL/pgSQL
+  caveats above do. Not "fixed" by case-folding before fingerprinting: nothing there can tell
+  an unquoted (case-insensitive) identifier from a deliberately quoted, case-sensitive one, so
+  a general fold risks collapsing a real distinction instead of a spurious one.
 - **dbt enrichment trusts the manifest as of its last `dbt compile`.** ADV302 rewrites DDL
   based on a model's materialization as the manifest records it; a materialization changed
   without a fresh `dbt compile` produces a stale — but traceable, since the disclosed
