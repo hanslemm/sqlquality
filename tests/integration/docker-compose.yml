@@ -13,7 +13,20 @@ services:
       - -c
       - pg_stat_statements.track=all
     ports:
-      - "55432:5432"
+      # 27432, not 55432, and not any other digit-shuffle of 5432. 55432 collided with an
+      # unrelated `postgres:16` container on a development machine for the whole of this
+      # feature's work, and when that happens `docker compose up` does not bind: it reports
+      # success, the port stays owned by the other container, and the suite talks to whatever
+      # is already listening. That surfaced as a password-authentication failure that read as a
+      # code bug and cost four people time. 27432 is unregistered, is outside the ephemeral
+      # port range on both Linux (32768+) and macOS (49152+) so no outbound socket can take it
+      # first, and is not one of the ports Postgres tooling gravitates to (5432, 5433, 54320,
+      # 54321, 55432, 15432).
+      #
+      # A port can still collide, so `live_dsn` verifies it reached *this* server rather than
+      # trusting the connection — see tests/integration/conftest.py. Do not change this number
+      # without changing DEFAULT_PORT there; set SQLQUALITY_TEST_DSN to point elsewhere instead.
+      - "27432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d sqlquality_test"]
       interval: 2s
