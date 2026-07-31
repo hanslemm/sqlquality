@@ -914,9 +914,11 @@ def _first_co_occurring(
 def propose_partial_indexes(
     usage: Sequence[ColumnUsage],
     facts: Mapping[Relation, TableFacts],
+    existing: Mapping[Relation, Sequence[PgIndex]],
     *,
     min_cost_share: float,
     min_rows: int = MIN_ROWS_FOR_INDEX,
+    have_index_data: bool = True,
 ) -> list[Proposal]:
     """ADV004 — index the hot equality column, restricted by a hot null-check predicate.
 
@@ -926,6 +928,37 @@ def propose_partial_indexes(
     Gated on table size exactly as ADV001 is: both rules create an index, and below the
     floor a sequential scan is the right plan whichever rule proposed it. An unknown row
     count caps confidence at LOW rather than being assumed large.
+
+    **This rule was the only index-creating rule that never consulted the existing-index list
+    at all**, so it could propose an index an existing one already serves and its rationale
+    said nothing about the gap — a check that silently did not run, which is the one thing
+    this rule set is built to refuse. It now runs `_covered` like ADV001, ADV007 and ADV008,
+    with two differences that follow from the proposal itself being *partial*:
+
+    * **A plain index leading with the guarded column suppresses this proposal.** A partial
+      index's only advantage over such an index is size — the access path is already there,
+      since `WHERE leading = $1 AND guard IS NULL` can be served by a plain index on
+      `(leading)` with the null check applied as a filter. Size is exactly what this tool
+      cannot measure: nothing here knows what fraction of the table satisfies the guard, so
+      "smaller" is an assertion, not evidence, and it would be traded against a second
+      index's write cost on every insert and update. Worse, nothing downstream would catch
+      the pair: ADV003's redundant-prefix check is restricted to plain indexes, so a partial
+      index shadowed by a plain one is never flagged on a later run. Suppressing is therefore
+      the honest call, not merely the conservative one.
+    * **A *partial* index that leads with the same column is disclosed, not treated as
+      coverage.** `_covered` skips partial and expression indexes deliberately (see its
+      docstring), and for this rule that exclusion cuts the other way than it does for
+      ADV001: an existing partial index on the same column may be *precisely* this proposal
+      already applied. Nothing here compares predicates — the existing index's `WHERE` clause
+      is not parsed, and this proposal's guard is reconstructed from redacted usage — so
+      whether it is the same index is genuinely unknown and is stated as unknown, naming the
+      index so an operator can settle it in one glance.
+
+    `have_index_data` is False when the existing-index catalog query was denied, and is
+    handled exactly as the other three rules handle it: the cost evidence is real so the
+    proposal survives, but confidence is capped at LOW and the rationale says which check
+    could not run. `existing` being empty cannot distinguish "no such index" from "could not
+    look", which is why the flag is separate from the mapping.
     """
     proposals: list[Proposal] = []
     for relation, items in sorted(_by_relation(usage).items()):
@@ -957,13 +990,50 @@ def propose_partial_indexes(
         cost_share = max(leading.cost_share, guard.cost_share)
         if cost_share < min_cost_share:
             continue
+        table_indexes = existing.get(relation, ())
+        # A plain index leading with this column already provides the access path; only the
+        # size differs, and this rule cannot measure that. See the docstring.
+        if _covered((leading.column,), table_indexes) is not None:
+            continue
+        # Not coverage, and not the same gap ADV001 discloses: an existing *partial* index
+        # leading with this column may be this very proposal, already applied. Predicates are
+        # not compared, so that is unknown rather than either answer.
+        partial_indexes = tuple(
+            index.name
+            for index in table_indexes
+            if index.is_partial and _is_prefix((leading.column,), index.columns)
+        )
+        # Same whole-identifier matching as ADV001/ADV007/ADV008, for the same reason: a
+        # substring test reports an index on `lower(guid)` as "mentions id".
+        expression_indexes = tuple(
+            index.name
+            for index in table_indexes
+            if index.has_expressions and mentions_identifier(leading.column, index.definition or "")
+        )
         predicate = _NULL_ROLE_PREDICATE[guard.role]
         rationale = (
             "The hot predicates always pair this lookup with the same null check, "
             "so a partial index covers them at a fraction of the size."
         )
+        if not have_index_data:
+            rationale += (
+                " The existing-index list could not be read, so whether an index already "
+                "serves this lookup is unknown — check before applying."
+            )
         if rows is None:
             rationale += _UNKNOWN_ROWS_NOTE
+        if partial_indexes:
+            rationale += (
+                f" A partial index ({', '.join(partial_indexes)}) already leads with this "
+                "column; sqlquality does not compare its WHERE predicate to this proposal's, "
+                "so it cannot tell whether this index already exists — check before applying."
+            )
+        if expression_indexes:
+            rationale += (
+                f" An expression index ({', '.join(expression_indexes)}) mentions "
+                f"{leading.column}; sqlquality cannot tell whether it already serves this "
+                "lookup, so confirm before applying."
+            )
         proposals.append(
             Proposal(
                 code="ADV004",
@@ -984,8 +1054,18 @@ def propose_partial_indexes(
                     #: How many query groups filter on both columns together. This is what
                     #: makes the proposal supported rather than a guess.
                     "co_occurring_fingerprints": len(shared),
+                    #: Named `partial_indexes_not_compared`, not ADV001's
+                    #: `partial_indexes_skipped`: there the partial index is known not to
+                    #: cover an unfiltered lookup, here it may be this exact proposal already
+                    #: applied and the difference is that nobody compared the predicates. A
+                    #: shared key name would have made two different facts indistinguishable
+                    #: in `--json`, which renders evidence as bare `k=v` pairs.
+                    "partial_indexes_not_compared": partial_indexes,
+                    "expression_indexes": expression_indexes,
                 },
-                confidence=Confidence.LOW if rows is None else Confidence.MEDIUM,
+                confidence=(
+                    Confidence.LOW if rows is None or not have_index_data else Confidence.MEDIUM
+                ),
                 ddl=(
                     f"CREATE INDEX ON {_qualified(relation.schema, relation.table)} "
                     f"({_quote_ident(leading.column)}) "
@@ -1930,7 +2010,13 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                 min_cost_share=min_cost_share,
                 have_index_data=have_index_data,
             ),
-            *propose_partial_indexes(aggregation.usage, facts, min_cost_share=min_cost_share),
+            *propose_partial_indexes(
+                aggregation.usage,
+                facts,
+                existing,
+                min_cost_share=min_cost_share,
+                have_index_data=have_index_data,
+            ),
             *propose_sargability(aggregation.usage, workload, min_cost_share=min_cost_share),
             *propose_select_star(
                 workload, facts, min_cost_share=min_cost_share, dialect=self.engine

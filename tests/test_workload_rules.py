@@ -888,6 +888,7 @@ def test_partial_index_proposed_for_a_hot_not_null_check():
             _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(),
+        {},
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -901,6 +902,7 @@ def test_partial_index_polarity_follows_the_predicate():
             _usage(_ORDERS, "shipped_at", ColumnRole.NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(),
+        {},
         min_cost_share=0.01,
     )
     assert "IS NULL" in proposals[0].ddl
@@ -927,6 +929,7 @@ def test_no_partial_index_when_the_columns_never_co_occur():
             ),
         ],
         _facts_map(),
+        {},
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -946,6 +949,7 @@ def test_partial_index_reports_the_co_occurrence_that_justifies_it():
             ),
         ],
         _facts_map(),
+        {},
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -968,6 +972,7 @@ def test_partial_index_picks_the_costliest_pair_that_actually_co_occurs():
             ),
         ],
         _facts_map(columns=("status", "region", "shipped_at")),
+        {},
         min_cost_share=0.01,
     )
     assert proposals[0].evidence["columns"] == ("region",)
@@ -986,6 +991,7 @@ def test_partial_index_is_suppressed_on_a_small_table():
             _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(rows=50),
+        {},
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -999,6 +1005,7 @@ def test_partial_index_with_an_unknown_row_count_is_low_and_says_why():
             _usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(rows=None),
+        {},
         min_cost_share=0.01,
     )
     assert codes(proposals) == ["ADV004"]
@@ -1007,10 +1014,128 @@ def test_partial_index_with_an_unknown_row_count_is_low_and_says_why():
     assert "unknown" in proposals[0].rationale.lower()
 
 
+def _partial_usage(relation=None):
+    """The minimal co-occurring pair ADV004 needs: a hot equality column and a hot null check
+    on the same query group."""
+    relation = relation or _ORDERS
+    return [
+        _usage(relation, "status", ColumnRole.EQUALITY, cost_ms=90.0),
+        _usage(relation, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
+    ]
+
+
+def test_partial_index_is_suppressed_when_a_plain_index_already_leads_with_the_column():
+    """ADV004 was the only index-creating rule that never called `_covered` at all.
+
+    A plain index on `(status, created_at)` already provides the access path this proposal
+    asks for — `WHERE status = $1 AND shipped_at IS NOT NULL` reads it and applies the null
+    check as a filter — so the partial index buys size alone, and nothing here can measure
+    that against a second index's write cost. Nothing downstream catches the pair either:
+    ADV003's redundant-prefix check is restricted to plain indexes, so a partial index
+    shadowed by a plain one is never flagged on any later run.
+    """
+    existing = {_ORDERS: (PgIndex("idx_plain", ("status", "created_at"), False, False, 5, 1),)}
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), existing, min_cost_share=0.01
+    )
+    assert proposals == []
+
+
+def test_partial_index_still_fires_when_no_existing_index_leads_with_the_column():
+    """Control for the suppression above: it must key on the *leading* column, exactly as
+    `_covered` does for every other index-creating rule. An index on `(created_at, status)`
+    cannot be probed by `status` alone, so it is not coverage and the proposal stands."""
+    existing = {
+        _ORDERS: (PgIndex("idx_wrong_order", ("created_at", "status"), False, False, 5, 1),)
+    }
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV004"]
+
+
+def test_partial_index_names_an_existing_partial_index_rather_than_comparing_predicates():
+    """`_covered` skips partial indexes deliberately, and for *this* rule that cuts the other
+    way than it does for ADV001: an existing partial index leading with the same column may be
+    precisely this proposal, already applied. Nothing here parses its WHERE clause, and this
+    proposal's guard is reconstructed from redacted usage, so the honest report is "unknown,
+    here is its name" — not silence, and not a suppression the evidence cannot support.
+    """
+    existing = {
+        _ORDERS: (
+            PgIndex("idx_open", ("status",), False, False, 5, 1, is_partial=True, predicate="..."),
+        )
+    }
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV004"], "a partial index is not treated as coverage"
+    assert "idx_open" in proposals[0].rationale
+    assert "does not compare its WHERE predicate" in proposals[0].rationale
+    assert proposals[0].evidence["partial_indexes_not_compared"] == ("idx_open",)
+    assert "partial_indexes_skipped" not in proposals[0].evidence, (
+        "a different fact from ADV001's: there the index is known not to cover an unfiltered "
+        "lookup, here nobody compared the predicates"
+    )
+
+
+def test_partial_index_names_an_expression_index_mentioning_the_same_column():
+    """Same gap ADV001, ADV007 and ADV008 already disclose: an expression index's `columns`
+    tuple understates it, so `_covered` cannot match against it and silence would leave the
+    operator to discover the overlap themselves."""
+    existing = {
+        _ORDERS: (
+            PgIndex(
+                "idx_lower_status",
+                (),
+                False,
+                False,
+                5,
+                1,
+                has_expressions=True,
+                definition="CREATE INDEX idx_lower_status ON orders (lower(status))",
+            ),
+        )
+    }
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), existing, min_cost_share=0.01
+    )
+    assert codes(proposals) == ["ADV004"]
+    assert "idx_lower_status" in proposals[0].rationale
+    assert proposals[0].evidence["expression_indexes"] == ("idx_lower_status",)
+
+
+def test_partial_index_discloses_that_the_existing_index_list_could_not_be_read():
+    """The confidence discipline the whole rule set turns on: a check that could not run is
+    disclosed and caps confidence, rather than being silently skipped. ADV001, ADV007 and
+    ADV008 all did this; ADV004 did not even have the flag."""
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), {}, min_cost_share=0.01, have_index_data=False
+    )
+    assert codes(proposals) == ["ADV004"], "the cost evidence is real, so the advice survives"
+    assert proposals[0].confidence is Confidence.LOW
+    assert "existing-index list could not be read" in proposals[0].rationale
+
+
+def test_partial_index_is_medium_and_silent_about_coverage_when_the_check_did_run():
+    """Control for the two disclosures above: neither sentence may appear on the ordinary run
+    where the list was read and nothing covered the candidate — a rule that always says a
+    check was skipped tells the operator nothing."""
+    proposals = propose_partial_indexes(
+        _partial_usage(), _facts_map(), {}, min_cost_share=0.01, have_index_data=True
+    )
+    assert proposals[0].confidence is Confidence.MEDIUM
+    assert "could not be read" not in proposals[0].rationale
+    assert "does not compare" not in proposals[0].rationale
+    assert proposals[0].evidence["partial_indexes_not_compared"] == ()
+    assert proposals[0].evidence["expression_indexes"] == ()
+
+
 def test_no_partial_index_without_an_equality_column_to_index():
     proposals = propose_partial_indexes(
         [_usage(_ORDERS, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4)],
         _facts_map(),
+        {},
         min_cost_share=0.01,
     )
     assert proposals == []
@@ -1990,6 +2115,7 @@ def test_partial_index_ddl_is_schema_qualified():
             _usage(relation, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(relation),
+        {},
         min_cost_share=0.01,
     )
     assert proposals[0].ddl.startswith('CREATE INDEX ON "analytics"."orders" ("status")')
@@ -2057,6 +2183,7 @@ def test_adv004_evidence_reports_the_bare_table_name_and_its_own_schema():
             _usage(relation, "shipped_at", ColumnRole.NOT_NULL_CHECK, cost_share=0.4, cost_ms=40.0),
         ],
         _facts_map(relation),
+        {},
         min_cost_share=0.01,
     )
     assert proposals[0].evidence["schema"] == "staging"
