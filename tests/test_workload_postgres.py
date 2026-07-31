@@ -229,6 +229,29 @@ def _canned(rows_by_capability):
     )
 
 
+@pytest.mark.parametrize("capability", sorted(EXPECTED_CAPABILITIES))
+def test_a_denied_capability_records_its_privilege_hint_in_degraded(capability):
+    """The recorded degradation must carry the capability's privilege hint, not only the
+    driver's message.
+
+    These hints are what someone hands their DBA — the `pg_stat_statements` and
+    `pg_read_all_stats` prerequisites are useless if the one place a denial is reported
+    omits them. Dropping the hint from the message left the whole suite green on both
+    adapters, so the mitigation could be disconnected in silence. The expected text is read
+    back out of `introspection_sql()` rather than duplicated here, so this cannot drift
+    from the hint a `--dry-run` prints.
+    """
+    hints = {s.capability: s.privilege_hint for s in PostgresWorkloadAdapter().introspection_sql()}
+    marker = PostgresWorkloadAdapter.SQL[capability]
+    adapter = PostgresWorkloadAdapter(querier=FakeQuerier({}, fail_markers=(marker,)))
+    adapter._run(capability, ())
+    assert len(adapter.degraded) == 1
+    recorded_capability, reason = adapter.degraded[0]
+    assert recorded_capability == capability
+    assert "permission denied" in reason, "the driver's own message must survive too"
+    assert hints[capability] in reason
+
+
 def test_fetch_workload_maps_rows_and_reports_the_window():
     querier = FakeQuerier(
         {
@@ -785,6 +808,12 @@ def test_profile_tls_settings_are_forwarded_to_the_driver(monkeypatch):
         dsn=None,
         fields={
             "host": "db",
+            # `database` is dbt's spelling and must be translated to libpq's `dbname`.
+            # Passing it here rather than `dbname` covers the aliasing half of the map: with
+            # neither key present, scrambling `dbname`/`database` in the shared
+            # `LIBPQ_FIELD_MAP` left every Postgres test green and only Redshift's noticed,
+            # which put single-adapter coverage on a credential-path table both engines share.
+            "database": "mydb",
             "user": "hans",
             "password": "hunter2",
             "sslmode": "verify-full",
@@ -797,6 +826,8 @@ def test_profile_tls_settings_are_forwarded_to_the_driver(monkeypatch):
     )
     PostgresWorkloadAdapter().connect(params, 30)
     conninfo = seen["conninfo"]
+    assert "dbname=mydb" in conninfo
+    assert "database=" not in conninfo, "dbt's `database` must be translated, not forwarded"
     assert "sslmode=verify-full" in conninfo
     assert "sslrootcert=/etc/ssl/ca.crt" in conninfo
     assert "sslcert=/etc/ssl/client.crt" in conninfo
