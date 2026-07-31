@@ -88,6 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- dbt enrichment now discloses itself in the terminal on **every** engine. The stderr
+  disclosure line counted only ADV302's config-block rewrite, which no Redshift proposal can
+  reach (nothing Redshift emits is a `CREATE INDEX`), so a `--project-dir` run on Redshift
+  warned in `rationale` and in the `--ddl` note that `dbt run` may undo an hours-long
+  full-table rewrite while the terminal row stayed byte-identical to a dbt-free run. Any
+  proposal whose DDL cannot be expressed as dbt config is now counted and reported too.
 - `IS NOT NULL` predicates were classified as `IS NULL` when sqlglot 30.13 or newer was
   installed, because that release moved the negation from a wrapping `Not` node onto a
   `negate` flag on the `Is` node itself. Both encodings are now read. This was not cosmetic:

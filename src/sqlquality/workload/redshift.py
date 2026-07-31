@@ -1460,7 +1460,22 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         already folded into ADV103 by the time `_disclose_advisor_agreement` looks for a
         `(relation, category)` match — an ADV102 dropped by the collapse must not also be
         the one Advisor agreement gets attached to, since it no longer exists in the
-        returned list at all.
+        returned list at all. **That order is load-bearing and pinned** by
+        `test_propose_collapses_before_disclosing_agreement`: reversed, the agreement
+        sentence lands on the ADV102 the collapse is about to withhold, the collapse then
+        folds it into the surviving ADV103, and ADV103 ends up claiming Advisor agrees with
+        a `DISTSTYLE ALL` recommendation Advisor never made — presenting Advisor's opinion
+        as ours, which is the one outcome ADV105's whole design exists to prevent.
+
+        Advisor rows are fetched for `aggregation.tables` *and* every relation `facts`
+        covers, deliberately. `cli.py` fetches facts for `aggregation.tables |
+        star_tables(...)`, so a relation reached only by a `SELECT *` has table facts —
+        and therefore can earn an ADV104 proposal — while never appearing in
+        `aggregation.tables`. Scoping ADV105 to `aggregation.tables` alone made it
+        narrower than ADV104 on exactly those relations: no Advisor relay and no agreement
+        disclosure for a table this run is otherwise happy to propose maintenance on. The
+        union keeps the two rules' reach consistent, and `_advisor_rows` still drops any
+        row whose relation was not asked for.
         """
         physical = self.physical_facts
         skipped = _skipped_for_physical_gap(aggregation.usage, physical)
@@ -1484,7 +1499,7 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             *propose_maintenance(physical, facts),
         ]
         proposals = _collapse_diststyle_all_over_distkey(proposals)
-        advisor_rows = self._advisor_rows(self.schemas, aggregation.tables)
+        advisor_rows = self._advisor_rows(self.schemas, aggregation.tables | frozenset(facts))
         proposals = proposals + propose_advisor(advisor_rows)
         proposals = _disclose_advisor_agreement(proposals, advisor_rows)
         return sorted(proposals, key=self.ranking_key)
