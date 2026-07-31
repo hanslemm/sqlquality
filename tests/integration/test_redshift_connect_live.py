@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 
 from sqlquality.models import ConnectionParams
+from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.redshift import RedshiftWorkloadAdapter
 
 
@@ -62,6 +63,29 @@ def test_a_wrong_password_leaks_nothing(live_dsn):
         adapter.connect(params, timeout_s=5)
     assert "wr0ng-p4ss" not in str(exc.value)
     assert "wr0ng-p4ss" not in repr(exc.value)
+
+
+@pytest.mark.integration
+def test_the_clamped_timeout_actually_reaches_the_server(live_dsn):
+    """The unit test (`test_an_out_of_range_timeout_is_clamped_before_it_reaches_the_
+    session` in `tests/test_workload_redshift.py`) only proves the clamped value is *sent*
+    to a fake driver's `execute()`. This proves the server actually *applies* it: an
+    out-of-range `timeout_s` must still leave `statement_timeout` set to the clamped
+    `MAX_TIMEOUT_S`, not to whatever out-of-range value was requested, on a connection that
+    genuinely round-trips through Postgres's wire protocol.
+    """
+    adapter = RedshiftWorkloadAdapter()
+    params = ConnectionParams(engine="redshift", dsn=live_dsn, fields={}, source="test")
+    adapter.connect(params, timeout_s=99_999)
+    assert adapter._query is not None
+    # Postgres reformats a round-number-of-seconds duration into the largest whole unit
+    # that expresses it exactly — 3600s displays as "1h", not "3600s" — so this asserts on
+    # the semantic value via `pg_catalog`'s own extraction rather than the display string
+    # `SHOW` returns.
+    rows = adapter._query(
+        "SELECT extract(epoch FROM current_setting('statement_timeout')::interval)", ()
+    )
+    assert rows == [(float(MAX_TIMEOUT_S),)]
 
 
 @pytest.mark.integration

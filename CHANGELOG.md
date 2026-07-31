@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sqlquality advise --engine redshift` — reads Redshift query history
+  (`sys_query_history`) and catalog metadata (`svv_columns`, `svv_table_info`,
+  `svv_alter_table_recommendations`) over a read-only connection and proposes SORTKEY
+  (ADV101), DISTKEY (ADV102) and DISTSTYLE ALL (ADV103) changes, VACUUM/ANALYZE
+  maintenance (ADV104), and relays Amazon Redshift Advisor's own recommendations verbatim
+  (ADV105), attributed as Advisor's rather than sqlquality's. Redshift has no indexes, so
+  none of ADV001–ADV008 apply; ADV101/102/103 each rewrite the entire table (no
+  `CONCURRENTLY` escape exists on Redshift), which the generated `--ddl` script's header
+  says loudly, and which caps those three rules at MEDIUM confidence — Redshift exposes no
+  per-column NDV to judge predicate selectivity or distribution skew. ADV104 is the
+  exception: its evidence is a direct catalog measurement and its remediation does not
+  rewrite anything, so it is the only Redshift rule that reaches HIGH. A dbt-managed
+  Redshift model's table-rewrite proposal is disclosed (not silently applied) via the same
+  dbt-enrichment path Postgres's index proposals use. **Redshift's introspection SQL has
+  not been executed against a live cluster** — see the README's `advise` section for what
+  is and is not verified, and run `--dry-run` before pointing this at production.
 - `sqlquality advise` — reads Postgres query history (`pg_stat_statements`) and catalog
   metadata over a read-only connection and proposes indexes, index removals, partial
   indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV008), with a `--json`
