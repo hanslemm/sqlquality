@@ -536,6 +536,17 @@ def _prepend_note(existing: str | None, dbt_note: str) -> str:
     warning is a caveat *on* it, and `dbt_note` is emitted exactly once — a note already
     carrying this warning is returned unchanged rather than accumulating a second copy, so a
     second enrichment pass over an already-enriched proposal cannot double it.
+
+    **Known and deliberately not fixed: only 2 of `_classify`'s 5 `note=` sites go through
+    this.** The `DROP INDEX` branch and the generic non-index branch do; the three remaining
+    ones — unrecognised materialization, and the two "cannot be expressed as config" bail-outs
+    — build their `note` from `_dbt_ddl_note(...)` directly and would discard an existing note
+    if one ever reached them. Today none can: every proposal that takes those three paths is a
+    `CREATE INDEX` from ADV001/004/007/008, and no Postgres rule sets `note` before enrichment
+    runs. The reachable case is a rule that both sets its own `note` *and* emits index-creating
+    DDL — Redshift's ADV105 sets a note, but Redshift emits no `CREATE INDEX`, so it lands in
+    the generic branch, which is already covered. Route the other three through this function
+    when such a rule appears; changing them now would add three untestable paths.
     """
     if not existing:
         return dbt_note
@@ -717,7 +728,14 @@ def _classify(proposal: Proposal, model: ModelNode) -> tuple[Proposal | None, _I
         # this stays covered when one does. It is no longer hypothetical: Redshift's
         # ADV101-103 (ALTER SORTKEY/DISTKEY/DISTSTYLE, table rewrites), ADV104
         # (VACUUM/ANALYZE) and ADV105 (Advisor's own DDL, relayed verbatim) all land here,
-        # since none of them is a CREATE/DROP INDEX. See
+        # since none of them is a CREATE/DROP INDEX.
+        #
+        # Known gap, deliberately not closed: this branch is exercised only from the Redshift
+        # side. It is engine-agnostic by construction — it keys on the DDL prefix, not on the
+        # adapter — but every test that reaches it today arrives with a Redshift-shaped
+        # proposal, so a Postgres rule emitting non-index DDL (an ALTER TABLE, a CLUSTER, a
+        # REINDEX) would land here with no test of its own. Writing one now would mean
+        # inventing a proposal shape no rule produces; add it with that rule. See
         # `test_dbt_warning_is_attached_to_a_redshift_rewrite_proposal` in
         # `tests/test_workload_redshift_rules.py` — this generic path was previously
         # unexercised by any test.
