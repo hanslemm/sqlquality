@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from sqlquality.models import (
     Aggregation,
     ColumnRole,
@@ -15,6 +17,7 @@ from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SEL
 from sqlquality.workload.postgres import (
     PgIndex,
     PostgresWorkloadAdapter,
+    _has_line_break,
     _is_fully_commented,
     _quote_ident,
     propose_grouping_indexes,
@@ -2888,6 +2891,59 @@ def test_a_carriage_return_in_an_identifier_is_not_rendered_as_a_statement():
     )
     assert "NOT RENDERED" in script
     assert _uncommented(script) == [], script
+
+
+#: Every codepoint `str.splitlines()` treats as a line boundary *other than* `\n` and `\r` —
+#: the only two the guard used to test for. Postgres permits all of them inside a quoted
+#: identifier, so each one is a real way for an introspected name to occupy two physical lines
+#: in the generated script. Parametrized one per codepoint, deliberately not asserted as a
+#: block: a guard that handled six of the eight would still pass a single test built from a
+#: string containing all of them, since one unhandled codepoint is enough to trip it.
+EXTRA_LINE_BREAKS = [
+    ("\v", "VT-000B"),
+    ("\f", "FF-000C"),
+    ("\x1c", "FS-001C"),
+    ("\x1d", "GS-001D"),
+    ("\x1e", "RS-001E"),
+    ("\x85", "NEL-0085"),
+    ("\u2028", "LS-2028"),
+    ("\u2029", "PS-2029"),
+]
+_BREAK_IDS = [name for _char, name in EXTRA_LINE_BREAKS]
+
+
+@pytest.mark.parametrize(("char", "name"), EXTRA_LINE_BREAKS, ids=_BREAK_IDS)
+def test_every_splitlines_line_break_in_an_identifier_reaches_the_not_rendered_fallback(char, name):
+    """The guard tested `"\\n" in ddl or "\\r" in ddl`, but every place that actually splits
+    the text uses `splitlines()`, which breaks on eight further codepoints. An identifier
+    carrying one of them therefore produced a second physical line in the file that the guard
+    never examined: the fallback was skipped and the tail of the statement was emitted as a
+    bare, statement-shaped line, in the one file whose stated purpose is that nothing
+    unintended is executable.
+    """
+    ddl = f'CREATE INDEX ON "main"."or{char}ders" ("status");'
+    # The premise, asserted rather than assumed. If this codepoint were not in fact a
+    # `splitlines()` boundary, everything below would pass while proving nothing at all — the
+    # exact way a guard test can look green and discriminate nothing.
+    assert len(ddl.splitlines()) == 2, f"{name} is not a splitlines boundary"
+    script = PostgresWorkloadAdapter().render_ddl([_ddl_proposal(ddl=ddl)])
+    assert "NOT RENDERED" in script, name
+    assert _uncommented(script) == [], script
+
+
+def test_has_line_break_agrees_with_splitlines_on_every_boundary():
+    """The guard is derived from `splitlines()` rather than from a restated character list,
+    which is what keeps it in lockstep with `_comment_lines`, `_is_fully_commented` and the
+    tests. Pinned directly as well as through the renderer, since this is the predicate the
+    whole "nothing unintended is executable" promise now rests on.
+    """
+    for char, name in [("\n", "LF-000A"), ("\r", "CR-000D"), *EXTRA_LINE_BREAKS]:
+        assert _has_line_break(f"a{char}b") is True, name
+        assert _has_line_break(f"trailing{char}") is True, name
+    assert _has_line_break('CREATE INDEX ON "main"."orders" ("status");') is False
+    assert _has_line_break("a\tb  c") is False, "a tab or a space is not a line boundary"
+    # No lines at all is not a line break, and `splitlines() != [text]` alone would say it is.
+    assert _has_line_break("") is False
 
 
 def test_is_fully_commented_requires_every_line_to_be_a_comment():
