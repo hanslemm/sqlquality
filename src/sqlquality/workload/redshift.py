@@ -77,7 +77,7 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
-from sqlquality.workload.postgres import _by_relation
+from sqlquality.workload.postgres import _by_relation, _sentences
 from sqlquality.workload.secrets import secrets_for
 from sqlquality.workload.session import (
     LIBPQ_FIELD_MAP,
@@ -99,6 +99,17 @@ CAP_ADVISOR = "advisor"
 #: read-only intent happens once at connect time rather than per fetch. Named distinctly
 #: from every real `CAP_*` so a report reader cannot mistake it for a denied SELECT.
 DEGRADATION_READ_ONLY = "read_only"
+
+#: Pseudo-capability name `propose()` uses to disclose how many relations it declined to
+#: propose SORTKEY/DISTKEY/DISTSTYLE ALL for because they were absent from
+#: `physical_facts` — see `RedshiftTableFacts`'s docstring and `_skipped_for_physical_gap`.
+#: That absence cannot distinguish a Spectrum (external) table, which cannot carry any of
+#: these levers, from a genuinely empty local table, so this rule set declines rather than
+#: guesses — but declining silently is indistinguishable from a bug that dropped the
+#: relation by accident. Reported through `self.degraded`, the same channel the read-only
+#: degradation uses, so it reaches the same stderr line, JSON payload and markdown report a
+#: denied capability would.
+DEGRADATION_PHYSICAL_FACTS_GAP = "physical_facts_gap"
 
 #: Redshift's dbt adapter accepts the same core libpq keywords Postgres does, so field
 #: translation uses the one shared table in `session.py` (`LIBPQ_FIELD_MAP` /
@@ -866,6 +877,12 @@ def propose_advisor(rows: Sequence[RedshiftAdvisorRow]) -> list[Proposal]:
                 evidence={
                     "schema": relation.schema,
                     "table": relation.table,
+                    # Machine-readable attribution, alongside the prose in `rationale` and
+                    # `note`: a caller rendering evidence as bare `k=v` pairs (the report's
+                    # own discipline — see `cost_share_of`'s docstring) still gets a
+                    # signal that this proposal's source is Advisor, not this adapter's
+                    # own inference.
+                    "source": "amazon_redshift_advisor",
                     "recommendation_type": row.rec_type,
                     "current_ddl": row.current_ddl,
                     "recommended_ddl": row.recommended_ddl,
@@ -930,6 +947,112 @@ def _disclose_advisor_agreement(
             )
         updated.append(proposal)
     return updated
+
+
+def _relation_of(proposal: Proposal) -> Relation:
+    """The relation an ADV101/102/103 proposal is about, recovered from its own evidence.
+
+    Every one of those three proposals' `evidence` carries plain `schema`/`table` strings
+    (not a `Relation`, which is not JSON-safe) — this is the one place that reconstitutes
+    it, so `_collapse_diststyle_all_over_distkey` and `_disclose_advisor_agreement` do not
+    each re-derive the same lookup with their own, possibly diverging, logic.
+    """
+    return Relation(
+        schema=str(proposal.evidence.get("schema")), table=str(proposal.evidence.get("table"))
+    )
+
+
+def _collapse_diststyle_all_over_distkey(proposals: list[Proposal]) -> list[Proposal]:
+    """Suppress ADV102 (DISTKEY) for a relation where ADV103 (DISTSTYLE ALL) also fired,
+    and say why in the survivor.
+
+    `DISTSTYLE ALL` replicates the whole table to every node, which removes redistribution
+    for *every* join against it — a strictly better outcome than co-locating on any single
+    join key, which is exactly what ADV102 offers and what its own docstring already says
+    about ADV103. Emitting both, silently, for the same relation recommends two conflicting
+    hours-long rewrites: an operator following both runs one full-table rewrite and then
+    another that undoes it. This is the same defect class Batch 2 shipped for
+    Postgres — ADV001 and ADV007 proposing a `(a, b)` index alongside an `(a)` index ADV003
+    would then advise dropping — except the relationship here is *subsumption of strategy*,
+    not a column-prefix, so the fix cannot be `postgres.py`'s `_collapse_index_prefixes` or
+    `_dedupe_by_ddl` as-is: both compare `columns` tuples on a `PgIndex`-shaped proposal,
+    which has no meaning for "one distribution strategy makes another redundant." What *is*
+    reused from `postgres.py` is the shape of the fix and `_sentences`, the same
+    fold-and-attribute discipline `_fold_discarded` uses: keep the stronger proposal, drop
+    the weaker one, and fold every one of its distinguishing sentences into the survivor
+    rather than discarding them along with the whole object — so a caveat that only existed
+    on the discarded ADV102 (its `skew_rows`/`stats_off` disclosures, say) still reaches the
+    operator instead of vanishing with it.
+
+    A relation with only one of the two present is untouched: this function only ever
+    removes an ADV102 proposal, and only when an ADV103 proposal for the *same* relation
+    also survived this run.
+    """
+    diststyle_all_relations = {_relation_of(p) for p in proposals if p.code == "ADV103"}
+    if not diststyle_all_relations:
+        return proposals
+
+    kept: list[Proposal] = []
+    withheld_by_relation: dict[Relation, Proposal] = {}
+    for proposal in proposals:
+        if proposal.code == "ADV102" and _relation_of(proposal) in diststyle_all_relations:
+            withheld_by_relation[_relation_of(proposal)] = proposal
+            continue
+        kept.append(proposal)
+
+    if not withheld_by_relation:
+        return kept
+
+    updated: list[Proposal] = []
+    for proposal in kept:
+        withheld = (
+            withheld_by_relation.get(_relation_of(proposal)) if proposal.code == "ADV103" else None
+        )
+        if withheld is not None:
+            seen = set(_sentences(proposal.rationale))
+            fresh = [s for s in _sentences(withheld.rationale) if s not in seen]
+            column = withheld.evidence.get("column")
+            addition = (
+                f" ADV102 also proposed a DISTKEY on {column} for this table at "
+                f"{withheld.confidence.value} confidence, withheld here: DISTSTYLE ALL "
+                "already removes redistribution entirely for every join against this "
+                "table, which strictly subsumes any single-column DISTKEY choice — "
+                "applying both would mean one full-table rewrite undoing another."
+            )
+            if fresh:
+                addition += " " + " ".join(fresh)
+            proposal = replace(proposal, rationale=proposal.rationale + addition)
+        updated.append(proposal)
+    return updated
+
+
+def _skipped_for_physical_gap(
+    usage: Sequence[ColumnUsage], physical: Mapping[Relation, RedshiftTableFacts]
+) -> int:
+    """How many relations carrying a hot RANGE/EQUALITY/JOIN predicate were declined by
+    ADV101/102/103 because they are absent from `physical`.
+
+    Counted, not silently absorbed: `RedshiftTableFacts`'s docstring explains why that
+    absence cannot, by itself, distinguish a Spectrum (external) table — which cannot carry
+    a SORTKEY, DISTKEY or DISTSTYLE at all — from a genuinely empty local table, and why
+    `propose_sortkey`/`propose_distkey`/`propose_diststyle_all` each decline rather than
+    guess for such a relation. A decision to decline is still a decision an operator is
+    entitled to see; this is what lets `propose()` disclose it through `self.degraded`
+    rather than leaving the relation to vanish with no count, no degradation entry and no
+    stderr line — the same silent-omission failure mode this feature keeps closing
+    elsewhere.
+
+    Scoped to relations that actually carried a candidate role for at least one of the
+    three rules — a relation with, say, only `GROUP`/`SORT` usage was never going to get a
+    SORTKEY/DISTKEY/DISTSTYLE ALL proposal even with `physical` present, so counting it
+    here would overstate the gap this rule set actually left.
+    """
+    candidate_roles = (ColumnRole.RANGE, ColumnRole.EQUALITY, ColumnRole.JOIN)
+    return sum(
+        1
+        for relation, items in _by_relation(usage).items()
+        if relation not in physical and any(item.role in candidate_roles for item in items)
+    )
 
 
 class RedshiftWorkloadAdapter(WorkloadAdapter):
@@ -1325,8 +1448,27 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         here: unlike Postgres's ADV005/ADV006, no Redshift rule in this task reads raw
         query text — every one of ADV101-104 works from `aggregation.usage` and
         `self.physical_facts`, and ADV105 works from Advisor's own catalog rows.
+
+        Two passes run after the four rules produce their raw proposals, in this order:
+        `_collapse_diststyle_all_over_distkey` first, so a withheld ADV102's rationale is
+        already folded into ADV103 by the time `_disclose_advisor_agreement` looks for a
+        `(relation, category)` match — an ADV102 dropped by the collapse must not also be
+        the one Advisor agreement gets attached to, since it no longer exists in the
+        returned list at all.
         """
         physical = self.physical_facts
+        skipped = _skipped_for_physical_gap(aggregation.usage, physical)
+        if skipped:
+            self.degraded.append(
+                (
+                    DEGRADATION_PHYSICAL_FACTS_GAP,
+                    f"{skipped} relation(s) with a hot range/equality/join predicate were "
+                    "not considered for SORTKEY/DISTKEY/DISTSTYLE ALL: absent from "
+                    "svv_table_info, which cannot distinguish a Spectrum (external) table "
+                    "— unable to carry any of these — from a genuinely empty local table, "
+                    "so this rule set declines rather than guesses for them",
+                )
+            )
         proposals = [
             *propose_sortkey(aggregation.usage, facts, physical, min_cost_share=min_cost_share),
             *propose_distkey(aggregation.usage, facts, physical, min_cost_share=min_cost_share),
@@ -1335,6 +1477,7 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             ),
             *propose_maintenance(physical, facts),
         ]
+        proposals = _collapse_diststyle_all_over_distkey(proposals)
         advisor_rows = self._advisor_rows(self.schemas, aggregation.tables)
         proposals = proposals + propose_advisor(advisor_rows)
         proposals = _disclose_advisor_agreement(proposals, advisor_rows)

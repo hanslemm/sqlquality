@@ -23,13 +23,18 @@ from sqlquality.models import (
 )
 from sqlquality.workload.redshift import (
     CAP_ADVISOR,
+    DEGRADATION_PHYSICAL_FACTS_GAP,
+    MAX_ROWS_FOR_DISTSTYLE_ALL,
     RedshiftAdvisorRow,
     RedshiftTableFacts,
     RedshiftWorkloadAdapter,
     _advisor_category,
+    _collapse_diststyle_all_over_distkey,
     _diststyle_is_all,
     _diststyle_key_column,
     _disclose_advisor_agreement,
+    _quote_ident,
+    _skipped_for_physical_gap,
     propose_advisor,
     propose_diststyle_all,
     propose_distkey,
@@ -124,6 +129,21 @@ def test_sortkey_never_reaches_high_even_with_a_dominant_cost_share():
     physical = {R: _phys(sortkey1="status")}
     proposals = propose_sortkey(usage, _facts(R), physical, min_cost_share=0.01)
     assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_sortkey_medium_cap_rationale_states_the_reason_not_just_the_word():
+    """The MEDIUM rung's explanation is the operator's only reason a whole-table rewrite
+    is offered at less than HIGH, and it is also what stops a later reader adding the
+    missing HIGH branch "for symmetry" — pin the substance, not just that the word
+    "MEDIUM" appears somewhere in the rationale.
+    """
+    usage = [_usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5)]
+    physical = {R: _phys(sortkey1="status")}
+    proposals = propose_sortkey(usage, _facts(R), physical, min_cost_share=0.1)
+    rationale = proposals[0].rationale
+    assert "a SORTKEY change only repays the rewrite if this predicate is selective" in rationale
+    assert "Redshift exposes no per-column" in rationale
+    assert "distinct-value statistics" in rationale
 
 
 def test_sortkey_no_proposal_when_relation_absent_from_physical_facts():
@@ -240,6 +260,16 @@ def test_distkey_never_reaches_high_even_with_a_dominant_cost_share():
     physical = {R: _phys(diststyle="EVEN")}
     proposals = propose_distkey(usage, _facts(R), physical, min_cost_share=0.01)
     assert proposals[0].confidence is Confidence.MEDIUM
+
+
+def test_distkey_medium_cap_rationale_states_the_reason_not_just_the_word():
+    usage = [_usage(R, "customer_id", ColumnRole.JOIN, cost_share=0.5)]
+    physical = {R: _phys(diststyle="EVEN")}
+    proposals = propose_distkey(usage, _facts(R), physical, min_cost_share=0.1)
+    rationale = proposals[0].rationale
+    assert "distribution skew is what makes a DISTKEY choice good or catastrophic" in rationale
+    assert "Redshift exposes no per-column" in rationale
+    assert "distinct-value statistics" in rationale
 
 
 def test_distkey_no_proposal_when_relation_absent_from_physical_facts():
@@ -412,6 +442,20 @@ def test_diststyle_all_never_reaches_high():
     assert proposals[0].confidence is Confidence.MEDIUM
 
 
+def test_diststyle_all_medium_cap_rationale_states_the_reason_not_just_the_word():
+    usage = [_usage(R2, "id", ColumnRole.JOIN, cost_share=0.5)]
+    physical = {R2: _phys(diststyle="EVEN")}
+    proposals = propose_diststyle_all(
+        usage, _facts(R2, row_estimate=1_000), physical, min_cost_share=0.1
+    )
+    rationale = proposals[0].rationale
+    assert "this rule's row-count ceiling is a heuristic" in rationale
+    assert (
+        "not a measurement of the storage and write cost this table will actually incur "
+        "once replicated" in rationale
+    )
+
+
 def test_diststyle_all_discloses_write_amplification_and_storage_cost():
     usage = [_usage(R2, "id", ColumnRole.JOIN, cost_share=0.5)]
     physical = {R2: _phys(diststyle="EVEN")}
@@ -562,6 +606,42 @@ def test_advisor_proposal_note_attributes_the_ddl_to_redshift_not_sqlquality():
     assert "not sqlquality's own analysis" in note
 
 
+def test_advisor_proposal_title_attributes_to_advisor_not_sqlquality():
+    """`title` is the one field the terminal table always renders — pin it directly,
+    since `note` alone (already covered above) does not stop `title` or `rationale` from
+    independently being rewritten to claim this recommendation as sqlquality's own."""
+    row = RedshiftAdvisorRow(
+        relation=R, rec_type="sort key", current_ddl=None, recommended_ddl="ALTER TABLE x;"
+    )
+    proposals = propose_advisor([row])
+    title = proposals[0].title
+    assert "Amazon Redshift Advisor" in title
+    assert "recommends" in title
+    assert "sqlquality recommends" not in title.lower()
+
+
+def test_advisor_proposal_rationale_attributes_to_advisor_not_sqlquality():
+    row = RedshiftAdvisorRow(
+        relation=R, rec_type="sort key", current_ddl=None, recommended_ddl="ALTER TABLE x;"
+    )
+    proposals = propose_advisor([row])
+    rationale = proposals[0].rationale
+    assert rationale.startswith("Amazon Redshift Advisor")
+    assert "sqlquality did not generate or verify this recommendation" in rationale
+    assert "sqlquality recommends" not in rationale.lower()
+
+
+def test_advisor_proposal_evidence_carries_a_machine_readable_source():
+    """A caller rendering evidence as bare `k=v` pairs (this report's own discipline) still
+    needs a signal that this proposal's source is Advisor, not this adapter's inference —
+    prose alone (`title`/`rationale`/`note`) is invisible to that renderer."""
+    row = RedshiftAdvisorRow(
+        relation=R, rec_type="sort key", current_ddl=None, recommended_ddl="ALTER TABLE x;"
+    )
+    proposals = propose_advisor([row])
+    assert proposals[0].evidence["source"] == "amazon_redshift_advisor"
+
+
 def test_advisor_proposal_handles_missing_current_and_recommended_ddl():
     row = RedshiftAdvisorRow(
         relation=R, rec_type="sort key", current_ddl=None, recommended_ddl=None
@@ -574,9 +654,13 @@ def test_advisor_proposal_handles_missing_current_and_recommended_ddl():
 
 
 def test_advisor_produces_one_proposal_per_row_in_deterministic_order():
+    """Rows are fed in the *opposite* of sorted order — "orders" before "customers" — so
+    a mutant that deleted the `sorted(...)` call in `propose_advisor` and simply iterated
+    `rows` as given would still fail this assertion. Feeding already-sorted input here
+    previously let that mutant survive."""
     rows = [
-        RedshiftAdvisorRow(relation=R2, rec_type="b", current_ddl=None, recommended_ddl=None),
         RedshiftAdvisorRow(relation=R, rec_type="a", current_ddl=None, recommended_ddl=None),
+        RedshiftAdvisorRow(relation=R2, rec_type="b", current_ddl=None, recommended_ddl=None),
     ]
     proposals = propose_advisor(rows)
     # Sorted by (schema, table, rec_type) — both share schema "public", so table order
@@ -603,6 +687,15 @@ def test_diststyle_key_column_parsing(diststyle, expected):
     assert _diststyle_key_column(diststyle) == expected
 
 
+def test_diststyle_key_column_parsing_is_case_insensitive():
+    """Pins `_DISTSTYLE_KEY_RE`'s `re.IGNORECASE` flag: nothing in this adapter has ever
+    observed a live cluster's actual casing for this text (see the module docstring's
+    provenance warning), so the parser must not silently assume upper case.
+    """
+    assert _diststyle_key_column("key(customer_id)") == "customer_id"
+    assert _diststyle_key_column("Auto(Key(customer_id))") == "customer_id"
+
+
 @pytest.mark.parametrize(
     ("diststyle", "expected"),
     [
@@ -615,6 +708,18 @@ def test_diststyle_key_column_parsing(diststyle, expected):
 )
 def test_diststyle_is_all_parsing(diststyle, expected):
     assert _diststyle_is_all(diststyle) is expected
+
+
+def test_diststyle_is_all_requires_no_key_column_even_when_all_is_a_substring():
+    """Pins the second conjunct of `_diststyle_is_all` — `and _diststyle_key_column(...)
+    is None` — which a real `svv_table_info.diststyle` value never exercises (`ALL` and
+    `KEY(...)` are mutually exclusive shapes), so nothing in the ordinary parametrize table
+    above can tell a version missing this conjunct apart from one that has it. A synthetic
+    diststyle whose key column name itself contains the substring "ALL" forces the two
+    checks apart: the naive `"ALL" in diststyle.upper()` alone would say True here, and
+    only the second conjunct correctly says this is a keyed style, not DISTSTYLE ALL.
+    """
+    assert _diststyle_is_all("KEY(all_customers)") is False
 
 
 @pytest.mark.parametrize(
@@ -632,6 +737,20 @@ def test_advisor_category_classification(rec_type, recommended_ddl, expected):
         relation=R, rec_type=rec_type, current_ddl=None, recommended_ddl=recommended_ddl
     )
     assert _advisor_category(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# `_quote_ident` — identifier quoting used by every ADV101/102/103/104 statement
+# ---------------------------------------------------------------------------
+
+
+def test_quote_ident_doubles_an_embedded_double_quote():
+    """Unquoted, or naively quoted, this would either produce invalid DDL or let an
+    identifier break out of its quoting — the same reasoning `postgres.py`'s identical
+    helper documents. Nothing in this adapter's own proposal tests happened to exercise a
+    quote-containing identifier, so the doubling itself was unpinned here."""
+    assert _quote_ident('weird"col') == '"weird""col"'
+    assert _quote_ident("plain") == '"plain"'
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +846,102 @@ def test_agreement_does_not_touch_advisor_proposals_or_maintenance_proposals():
     ]
     updated = _disclose_advisor_agreement(maintenance + advisor, advisor_rows)
     assert updated == maintenance + advisor
+
+
+# ---------------------------------------------------------------------------
+# _collapse_diststyle_all_over_distkey — ADV103 subsumes ADV102 for the same relation
+# ---------------------------------------------------------------------------
+
+
+def _distkey_proposal(relation=R2, column="id", confidence=Confidence.MEDIUM):
+    usage = [_usage(relation, column, ColumnRole.JOIN, cost_share=0.5)]
+    physical = {relation: _phys(diststyle="EVEN")}
+    proposals = propose_distkey(usage, _facts(relation), physical, min_cost_share=0.1)
+    assert len(proposals) == 1
+    assert proposals[0].confidence is confidence
+    return proposals[0]
+
+
+def _diststyle_all_proposal(relation=R2):
+    usage = [_usage(relation, "id", ColumnRole.JOIN, cost_share=0.5)]
+    physical = {relation: _phys(diststyle="EVEN")}
+    proposals = propose_diststyle_all(
+        usage, _facts(relation, row_estimate=1_000), physical, min_cost_share=0.1
+    )
+    assert len(proposals) == 1
+    return proposals[0]
+
+
+def test_collapse_drops_distkey_when_diststyle_all_fires_for_the_same_relation():
+    distkey = _distkey_proposal()
+    diststyle_all = _diststyle_all_proposal()
+    collapsed = _collapse_diststyle_all_over_distkey([distkey, diststyle_all])
+    codes = [p.code for p in collapsed]
+    assert codes == ["ADV103"]
+
+
+def test_collapse_discloses_the_withheld_distkey_in_the_survivors_rationale():
+    distkey = _distkey_proposal(column="customer_id")
+    diststyle_all = _diststyle_all_proposal()
+    collapsed = _collapse_diststyle_all_over_distkey([distkey, diststyle_all])
+    rationale = collapsed[0].rationale
+    assert "ADV102 also proposed a DISTKEY on customer_id" in rationale
+    assert "withheld" in rationale
+    assert "strictly subsumes any single-column DISTKEY choice" in rationale
+
+
+def test_collapse_leaves_distkey_alone_when_diststyle_all_does_not_fire_for_it():
+    """A relation with only ADV102 (e.g. it failed ADV103's row-count ceiling) must be
+    untouched — this function only ever removes an ADV102 that has a matching ADV103 for
+    the *same* relation."""
+    distkey_r = _distkey_proposal(relation=R)
+    diststyle_all_r2 = _diststyle_all_proposal(relation=R2)
+    collapsed = _collapse_diststyle_all_over_distkey([distkey_r, diststyle_all_r2])
+    codes = {p.code for p in collapsed}
+    assert codes == {"ADV102", "ADV103"}
+
+
+def test_collapse_is_a_noop_with_no_diststyle_all_proposals():
+    distkey = _distkey_proposal()
+    collapsed = _collapse_diststyle_all_over_distkey([distkey])
+    assert collapsed == [distkey]
+
+
+def test_collapse_leaves_diststyle_all_alone_with_no_matching_distkey():
+    diststyle_all = _diststyle_all_proposal()
+    collapsed = _collapse_diststyle_all_over_distkey([diststyle_all])
+    assert collapsed == [diststyle_all]
+
+
+# ---------------------------------------------------------------------------
+# _skipped_for_physical_gap — Spectrum/empty-table ambiguity, counted rather than silent
+# ---------------------------------------------------------------------------
+
+
+def test_skipped_for_physical_gap_counts_a_relation_with_a_candidate_role_and_no_facts():
+    usage = [_usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5)]
+    assert _skipped_for_physical_gap(usage, {}) == 1
+
+
+def test_skipped_for_physical_gap_counts_join_and_equality_roles_too():
+    usage = [
+        _usage(R, "customer_id", ColumnRole.JOIN, cost_share=0.5),
+        _usage(R2, "status", ColumnRole.EQUALITY, cost_share=0.5),
+    ]
+    assert _skipped_for_physical_gap(usage, {}) == 2
+
+
+def test_skipped_for_physical_gap_ignores_a_relation_with_facts_present():
+    usage = [_usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5)]
+    physical = {R: _phys(sortkey1="status")}
+    assert _skipped_for_physical_gap(usage, physical) == 0
+
+
+def test_skipped_for_physical_gap_ignores_a_relation_with_no_candidate_role():
+    """A relation with only GROUP/SORT usage was never going to get a SORTKEY/DISTKEY/
+    DISTSTYLE ALL proposal even with facts present, so it must not inflate this count."""
+    usage = [_usage(R, "category", ColumnRole.GROUP, cost_share=0.5)]
+    assert _skipped_for_physical_gap(usage, {}) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -849,3 +1064,78 @@ def test_propose_disclosed_agreement_survives_the_full_dispatcher():
     assert "Advisor independently recommends" in by_code["ADV101"].rationale
     # The Advisor row must still stand as its own, separate, unmodified proposal.
     assert by_code["ADV105"].confidence is Confidence.HIGH
+
+
+def test_propose_wires_distkey_when_the_table_is_too_large_for_diststyle_all():
+    """Isolates ADV102 in the full dispatcher: the table is over ADV103's row-count
+    ceiling, so ADV103 does not fire and cannot mask ADV102's own wiring — removing
+    `propose_distkey(...)` from `propose()` must redden this test on its own."""
+    adapter = RedshiftWorkloadAdapter(querier=_AdvisorQuerier())
+    adapter.physical_facts = {R: _phys(diststyle="EVEN")}
+    usage = [_usage(R, "customer_id", ColumnRole.JOIN, cost_share=0.5)]
+    proposals = adapter.propose(
+        _bare_aggregation(usage, [R]),
+        _facts(R, row_estimate=MAX_ROWS_FOR_DISTSTYLE_ALL + 1),
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    codes = [p.code for p in proposals]
+    assert codes == ["ADV102"]
+
+
+def test_propose_wires_diststyle_all_and_suppresses_distkey_for_the_same_relation():
+    """Isolates ADV103 in the full dispatcher, and proves the collapse (finding 4) runs
+    end to end: a small, hot-join dimension makes both ADV102 and ADV103 fire from their
+    own rule functions, but only ADV103 must survive `propose()`. Removing
+    `propose_diststyle_all(...)` from `propose()` reddens this test two ways — "ADV103" no
+    longer appears, and "ADV102" reappears because nothing is left to suppress it."""
+    adapter = RedshiftWorkloadAdapter(querier=_AdvisorQuerier())
+    adapter.physical_facts = {R2: _phys(diststyle="EVEN")}
+    usage = [_usage(R2, "id", ColumnRole.JOIN, cost_share=0.5)]
+    proposals = adapter.propose(
+        _bare_aggregation(usage, [R2]),
+        _facts(R2, row_estimate=1_000),
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    codes = [p.code for p in proposals]
+    assert codes == ["ADV103"]
+    assert "ADV102 also proposed a DISTKEY" in proposals[0].rationale
+
+
+def test_propose_discloses_the_physical_facts_gap_in_degraded():
+    """Finding 5: a relation with a hot predicate but no `physical_facts` entry must not
+    simply vanish — `propose()` must count it and disclose the count through the same
+    `self.degraded` channel a denied capability uses, so it reaches the coverage line, the
+    JSON payload and the markdown report."""
+    adapter = RedshiftWorkloadAdapter(querier=_AdvisorQuerier())
+    adapter.physical_facts = {}
+    usage = [
+        _usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5),
+        _usage(R2, "id", ColumnRole.JOIN, cost_share=0.5),
+    ]
+    adapter.propose(
+        _bare_aggregation(usage, [R, R2]),
+        {},
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    gaps = [reason for cap, reason in adapter.degraded if cap == DEGRADATION_PHYSICAL_FACTS_GAP]
+    assert len(gaps) == 1
+    assert "2 relation(s)" in gaps[0]
+    assert "Spectrum" in gaps[0]
+
+
+def test_propose_does_not_disclose_a_physical_facts_gap_when_there_is_none():
+    """Guards the test above: with `physical_facts` covering every relation involved, no
+    `DEGRADATION_PHYSICAL_FACTS_GAP` entry should appear at all."""
+    adapter = RedshiftWorkloadAdapter(querier=_AdvisorQuerier())
+    adapter.physical_facts = {R: _phys(sortkey1="status")}
+    usage = [_usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5)]
+    adapter.propose(
+        _bare_aggregation(usage, [R]),
+        _facts(R),
+        Workload(stats=(), window_description="w"),
+        min_cost_share=0.1,
+    )
+    assert not any(cap == DEGRADATION_PHYSICAL_FACTS_GAP for cap, _ in adapter.degraded)
