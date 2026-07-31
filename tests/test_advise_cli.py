@@ -1456,3 +1456,53 @@ def test_the_no_manifest_run_contains_no_dbt_conditional_element_anywhere(monkey
             assert token not in text, f"{token!r} leaked into {name} on a dbt-free run"
     for proposal in payload["proposals"]:
         assert not any(k.startswith("dbt") for k in proposal["evidence"]), proposal
+
+
+def test_redshift_read_only_degradation_reaches_stderr_end_to_end(monkeypatch):
+    """The carried-forward item from Tasks 2-4: `connect()`'s read-only degradation was
+    recorded correctly from the start, but could never reach a user because `propose()`
+    raised `NotImplementedError` before `cli.py` ever got to the loop that prints
+    `adapter.degraded` to stderr — see `RedshiftWorkloadAdapter.propose`'s docstring and
+    `tests/test_workload_redshift.py`'s `test_the_read_only_degradation_survives_past_
+    fetch_workload`, which proved only that `fetch_workload` no longer crashed, and said so
+    explicitly rather than claiming the full run worked.
+
+    Now that ADV101-105 make `propose()` a real method, a full `advise` run against a
+    Redshift adapter whose `connect()` recorded a read-only degradation must complete and
+    print it — this is the first test that exercises `cli.py` end to end for that engine
+    rather than stopping at `fetch_workload`.
+    """
+    from sqlquality.workload.redshift import DEGRADATION_READ_ONLY, RedshiftWorkloadAdapter
+
+    def fake_connect(self, params, timeout_s):
+        def query(sql, bind):
+            return []
+
+        self._query = query
+        self.degraded.append(
+            (
+                DEGRADATION_READ_ONLY,
+                "the session could not be proven read-only (belt-and-braces guard refused) — ***",
+            )
+        )
+
+    monkeypatch.setattr(RedshiftWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0, result.output
+    assert f"reduced coverage — {DEGRADATION_READ_ONLY}:" in result.stderr
+    assert "could not be proven read-only" in result.stderr
+
+
+def test_redshift_advise_run_with_no_degradation_prints_none(monkeypatch):
+    """Guards the test above: a clean `connect()` must not print a `reduced coverage` line
+    at all, so the assertion above is attributable to the recorded degradation, not to
+    `cli.py` always printing something regardless of `adapter.degraded`'s contents."""
+    from sqlquality.workload.redshift import RedshiftWorkloadAdapter
+
+    def fake_connect(self, params, timeout_s):
+        self._query = lambda sql, bind: []
+
+    monkeypatch.setattr(RedshiftWorkloadAdapter, "connect", fake_connect)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dsn", "postgresql://u@h/db"])
+    assert result.exit_code == 0, result.output
+    assert "reduced coverage" not in result.stderr

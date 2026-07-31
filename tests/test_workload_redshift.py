@@ -6,7 +6,7 @@ from datetime import timedelta
 import sqlglot
 import pytest
 
-from sqlquality.models import Aggregation, ConnectionParams, Relation, Workload
+from sqlquality.models import ConnectionParams, Relation
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.base import MAX_TIMEOUT_S
 from sqlquality.workload.fingerprint import ingest
@@ -91,12 +91,6 @@ def test_there_is_no_ndv_or_index_capability():
 #: Redshift speaks the same PostgreSQL wire protocol Postgres does, so it is the one
 #: method genuinely exercisable without a live Redshift cluster.
 UNIMPLEMENTED = {
-    "propose": lambda a: a.propose(
-        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
-        {},
-        Workload(stats=(), window_description="w"),
-        min_cost_share=0.01,
-    ),
     "render_ddl": lambda a: a.render_ddl([]),
 }
 
