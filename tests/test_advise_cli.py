@@ -1506,3 +1506,25 @@ def test_redshift_advise_run_with_no_degradation_prints_none(monkeypatch):
     result = runner.invoke(app, ["advise", "--engine", "redshift", "--dsn", "postgresql://u@h/db"])
     assert result.exit_code == 0, result.output
     assert "reduced coverage" not in result.stderr
+
+
+def test_redshift_dry_run_prints_all_four_statements_and_never_connects(monkeypatch):
+    """Task 8's proof that a user can inspect Redshift's introspection SQL — every column
+    name unverified against a live cluster (see `redshift.py`'s module docstring) — before
+    trusting it with a real connection. Mirrors `test_dry_run_prints_statements_and_never_
+    connects` above, for the engine whose SQL genuinely needs this escape hatch most.
+    """
+
+    def explode(*args, **kwargs):
+        raise AssertionError("--dry-run must not connect")
+
+    monkeypatch.setattr("sqlquality.workload.redshift.RedshiftWorkloadAdapter.connect", explode)
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    for marker in ("sys_query_history", "svv_columns", "svv_table_info", "svv_alter_table"):
+        assert marker in result.stdout
+
+
+def test_redshift_dry_run_needs_no_credentials():
+    result = runner.invoke(app, ["advise", "--engine", "redshift", "--dry-run"])
+    assert result.exit_code == 0, result.output
