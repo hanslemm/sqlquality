@@ -88,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ADV004 (partial index) now consults the existing-index list, which it was alone among the
+  index-creating rules in never doing. A plain index leading with the guarded column now
+  suppresses the proposal — that index already serves the lookup, and the partial index's only
+  advantage is a size saving this tool cannot measure against a second index's write cost (and
+  which ADV003 would never flag as redundant, since its prefix check is restricted to plain
+  indexes). Where a check genuinely could not run it is now stated rather than skipped: an
+  unreadable existing-index list caps confidence at LOW and says so, and an existing *partial*
+  or expression index that leads with the same column is named, since sqlquality does not
+  compare index predicates and so cannot tell whether the proposal is already applied. New
+  evidence keys `partial_indexes_not_compared` and `expression_indexes`; deliberately not
+  ADV001's `partial_indexes_skipped`, which records a different fact.
 - dbt enrichment now discloses itself in the terminal on **every** engine. The stderr
   disclosure line counted only ADV302's config-block rewrite, which no Redshift proposal can
   reach (nothing Redshift emits is a `CREATE INDEX`), so a `--project-dir` run on Redshift
