@@ -35,7 +35,8 @@ from sqlquality.workload.base import (
     WorkloadAdapter,
 )
 from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
-from sqlquality.workload.secrets import clamp_timeout_ms, scrub, secrets_for
+from sqlquality.workload.secrets import secrets_for
+from sqlquality.workload.session import READ_ONLY_SQL, import_psycopg, open_session
 
 CAP_WORKLOAD = "workload"
 CAP_STATS_RESET = "stats_reset"
@@ -1368,13 +1369,7 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             return []
 
     def connect(self, params: ConnectionParams, timeout_s: int) -> None:
-        try:
-            import psycopg
-        except ImportError as exc:
-            raise ImportError(
-                "Postgres support requires psycopg. "
-                "Install it with: pip install 'sqlquality[postgres]'"
-            ) from exc
+        psycopg = import_psycopg("Postgres", "postgres")
 
         # Silence is the failure mode being fixed here: a dropped `sslmode` downgrades the
         # connection with no signal at all. Key names only — see _dropped_pg_fields.
@@ -1390,41 +1385,26 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # than trusted.
         secrets = secrets_for(params)
 
-        failure: str | None = None
-        try:
+        # `read_only_required=True`: on Postgres `SET default_transaction_read_only` is
+        # expected to succeed unconditionally, so its failure is indistinguishable from
+        # any other setup failure and aborts the connection exactly like one. See
+        # `open_session` and `RedshiftWorkloadAdapter.connect` for the engine where a
+        # refusal is instead a recorded degradation.
+        query, _degradation = open_session(
+            psycopg=psycopg,
             # Inside the scrubbing envelope: psycopg raises from make_conninfo on an
-            # unusable keyword, and that message can quote the offending value — which for
-            # the `password` keyword is the password.
-            conninfo = params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
-            connection = psycopg.connect(conninfo, autocommit=True)
-            with connection.cursor() as cursor:
-                # Belt and braces: the session cannot write even if a statement tried to.
-                cursor.execute("SET default_transaction_read_only = on")
-                # set_config() rather than `SET`, because Postgres does not accept bind
-                # parameters in a SET statement and string-building one with a caller value
-                # is the wrong habit to establish in the one place we talk to a database.
-                cursor.execute(
-                    "SELECT set_config('statement_timeout', %s, false)",
-                    (
-                        f"{clamp_timeout_ms(timeout_s, minimum=MIN_TIMEOUT_S, maximum=MAX_TIMEOUT_S)}ms",
-                    ),
-                )
-        except Exception as exc:
-            failure = scrub(str(exc), secrets)
-        if failure is not None:
-            # Raised after the handler, and scrubbed: Task 6 established that a dependency's
-            # exception text is exactly where this class of leak hides, and that leaving the
-            # handler is the only way to keep the original out of __context__.
-            # No "Could not connect" prefix here — the CLI adds it. Prefixing at both
-            # layers printed "Could not connect: Could not connect: ..." on the most
-            # common failure a user hits.
-            raise ConnectionError(failure)
-
-        def query(sql: str, bind: tuple[object, ...]) -> list[tuple[object, ...]]:
-            with connection.cursor() as cur:
-                cur.execute(sql, bind)
-                return list(cur.fetchall())
-
+            # unusable keyword, and that message can quote the offending value — which
+            # for the `password` keyword is the password.
+            conninfo_factory=lambda: (
+                params.dsn or psycopg.conninfo.make_conninfo(**_pg_fields(params.fields))
+            ),
+            secrets=secrets,
+            timeout_s=timeout_s,
+            min_timeout_s=MIN_TIMEOUT_S,
+            max_timeout_s=MAX_TIMEOUT_S,
+            read_only_sql=READ_ONLY_SQL,
+            read_only_required=True,
+        )
         self._query = query
 
     def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
