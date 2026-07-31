@@ -88,6 +88,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI now runs the 23 live-Postgres integration tests, in a job with a `postgres:16` service
+  container that has `pg_stat_statements` preloaded. Until now they ran only on a contributor's
+  own machine, while this feature's live suite was repeatedly the only thing that caught a
+  whole class of bug — a `reltuples = -1` sentinel that suppressed every proposal, redaction
+  dismembering `$N` placeholders, a `toplevel` filter that produced confidently-wrong advice,
+  and a workload statement that failed on the wire for every default run. The job fails if the
+  suite skipped or executed nothing, since every one of those tests skips itself when no server
+  answers and `pytest` exits 0 on a skip.
+- The integration compose file publishes host port 27432 instead of 55432, which collided with
+  an unrelated container in practice — and because `docker compose up` neither binds nor fails
+  in that case, the suite silently talked to whatever else was listening. The fixture now also
+  verifies which server answered (database name, and `pg_stat_statements` in
+  `shared_preload_libraries`) and fails naming a port collision as the likely cause, rather
+  than trusting that a successful connection reached the right database.
 - `--ddl`'s guarantee that every line of the generated script is either an intended statement
   or a `--` comment now holds for all ten codepoints `str.splitlines()` treats as a line
   boundary, on both the Postgres and Redshift renderers. The guard tested only `\n` and `\r`,
