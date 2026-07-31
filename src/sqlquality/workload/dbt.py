@@ -695,6 +695,14 @@ def _classify(proposal: Proposal, model: ModelNode) -> tuple[Proposal | None, _I
                 "removed as well or the drop will not stick — and this proposal will come "
                 "back on the next run."
             )
+            # A flag for the same reason `dbt_index_config` and
+            # `dbt_ddl_not_expressed_as_config` are: the warning above lives in `rationale`
+            # and `note`, and the terminal prints neither, so this row is byte-identical to
+            # the same ADV002/ADV003 proposal from a dbt-free run. Without this,
+            # `describe_rewrites` was silent on the whole class of *Postgres* run that emits
+            # only index drops for dbt-managed relations — enrichment fired, the operator was
+            # told nothing, and the drop they applied came back on the next `dbt run`.
+            evidence["dbt_drop_may_be_recreated"] = True
             return (
                 dataclasses.replace(
                     proposal,
@@ -936,13 +944,22 @@ def describe_rewrites(proposals: list[Proposal]) -> str | None:
     same title. Without this line a user who reads only the terminal cannot tell enrichment
     happened.
 
-    **Both kinds are counted, not only ADV302's.** Counting the config-block rewrite alone
-    made this function return `None` for every Redshift run: nothing Redshift emits is a
+    **All three kinds are counted, not only ADV302's.** Counting the config-block rewrite
+    alone made this function return `None` for every Redshift run: nothing Redshift emits is a
     `CREATE INDEX`, so every Redshift proposal for a dbt-managed relation takes
     `_classify`'s generic path instead — it gets the warning that `dbt run` may undo an
     hours-long full-table rewrite, and then the terminal said nothing at all. That is
     verbatim the failure mode this function exists to prevent, on the engine where the
     wasted work is hours rather than seconds.
+
+    The third kind — an index *drop* on a dbt-managed relation, which `dbt run` may put
+    straight back from the model's `indexes:` config — was the same hole one branch further
+    along, and reachable on the adapter this module was written for: a Postgres run whose only
+    proposals for dbt-managed relations are ADV002/ADV003 drops enriches every one of them and
+    used to print nothing. It is counted separately rather than folded into the "cannot be
+    expressed as dbt config" clause because the required action is the opposite one — there
+    the operator keeps the statement and expects it not to last, here they must *also* delete
+    a config entry or the drop silently reverts.
 
     Counted off evidence flags rather than by searching the DDL or rationale text for
     "ADV302", which would depend on the wording of a string meant for humans.
@@ -952,7 +969,10 @@ def describe_rewrites(proposals: list[Proposal]) -> str | None:
     unexpressed = sum(
         1 for p in proposals if p.evidence.get("dbt_ddl_not_expressed_as_config") is True
     )
-    if not rewritten and not merged and not unexpressed:
+    recreatable_drops = sum(
+        1 for p in proposals if p.evidence.get("dbt_drop_may_be_recreated") is True
+    )
+    if not rewritten and not merged and not unexpressed and not recreatable_drops:
         return None
     clauses: list[str] = []
     if rewritten or merged:
@@ -971,6 +991,12 @@ def describe_rewrites(proposals: list[Proposal]) -> str | None:
             f"{unexpressed} proposal(s) target a dbt-managed relation and cannot be expressed "
             "as dbt config: the statement is still runnable, but the next `dbt run` may undo "
             "it — see each proposal's note in --ddl, or its rationale in --markdown/--json"
+        )
+    if recreatable_drops:
+        clauses.append(
+            f"{recreatable_drops} index drop(s) target a dbt-managed relation: if the index is "
+            "declared in the model's `indexes:` config, remove that entry too or the next "
+            "`dbt run` recreates it and the drop does not stick"
         )
     return "; ".join(clauses)
 
