@@ -159,6 +159,10 @@ def test_fetch_workload_maps_rows_and_reports_no_filter_applied():
     assert fetch.rows[0].total_time_ms == pytest.approx(25.0)
     assert "no --since filter" in fetch.window_description
     assert "sys_query_history" in fetch.window_description
+    # The statement is ORDER BY ... LIMIT n, so what was actually fetched is a truncated
+    # top-n, not "everything" — the window text must say so, not merely name the source
+    # view. See test_fetch_workload_window_names_the_truncation below for the full pin.
+    assert "500" in fetch.window_description
 
 
 def test_fetch_workload_window_is_honest_that_since_is_honoured():
@@ -173,6 +177,19 @@ def test_fetch_workload_window_is_honest_that_since_is_honoured():
     assert "since" in lowered
     assert "honoured" in lowered
     assert "not supported" not in lowered
+
+
+def test_fetch_workload_window_names_the_truncation_not_full_coverage():
+    """`ORDER BY elapsed_time DESC LIMIT n` combined with a `--since` filter means the
+    window actually covers is "the n most expensive queries since T", not "everything
+    since T" — and `cost_share` denominators throughout the rest of the run are computed
+    over exactly that truncated set. A window sentence that only names the cutoff (and
+    not the limit) reads as full coverage, which overstates what was actually analysed.
+    """
+    querier = _canned({CAP_WORKLOAD: []})
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(timedelta(days=7), 42)
+    assert "42" in fetch.window_description
+    assert "most expensive" in fetch.window_description.lower()
 
 
 def test_fetch_workload_since_is_actually_bound_into_the_statement():
@@ -232,6 +249,59 @@ def test_two_executions_of_the_same_statement_collapse_to_one_query_stat_via_ing
     assert stat.total_time_ms == pytest.approx(200.0)
 
 
+def test_identifier_case_and_comments_can_still_split_one_statement_into_two_stats():
+    """A deliberate, documented exposure rather than a silent bug: `sys_query_history`
+    stores the *verbatim* text a client sent — unlike `pg_stat_statements`, which Postgres
+    has already parsed and re-serialised (identifiers folded to lowercase) before storing.
+    Two executions that are semantically one statement, differing only in identifier case
+    or in an attached comment, therefore fingerprint as two separate `QueryStat`s in
+    `ingest()`. This is not "fixed" here — a general identifier case-fold cannot tell a
+    case-insensitive unquoted identifier apart from a deliberately-quoted, case-sensitive
+    one without risking folding away a real distinction — so this test pins the current,
+    accepted behaviour rather than a silently-changed one. See `fetch_workload`'s docstring
+    for the `cost_share`/`--min-cost-share` consequence this has.
+    """
+    querier = _canned(
+        {
+            CAP_WORKLOAD: [
+                ("select id from orders where status = 'a'", 100_000),
+                ("SELECT ID FROM ORDERS WHERE STATUS = 'b'", 100_000),
+                ("/* app=foo */ select id from orders where status = 'c'", 100_000),
+            ]
+        }
+    )
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    workload = ingest(fetch, "redshift")
+    # Three distinct QueryStats, not one — the collapse test above pins the case ingest()
+    # *does* unify; this pins the case it deliberately does not.
+    assert len(workload.stats) == 3
+
+
+def test_a_null_elapsed_time_does_not_crash_the_whole_run():
+    """A malformed or NULL `elapsed_time` must cost this run nothing more than one row,
+    never the whole `fetch_workload` call — the same "one missing grant, one capability"
+    guarantee `_run` gives a denied statement, which is worthless if a single bad row can
+    still take the run down one level higher up. Coerced defensively the way
+    `postgres.py`'s `_as_float` call sites are, rather than raising a bare `TypeError` out
+    of a generator expression no caller wraps in a try/except.
+    """
+    querier = _canned(
+        {
+            CAP_WORKLOAD: [
+                ("select id from orders where status = 'a'", None),
+                ("select id from customers where status = 'b'", 50_000),
+            ]
+        }
+    )
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert len(fetch.rows) == 2
+    by_sql = {row.sql: row for row in fetch.rows}
+    assert by_sql["select id from orders where status = 'a'"].total_time_ms == 0.0
+    assert by_sql["select id from customers where status = 'b'"].total_time_ms == pytest.approx(
+        50.0
+    )
+
+
 def test_fetch_schema_builds_a_sqlglot_schema_mapping():
     querier = _canned(
         {
@@ -264,6 +334,33 @@ def test_fetch_schema_is_nested_by_schema():
         "sales": {"orders": {"id": "integer", "status": "text"}},
         "staging": {"orders": {"id": "integer"}},
     }
+
+
+def test_schema_rows_are_fetched_at_most_once_per_schema_tuple():
+    """`_schema_cache`'s whole justification: `fetch_schema` and `fetch_table_facts` both
+    need CAP_SCHEMA rows, and querying twice for the same `schemas` tuple would do twice
+    the catalog work and — worse — record a denied grant in `degraded` twice for the same
+    missing privilege. Pins the call count directly rather than trusting the docstring.
+    """
+    rows = {
+        CAP_SCHEMA: [("public", "orders", "id", "integer")],
+        CAP_TABLE_FACTS: [("public", "orders", 10, 1, 0.0, 0.0, "EVEN", "id", 0.0)],
+    }
+    querier = _canned(rows)
+    adapter = RedshiftWorkloadAdapter(querier=querier)
+    adapter.fetch_schema(("public",))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    schema_calls = [
+        call for call in querier.calls if call[0] == RedshiftWorkloadAdapter.SQL[CAP_SCHEMA]
+    ]
+    assert len(schema_calls) == 1, "CAP_SCHEMA was queried more than once for the same schemas"
+
+    # A second, distinct schema tuple is a real cache miss, not suppressed entirely.
+    adapter.fetch_schema(("staging",))
+    schema_calls = [
+        call for call in querier.calls if call[0] == RedshiftWorkloadAdapter.SQL[CAP_SCHEMA]
+    ]
+    assert len(schema_calls) == 2
 
 
 def test_table_facts_do_not_alias_across_schemas():
@@ -333,11 +430,16 @@ def test_a_null_size_reads_as_an_unknown_size_bytes():
     assert facts[Relation("public", "orders")].row_estimate == 500
 
 
-def test_stats_off_100_reads_tbl_rows_and_size_as_unknown_despite_present_values():
-    """Sentinel 3, the central lesson this task exists to apply: Redshift's own version of
-    `pg_class.reltuples = -1`. At `stats_off = 100` — statistics never refreshed by
-    ANALYZE — `tbl_rows`/`size` are non-NULL but meaningless; reading them as facts is
-    exactly what silently suppressed every Postgres proposal for a freshly-loaded table.
+def test_stats_off_100_does_not_suppress_a_real_row_estimate_or_size():
+    """The inverted-premise bug a review caught in this module's first version: `stats_off`
+    is a 0-100 *staleness percentage* for planner statistics, not a "never analyzed" flag —
+    AWS documents `tbl_rows` and `size` as physical facts about the table, not values
+    ANALYZE produces. Gating them on `stats_off = 100` discarded accurate facts for a
+    merely-stale table and then claimed the row count "could not be checked" when it
+    plainly could — the opposite of Redshift's answer to Postgres's genuine
+    `pg_class.reltuples = -1` sentinel. `stats_off` is still real evidence (see
+    `test_physical_facts_are_stashed_on_the_adapter_keyed_by_relation`), just not a reason
+    to null out these two columns.
     """
     rows = {
         CAP_SCHEMA: [("public", "orders", "id", "integer")],
@@ -346,15 +448,15 @@ def test_stats_off_100_reads_tbl_rows_and_size_as_unknown_despite_present_values
     facts = RedshiftWorkloadAdapter(querier=_canned(rows)).fetch_table_facts(
         ("public",), frozenset({Relation("public", "orders")})
     )
-    assert facts[Relation("public", "orders")].row_estimate is None
-    assert facts[Relation("public", "orders")].size_bytes is None
+    assert facts[Relation("public", "orders")].row_estimate == 3
+    assert facts[Relation("public", "orders")].size_bytes == 1 * 1024 * 1024
 
 
 def test_a_null_stats_off_does_not_suppress_a_real_row_estimate():
-    """The control for sentinel 3: `stats_off` itself coming back NULL is unknown
-    staleness, not proven-stale, and must not be treated as "never analyzed" — otherwise
-    every table whose staleness this adapter cannot see would silently lose its row
-    estimate and size too.
+    """`stats_off` itself coming back NULL — its staleness is simply unknown — must not
+    suppress `tbl_rows`/`size` either, for the same reason a *known* `stats_off` no longer
+    does: those two columns were never derived from ANALYZE in the first place, so nothing
+    about `stats_off` — known, unknown, or maximally stale — is a reason to null them out.
     """
     rows = {
         CAP_SCHEMA: [("public", "orders", "id", "integer")],

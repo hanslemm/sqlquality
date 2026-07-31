@@ -9,8 +9,23 @@ row. That is exactly why every consumer of these rows (added in later tasks) is 
 unpack them defensively, and why `_run` records a denied or malformed statement as one entry
 in `self.degraded` rather than letting the exception propagate: a wrong column name should
 cost this run exactly one capability, never the whole run. The one correctness check
-available without a cluster is syntax — see `tests/test_workload_redshift.py`, which parses
-every statement with sqlglot's `redshift` dialect.
+available without a cluster for *column names* is syntax — see
+`tests/test_workload_redshift.py`, which parses every statement with sqlglot's `redshift`
+dialect.
+
+That is a narrower boundary than it first looks, and framing it any wider cost a day: a
+statement's *parameters* are bound by the driver over the wire, which has nothing to do
+with whether the table behind `FROM` is Redshift-only — a parameter psycopg cannot type
+fails identically whether it is headed at `svv_table_info` or `pg_class`. So every one of
+this module's four statements is also executed, with representative binds, against a
+same-named, same-shaped throwaway table created in the same `postgres:16` the rest of the
+suite runs against — see `tests/integration/test_redshift_introspection_bindable_live.py`,
+and its docstring for why a *real* stand-in table is required: Postgres's analyzer
+resolves table references before parameter types, so running a statement against the
+genuinely missing view always fails with `UndefinedTable` regardless of whether its
+parameters would otherwise bind, which cannot discriminate anything. A parameter-binding
+failure (`IndeterminateDatatype`, previously reproducible on every default `advise` run —
+see `CAP_WORKLOAD`'s comment) is exactly the class of bug this closes locally.
 
 **Deliberately no `CAP_NDV`, no `CAP_INDEXES`.** Redshift exposes no equivalent of
 `pg_stats.n_distinct`, and it has no indexes at all — its physical-design levers are
@@ -105,9 +120,10 @@ _HINTS = {
         "rather than a missing grant on this view itself"
     ),
     CAP_TABLE_FACTS: (
-        "reads svv_table_info; rows are limited to tables the current user has been granted "
-        "access to, so an unexpectedly short result reads as a small schema rather than a "
-        "denial — there is no error to distinguish the two"
+        "reads svv_table_info, which is superuser-only unless the connecting role has an "
+        "explicit SELECT grant on it; rows are also limited to tables the current user has "
+        "been granted access to, so an unexpectedly short (or empty) result reads as a "
+        "small schema rather than a denial — there is no error to distinguish the two"
     ),
     CAP_ADVISOR: (
         "reads svv_alter_table_recommendations, Amazon Redshift Advisor's own SORTKEY/"
@@ -130,57 +146,35 @@ def _as_float(value: object) -> float:
     return float(value)  # type: ignore[arg-type]
 
 
-#: `svv_table_info.stats_off`: a 0-100 staleness gauge for a table's statistics, where 0
-#: is current and 100 means the statistics have never been refreshed by ANALYZE. Compared
-#: with `>=` rather than `==` so a value the driver reports fractionally above 100 (not
-#: documented as possible, but not documented as impossible either) still reads as fully
-#: stale rather than silently passing a stricter equality check.
-_STATS_FULLY_STALE = 100.0
-
 #: `svv_table_info.size` is documented in 1 MB blocks; `TableFacts.size_bytes` is bytes.
 _MB_BYTES = 1024 * 1024
 
 
-def _never_analyzed(stats_off: object) -> bool:
-    """True when `stats_off` says this table's statistics have never been refreshed.
+def _row_estimate(tbl_rows: object) -> int | None:
+    """`svv_table_info.tbl_rows`, with a NULL row translated to unknown.
 
-    `stats_off is None` (the statement was denied, or the column itself came back NULL for
-    a reason this adapter cannot see) is deliberately *not* treated as "never analyzed" —
-    that would be inventing a fact from an absence, the same conflation `_row_estimate` and
-    `_size_bytes` exist to avoid on the other side. It reads as merely unknown, and the raw
-    `tbl_rows`/`size` value — if present — passes through unchanged.
+    A review of this module's first version gated this on `stats_off` too — reading
+    `stats_off = 100` as Redshift's equivalent of `pg_class.reltuples = -1`, Postgres's
+    "never analyzed" sentinel that silently suppressed every proposal for a table. That
+    premise was inverted and is corrected here: AWS documents `tbl_rows` as the table's
+    actual row count and `stats_off` as a 0-100 *staleness percentage* for the planner
+    statistics, not an "ever analyzed" flag — neither `tbl_rows` nor `size` is itself
+    derived from ANALYZE, so nulling them out on a high `stats_off` discarded accurate
+    facts about a merely-stale table and then claimed the row count "could not be
+    checked" when it plainly could. `stats_off` is still real evidence — see
+    `RedshiftTableFacts.stats_off` — it is disclosed as a staleness caveat by a later
+    task's rules, not used here to erase a fact this column was never responsible for.
+    A NULL `tbl_rows` (the row was never populated at all) is the one genuine unknown.
     """
-    return stats_off is not None and _as_float(stats_off) >= _STATS_FULLY_STALE
+    return None if tbl_rows is None else _as_int(tbl_rows)
 
 
-def _row_estimate(tbl_rows: object, stats_off: object) -> int | None:
-    """`svv_table_info.tbl_rows`, with Redshift's own never-analyzed sentinel translated to
-    unknown.
+def _size_bytes(size: object) -> int | None:
+    """`svv_table_info.size` (1 MB blocks) converted to bytes, or unknown if NULL.
 
-    This is Redshift's version of the bug Postgres's `_row_estimate` was written to fix:
-    `pg_class.reltuples = -1` meaning "never analyzed" being read as "tiny table," which
-    silently suppressed every index proposal for that table with no message. Redshift does
-    not reuse a negative number for the same meaning — `tbl_rows` is a plain count — so the
-    signal instead lives in the sibling column `stats_off`: at 100 the row count (and the
-    size below) reflect statistics that have never been refreshed by ANALYZE, which is
-    exactly the freshly-loaded-table-with-slow-queries moment someone reaches for `advise`
-    in the first place. `None` already means "unknown" throughout — a rule proposes at LOW
-    and says the row count could not be checked — so translating the sentinel here is the
-    whole fix. A NULL `tbl_rows` (the row was never populated at all) translates the same
-    way.
+    See `_row_estimate` for why this is no longer gated on `stats_off`.
     """
-    if tbl_rows is None or _never_analyzed(stats_off):
-        return None
-    return _as_int(tbl_rows)
-
-
-def _size_bytes(size: object, stats_off: object) -> int | None:
-    """`svv_table_info.size` (1 MB blocks) converted to bytes, gated by the same
-    never-analyzed sentinel `_row_estimate` translates — see that function's docstring.
-    """
-    if size is None or _never_analyzed(stats_off):
-        return None
-    return _as_int(size) * _MB_BYTES
+    return None if size is None else _as_int(size) * _MB_BYTES
 
 
 @dataclass(frozen=True)
@@ -190,18 +184,23 @@ class RedshiftTableFacts:
     staleness are Redshift-specific levers. Held in the adapter, keyed by `Relation`, the
     way `postgres.py` holds `PgIndex`.
 
-    Every field is `None` only when its own source value was SQL NULL — `unsorted`,
-    `diststyle`, `sortkey1` and `skew_rows` carry no sentinel of their own the way
-    `tbl_rows`/`size` do, so they are not gated by `stats_off`; see `_row_estimate` for the
-    one translation this adapter does perform.
+    `stats_off` is a 0-100 staleness *percentage* for this table's planner statistics — 0
+    is current, 100 is maximally stale — **not** a flag for "never analyzed" and not a
+    reason to distrust `tbl_rows`/`size` on the engine-neutral `TableFacts` this adapter
+    also builds: AWS documents both of those as physical facts about the table itself,
+    not values ANALYZE produces. A later task's rules should disclose `stats_off` as a
+    caveat ("statistics are N% stale") rather than treat it as a reason to null out a row
+    estimate or size that was never derived from statistics in the first place.
+
+    Every field is `None` only when its own source value was SQL NULL.
 
     A relation absent entirely from the dict this is stored in (`RedshiftWorkloadAdapter
     .physical_facts`) is a *distinct* condition from every field here being `None`: absence
-    means the relation never appeared in `svv_table_info` at all, which is what a Spectrum
-    (external) table looks like — `svv_columns` sees it (so `fetch_schema` can qualify a
-    query against it) but `svv_table_info` does not, since an external table cannot carry a
-    SORTKEY or a DISTSTYLE. A later task proposing either must check for the relation's
-    absence from this dict, not merely for `None` fields on a present entry.
+    means the relation never appeared in `svv_table_info` at all. **This is not, by
+    itself, proof of a Spectrum (external) table** — AWS also omits genuinely *empty*
+    tables from `svv_table_info`, so a later task proposing SORTKEY/DISTKEY from this
+    absence needs an additional signal (e.g. cross-referencing `svv_external_tables`) to
+    tell the two cases apart; recorded here as a carry-forward, not solved by this task.
     """
 
     unsorted: float | None
@@ -230,19 +229,33 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # `elapsed_time` is documented as microseconds, unlike `pg_stat_statements
         # .total_exec_time`'s milliseconds — fetch_workload() divides by 1000.
         #
-        # `(%s IS NULL OR start_time >= %s)`, not a bare `start_time >= %s`: unlike
-        # `pg_stat_statements`, which carries no per-statement timestamp at all,
-        # `sys_query_history.start_time` genuinely lets `--since` be honoured here — see
-        # fetch_workload()'s docstring and its honest `window_description` either way. The
-        # same bind value is passed twice (`None` when `--since` was not given) so one
-        # static, syntax-checkable statement serves both cases rather than two near-
-        # duplicate strings that could drift apart.
+        # `(CAST(%s AS timestamptz) IS NULL OR start_time >= %s)`, not a bare
+        # `start_time >= %s`: unlike `pg_stat_statements`, which carries no per-statement
+        # timestamp at all, `sys_query_history.start_time` genuinely lets `--since` be
+        # honoured here — see fetch_workload()'s docstring and its honest
+        # `window_description` either way. The same bind value is passed twice (`None`
+        # when `--since` was not given) so one static, syntax-checkable statement serves
+        # both cases rather than two near-duplicate strings that could drift apart.
+        #
+        # The explicit `CAST(... AS timestamptz)` is load-bearing, not decoration. A bare
+        # `%s IS NULL` gives the driver no other typed operand in that branch of the OR to
+        # infer a type from, and every run *without* `--since` binds `None` there —
+        # reproduced live against `postgres:16` through the identical psycopg wire path:
+        # `IndeterminateDatatype: could not determine data type of parameter $1`. `_run`
+        # then swallows it into `degraded`, so the run reported a zero-query workload —
+        # exactly the "healthy cluster, no traffic" failure mode this module's own
+        # docstring says it exists to prevent, for the *default* invocation with no
+        # `--since` at all. See `tests/integration/test_redshift_introspection_bindable_live
+        # .py`, which executes every one of this adapter's four statements against
+        # `postgres:16` with representative binds specifically to catch this class of bug
+        # — a statement that cannot even be prepared — locally, rather than assuming
+        # bindability is untestable just because the tables underneath are Redshift-only.
         CAP_WORKLOAD: """
             SELECT query_text, elapsed_time
             FROM sys_query_history
             WHERE database_name = current_database()
               AND status = 'success'
-              AND (%s IS NULL OR start_time >= %s)
+              AND (CAST(%s AS timestamptz) IS NULL OR start_time >= %s)
             ORDER BY elapsed_time DESC
             LIMIT %s
         """,
@@ -263,8 +276,8 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # estimate and size-in-MB columns per AWS's documentation; `unsorted`, `stats_off`,
         # `diststyle`, `sortkey1` and `skew_rows` are the physical-design evidence ADV103
         # (DISTSTYLE ALL) and ADV104 (VACUUM/ANALYZE) need — see `RedshiftTableFacts`.
-        # `stats_off` doubles as the never-analyzed sentinel `_row_estimate`/`_size_bytes`
-        # translate to unknown.
+        # `stats_off` is a staleness *percentage*, not a never-analyzed flag — see
+        # `RedshiftTableFacts`'s docstring — and does not gate `tbl_rows`/`size`.
         CAP_TABLE_FACTS: """
             SELECT "schema", "table", tbl_rows, size, unsorted, stats_off, diststyle,
                    sortkey1, skew_rows
@@ -387,7 +400,12 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         Unlike `pg_stat_statements`, `sys_query_history` carries a `start_time` per
         execution — so unlike `PostgresWorkloadAdapter.fetch_workload`, `--since` genuinely
         can be honoured here, and `window_description` says so plainly either way, the same
-        discipline the Postgres adapter uses to say the opposite.
+        discipline the Postgres adapter uses to say the opposite. The statement is also
+        `ORDER BY elapsed_time DESC LIMIT n`, though, so what is actually returned is *the
+        n most expensive successful queries* since that cutoff (or overall, with no
+        `--since`) — not literally everything since then. `window_description` says so
+        explicitly rather than implying full coverage, because `cost_share` denominators
+        throughout the rest of this run are computed over exactly that truncated set.
 
         `sys_query_history` returns one row per *execution*, not per normalised statement —
         `pg_stat_statements` pre-aggregates by fingerprint, this view does not. So `calls`
@@ -395,24 +413,54 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         fingerprint, with `calls` and `total_time_ms` summed, happens in `ingest()` — see
         `tests/test_workload_redshift.py`'s test pinning that two executions of the same
         statement actually do collapse, rather than assuming it.
+
+        That collapse is keyed on `ingest()`'s redacted, re-serialised SQL text, which is
+        sensitive to exactly how the raw text was written — and `sys_query_history` stores
+        the *verbatim* text the client sent, unlike `pg_stat_statements`, which Postgres has
+        already parsed and re-serialised (identifiers folded to lowercase) before storing.
+        So two executions that are, semantically, one statement can still fingerprint as two
+        separate `QueryStat`s here if they differ only in identifier case or in an attached
+        comment (an ORM query tag, for instance) — deliberately left undisclosed-but-real
+        rather than "fixed" by normalising identifiers before `ingest()` runs, since a
+        general case-fold cannot tell an unquoted identifier (case-insensitive) apart from a
+        deliberately-quoted, case-sensitive one without risking folding a real distinction
+        away. Pinned by
+        `test_identifier_case_and_comments_can_still_split_one_statement_into_two_stats`.
+        The consequence is real, not merely cosmetic: splitting one statement's cost across
+        two `QueryStat`s inflates the number of groups the workload's total cost is spread
+        over, which shrinks every `cost_share` and makes `--min-cost-share` correspondingly
+        stricter for the affected statement.
         """
         cutoff = None if since is None else datetime.now(timezone.utc) - since
         rows = self._run(CAP_WORKLOAD, (cutoff, cutoff, limit))
         if cutoff is not None:
             window = (
-                f"since {cutoff.isoformat()} (--since is honoured: sys_query_history "
-                "carries a per-execution start_time, unlike pg_stat_statements)"
+                f"the {limit} most expensive successful queries since {cutoff.isoformat()} "
+                "in sys_query_history (--since is honoured: sys_query_history carries a "
+                "per-execution start_time, unlike pg_stat_statements)"
             )
         else:
             window = (
-                "no --since filter applied; the most expensive successful queries "
-                "recorded in sys_query_history"
+                f"the {limit} most expensive successful queries recorded in "
+                "sys_query_history (no --since filter applied)"
             )
         return WorkloadFetch(
             rows=tuple(
-                # elapsed_time is documented in microseconds; total_time_ms wants
-                # milliseconds.
-                RawQueryRow(sql=str(sql), calls=1, total_time_ms=_as_float(elapsed) / 1000.0)
+                RawQueryRow(
+                    sql=str(sql),
+                    calls=1,
+                    # elapsed_time is documented in microseconds; total_time_ms wants
+                    # milliseconds. A NULL elapsed_time (not documented as possible for a
+                    # 'success' row, but nothing here can prove it can't happen) must not
+                    # raise past this point: an uncaught TypeError here would crash the
+                    # whole run for one malformed row, exactly the failure `_run`'s
+                    # try/except exists to prevent for a denied statement — that guarantee
+                    # is worthless if a single bad row can still take down the run one
+                    # level up. Treated as zero cost rather than dropping the row, so the
+                    # call is still counted; zero cost is honestly conservative, since
+                    # `total_time_ms` has no `None`/unknown state to fall back to.
+                    total_time_ms=(_as_float(elapsed) / 1000.0) if elapsed is not None else 0.0,
+                )
                 for sql, elapsed in rows
             ),
             window_description=window,
@@ -455,13 +503,16 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         `PostgresWorkloadAdapter.fetch_table_facts`. `svv_columns` includes external
         (Spectrum) tables and `svv_table_info` does not (see `fetch_schema`'s docstring),
         so a relation named in `relations` can legitimately never appear in this method's
-        `svv_table_info` rows at all. Forcing an entry anyway — every field `None` — would
-        make "this is an external table, structurally incapable of SORTKEY/DISTKEY" look
-        identical to "this is a real table whose statistics simply have not been analysed
-        yet," which is exactly the conflation `_row_estimate` and `_size_bytes` exist to
-        prevent on the *value* side. A relation's simple absence from the returned dict (and
-        from `self.physical_facts`) is the signal a later task's SORTKEY/DISTKEY rules must
-        check for instead.
+        `svv_table_info` rows at all — forcing an entry anyway, every field `None`, would
+        make that indistinguishable from a real table this method genuinely has no facts
+        for. A relation's simple absence from the returned dict (and from
+        `self.physical_facts`) is the signal a later task's rules must check for instead.
+
+        **That absence is not, by itself, proof of a Spectrum table** — AWS also omits
+        genuinely *empty* tables from `svv_table_info` — so a later task proposing
+        SORTKEY/DISTKEY from this absence needs an additional signal to tell the two cases
+        apart; see `RedshiftTableFacts`'s docstring. Recorded as a carry-forward, not
+        solved here.
         """
         wanted = sorted({relation.table for relation in relations})
         columns: dict[Relation, list[str]] = {}
@@ -491,8 +542,8 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
                 continue
             facts[relation] = TableFacts(
                 relation=relation,
-                row_estimate=_row_estimate(tbl_rows, stats_off),
-                size_bytes=_size_bytes(size, stats_off),
+                row_estimate=_row_estimate(tbl_rows),
+                size_bytes=_size_bytes(size),
                 columns=tuple(columns.get(relation, ())),
             )
             physical[relation] = RedshiftTableFacts(
