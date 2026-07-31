@@ -59,6 +59,146 @@ jobs:
             exit 1
           fi
 
+  # The 23 tests under tests/integration/ are deselected by default and, until this job
+  # existed, ran only on a contributor's own machine. That is not a theoretical gap: this
+  # feature's live suite repeatedly found bugs no fixture could reach — a `reltuples = -1`
+  # sentinel that read as "tiny table" and silently suppressed every proposal, redaction
+  # dismembering `$N` placeholders, a `toplevel` filter that made a hot function-wrapped query
+  # vanish while leaving confidently-wrong advice in its place, and a workload statement that
+  # failed on the wire for every default run. Each was invisible to `pytest` and to review.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: sqlquality
+          POSTGRES_DB: sqlquality_test
+        # Same host port as tests/integration/docker-compose.yml, so one DSN describes both.
+        # `tests/test_ci_integration_job.py` pins these against the fixture's own constants:
+        # a port or database name that drifts here turns every live test into a skip, which
+        # this job's final step is specifically built to refuse.
+        ports:
+          - 27432:5432
+        # A service container cannot be given a command — GitHub's `services:` schema has no
+        # `command`/`entrypoint` key, and `options` is passed to `docker create` *before* the
+        # image, so the `-c shared_preload_libraries=...` flags the compose file uses cannot be
+        # expressed here. The preload is applied in the first step instead. What `options` is
+        # for is the health check: the job does not start its steps until Postgres answers.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sqlquality_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # `pg_stat_statements` must be loaded by the postmaster at startup; `CREATE EXTENSION`
+      # alone leaves the extension installed and every read of its view failing. Since the
+      # service container's command cannot carry the flags, they are written with ALTER SYSTEM
+      # (which persists them to postgresql.auto.conf) and the container is restarted so the
+      # postmaster picks them up. `pg_reload_conf()` is not enough: both settings are
+      # postmaster-level, so a reload leaves them inactive with no error.
+      #
+      # `docker exec` rather than a host psql: the client is guaranteed to exist inside the
+      # postgres image, and no assumption is made about what the runner image ships.
+      - name: Preload pg_stat_statements and restart the service container
+        run: |
+          set -euo pipefail
+          container="$(docker ps --filter ancestor=postgres:16 --format '{{.ID}}' | head -n1)"
+          if [ -z "$container" ]; then
+            echo "::error::no postgres:16 service container found — the service failed to start"
+            docker ps -a
+            exit 1
+          fi
+          # One `psql -c` per statement, deliberately: psql wraps multiple `-c` options in a
+          # single implicit transaction, and ALTER SYSTEM cannot run inside a transaction block.
+          docker exec "$container" psql -U postgres -d sqlquality_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements'"
+          # `pg_stat_statements.track = all` matters as much as the preload: the live suite
+          # covers nested statements (a DECLARE ... CURSOR unwrapped to its inner query), which
+          # only appear in pg_stat_statements under `track = all`.
+          docker exec "$container" psql -U postgres -d sqlquality_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET pg_stat_statements.track = 'all'"
+          docker restart "$container"
+          # The health check gates the *start of the job*, not a mid-job restart, so the wait
+          # is explicit. Failing here rather than letting the suite skip is the whole point:
+          # a server that never came back must not read as a pass.
+          for _ in $(seq 1 30); do
+            if docker exec "$container" pg_isready -U postgres -d sqlquality_test; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec "$container" pg_isready -U postgres -d sqlquality_test
+          # Prove both settings actually took effect before any test runs, so a failure here
+          # names the cause instead of surfacing as an error deep inside a fixture.
+          docker exec "$container" psql -U postgres -d sqlquality_test -tAc \
+            "SELECT current_setting('shared_preload_libraries')" | grep -q pg_stat_statements
+          test "$(docker exec "$container" psql -U postgres -d sqlquality_test -tAc \
+            "SELECT current_setting('pg_stat_statements.track')")" = "all"
+      # The `postgres` extra, since psycopg is what the live tests connect with. Not
+      # `--all-extras`: nothing here needs the llm extra.
+      - run: uv sync --extra postgres
+      - name: Run the integration suite
+        env:
+          # The fixture's own default DSN is this exact string, but it is set explicitly so a
+          # change to either side is a visible change here rather than a silent switch to
+          # whatever the fixture happens to default to.
+          SQLQUALITY_TEST_DSN: postgresql://postgres:sqlquality@127.0.0.1:27432/sqlquality_test
+        # `--strict-markers` catches a typo'd `integration` marker, which would otherwise
+        # select nothing. The junit XML is what the next step reads: pytest's own
+        # machine-readable count, not a regex over text meant for humans.
+        run: uv run pytest -m integration -q -rs --strict-markers --junitxml=integration.xml
+      # `pytest` exits 0 on skips, and every one of these tests skips itself when the server is
+      # unreachable — so a service that never became ready, a wrong port, or a marker typo would
+      # otherwise produce a green run that executed nothing at all. Same discipline as the
+      # `no-extras` job above, which refuses a skip for the same reason: an invariant that is
+      # only ever asserted by a test that did not run is not asserted.
+      #
+      # `if: always()` so a failing suite still reports *why* — a run that skipped everything
+      # and a run that genuinely failed need different fixes.
+      - name: Fail if the integration suite skipped or ran nothing
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("integration.xml")
+          if not report.exists():
+              # Reachable because this step is `if: always()`: the pytest step can die before
+              # writing a report. Say so plainly rather than raising a traceback over it.
+              sys.exit(
+                  "::error::integration.xml was never written, so the previous step did not "
+                  "get as far as running tests. Its own log has the reason."
+              )
+          root = ET.parse(report).getroot()
+          suites = root.findall("testsuite") or ([root] if root.tag == "testsuite" else [])
+          if not suites:
+              sys.exit("::error::integration.xml has no testsuite element; pytest wrote nothing")
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+          executed = total - skipped
+          print(f"collected={total} executed={executed} skipped={skipped} failed={failures}")
+          if skipped:
+              sys.exit(
+                  f"::error::{skipped} integration test(s) skipped. These tests skip themselves "
+                  "when no Postgres answers, so a skip here means the service container never "
+                  "became ready, the published port does not match SQLQUALITY_TEST_DSN, or the "
+                  "server is not the one this suite expects. A skip must not read as a pass."
+              )
+          if executed == 0:
+              sys.exit(
+                  "::error::zero integration tests ran. Either the `integration` marker no "
+                  "longer selects them or the package collected nothing."
+              )
+          PY
+
   # `uv sync` installs what uv.lock pins, so every job above tests exactly one point in the
   # dependency ranges pyproject declares. A user running `pip install sqlquality` gets the
   # *newest* release satisfying those ranges instead — and that difference has already shipped

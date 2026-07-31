@@ -1052,10 +1052,15 @@ def test_adv302_rewrites_an_index_proposal_into_dbt_config_through_the_cli(monke
     replacing that one line with `pass` — which disables the branch's headline feature
     completely — left all 665 tests passing. The only guard was
     `tests/integration/test_advise_live.py`, and `pyproject.toml` sets
-    `addopts = "-m 'not integration'"` while `ci.yml` provisions no Postgres, so CI never runs
-    it: ADV302 could have been deleted from the CLI with every check green. This is the third
-    instance of that defect class on this branch, so it is pinned here — no Docker, no extras,
-    no live database, because the `no-extras` CI job depends on that.
+    `addopts = "-m 'not integration'"` while `ci.yml` provisioned no Postgres at the time, so CI
+    never ran it: ADV302 could have been deleted from the CLI with every check green. This is the
+    third instance of that defect class on this branch, so it is pinned here — no Docker, no
+    extras, no live database, because the `no-extras` CI job depends on that.
+
+    CI now has an `integration` job that does provision Postgres, which closes the other half of
+    that gap. It does not make this test redundant: the live suite needs Docker and the postgres
+    extra, so it is still the wrong place to pin CLI wiring that must hold for every contributor
+    running a bare `uv run pytest`.
     """
     _stub_adapter(monkeypatch, TWO_INDEXES_ON_ORDERS_ROWS)
     result = runner.invoke(
