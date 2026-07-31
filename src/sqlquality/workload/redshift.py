@@ -37,12 +37,13 @@ degradation rather than a hard failure — is documented on `connect()` itself.
 from __future__ import annotations
 
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlquality.models import (
     Aggregation,
     ConnectionParams,
     Proposal,
+    RawQueryRow,
     Relation,
     TableFacts,
     Workload,
@@ -116,6 +117,18 @@ _HINTS = {
 }
 
 
+def _as_int(value: object) -> int:
+    """Coerce a driver row value to int. See `postgres.py`'s identical helper — Querier
+    rows are `tuple[object, ...]`, so this coercion is unavoidably unchecked and lives in
+    one auditable place rather than at a dozen call sites."""
+    return int(value)  # type: ignore[call-overload]
+
+
+def _as_float(value: object) -> float:
+    """Coerce a driver row value to float. See `_as_int`."""
+    return float(value)  # type: ignore[arg-type]
+
+
 class RedshiftWorkloadAdapter(WorkloadAdapter):
     engine = "redshift"
 
@@ -131,17 +144,31 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # never finished. `database_name = current_database()` scopes to the connected
         # database exactly as the Postgres adapter's CAP_WORKLOAD scopes to
         # `current_database()` via `pg_database`.
+        #
+        # `elapsed_time` is documented as microseconds, unlike `pg_stat_statements
+        # .total_exec_time`'s milliseconds — fetch_workload() divides by 1000.
+        #
+        # `(%s IS NULL OR start_time >= %s)`, not a bare `start_time >= %s`: unlike
+        # `pg_stat_statements`, which carries no per-statement timestamp at all,
+        # `sys_query_history.start_time` genuinely lets `--since` be honoured here — see
+        # fetch_workload()'s docstring and its honest `window_description` either way. The
+        # same bind value is passed twice (`None` when `--since` was not given) so one
+        # static, syntax-checkable statement serves both cases rather than two near-
+        # duplicate strings that could drift apart.
         CAP_WORKLOAD: """
             SELECT query_text, elapsed_time
             FROM sys_query_history
             WHERE database_name = current_database()
               AND status = 'success'
+              AND (%s IS NULL OR start_time >= %s)
             ORDER BY elapsed_time DESC
             LIMIT %s
         """,
         # svv_columns is Redshift's own columns view (distinct from information_schema,
         # which Redshift also exposes but which AWS documents less completely for this
-        # engine). No reserved words here, unlike CAP_TABLE_FACTS below.
+        # engine). No reserved words here, unlike CAP_TABLE_FACTS below. It also includes
+        # external (Spectrum) tables, unlike CAP_TABLE_FACTS's svv_table_info — see
+        # fetch_schema()'s docstring.
         CAP_SCHEMA: """
             SELECT schema_name, table_name, column_name, data_type
             FROM svv_columns
@@ -172,6 +199,11 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
     def __init__(self, querier: Querier | None = None) -> None:
         super().__init__()
         self._query = querier
+        #: CAP_SCHEMA rows per schema tuple. Both fetch_schema and fetch_table_facts need
+        #: them, and running the statement twice did twice the catalog work and — worse —
+        #: would append two identical entries to `degraded` when it was denied. Mirrors
+        #: `PostgresWorkloadAdapter`'s identical cache.
+        self._schema_cache: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -257,10 +289,68 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             self.degraded.append((DEGRADATION_READ_ONLY, degradation))
 
     def fetch_workload(self, since: timedelta | None, limit: int) -> WorkloadFetch:
-        raise NotImplementedError("Redshift fetch_workload() is not implemented yet.")
+        """Raw query-history rows plus an honest description of the window they cover.
+
+        Unlike `pg_stat_statements`, `sys_query_history` carries a `start_time` per
+        execution — so unlike `PostgresWorkloadAdapter.fetch_workload`, `--since` genuinely
+        can be honoured here, and `window_description` says so plainly either way, the same
+        discipline the Postgres adapter uses to say the opposite.
+
+        `sys_query_history` returns one row per *execution*, not per normalised statement —
+        `pg_stat_statements` pre-aggregates by fingerprint, this view does not. So `calls`
+        is always 1 on the `RawQueryRow`s built here; the collapse into one `QueryStat` per
+        fingerprint, with `calls` and `total_time_ms` summed, happens in `ingest()` — see
+        `tests/test_workload_redshift.py`'s test pinning that two executions of the same
+        statement actually do collapse, rather than assuming it.
+        """
+        cutoff = None if since is None else datetime.now(timezone.utc) - since
+        rows = self._run(CAP_WORKLOAD, (cutoff, cutoff, limit))
+        if cutoff is not None:
+            window = (
+                f"since {cutoff.isoformat()} (--since is honoured: sys_query_history "
+                "carries a per-execution start_time, unlike pg_stat_statements)"
+            )
+        else:
+            window = (
+                "no --since filter applied; the most expensive successful queries "
+                "recorded in sys_query_history"
+            )
+        return WorkloadFetch(
+            rows=tuple(
+                # elapsed_time is documented in microseconds; total_time_ms wants
+                # milliseconds.
+                RawQueryRow(sql=str(sql), calls=1, total_time_ms=_as_float(elapsed) / 1000.0)
+                for sql, elapsed in rows
+            ),
+            window_description=window,
+        )
+
+    def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
+        """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""
+        if schemas not in self._schema_cache:
+            self._schema_cache[schemas] = self._run(CAP_SCHEMA, (list(schemas),))
+        return self._schema_cache[schemas]
 
     def fetch_schema(self, schemas: tuple[str, ...]) -> dict:
-        raise NotImplementedError("Redshift fetch_schema() is not implemented yet.")
+        """Nested schema mapping for sqlglot qualify(): {schema: {table: {column: type}}}.
+
+        `svv_columns` includes external (Spectrum) tables; `svv_table_info` — what
+        `fetch_table_facts` reads — does not (an external table cannot carry SORTKEY or
+        DISTSTYLE, so Redshift never lists one there). So this map can, correctly, carry a
+        relation `fetch_table_facts` never returns a fact for: a query joining an external
+        table still needs its columns to qualify, or the whole statement is dropped as
+        unqualifiable — see `fetch_table_facts`'s docstring for the consequence on the
+        other side of that gap.
+
+        Nested rather than flat for the same reason `PostgresWorkloadAdapter.fetch_schema`
+        is: a flat map cannot tell two same-named tables in different schemas apart.
+        """
+        schema: dict[str, dict[str, dict[str, str]]] = {}
+        for schema_name, table, column, data_type in self._schema_rows(schemas):
+            schema.setdefault(str(schema_name), {}).setdefault(str(table), {})[str(column)] = str(
+                data_type
+            )
+        return schema
 
     def fetch_table_facts(
         self, schemas: tuple[str, ...], relations: frozenset[Relation]

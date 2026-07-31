@@ -1,6 +1,7 @@
 import re
 import sys
 import types
+from datetime import timedelta
 
 import sqlglot
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from sqlquality.models import Aggregation, ConnectionParams, Workload
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.base import MAX_TIMEOUT_S
+from sqlquality.workload.fingerprint import ingest
 from sqlquality.workload.redshift import (
     CAP_ADVISOR,
     CAP_SCHEMA,
@@ -89,8 +91,6 @@ def test_there_is_no_ndv_or_index_capability():
 #: Redshift speaks the same PostgreSQL wire protocol Postgres does, so it is the one
 #: method genuinely exercisable without a live Redshift cluster.
 UNIMPLEMENTED = {
-    "fetch_workload": lambda a: a.fetch_workload(None, 10),
-    "fetch_schema": lambda a: a.fetch_schema(("public",)),
     "fetch_table_facts": lambda a: a.fetch_table_facts(("public",), frozenset()),
     "propose": lambda a: a.propose(
         Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
@@ -115,6 +115,156 @@ def test_unimplemented_methods_say_so_rather_than_returning_empty(method):
     adapter = RedshiftWorkloadAdapter()
     with pytest.raises(NotImplementedError):
         UNIMPLEMENTED[method](adapter)
+
+
+class FakeQuerier:
+    """Returns canned rows per capability, keyed by a distinctive SQL substring.
+
+    Mirrors `tests/test_workload_postgres.py`'s `FakeQuerier` exactly — same dispatch, same
+    shape — so the two adapters' fetch tests read the same way.
+    """
+
+    def __init__(self, rows_by_marker, fail_markers=()):
+        self.rows_by_marker = rows_by_marker
+        self.fail_markers = fail_markers
+        self.calls = []
+
+    def __call__(self, sql, params):
+        self.calls.append((sql, params))
+        for marker in self.fail_markers:
+            if marker in sql:
+                raise RuntimeError(f"permission denied for {marker}")
+        for marker, rows in self.rows_by_marker.items():
+            if marker in sql:
+                return rows
+        return []
+
+
+def _canned(rows_by_capability):
+    """A FakeQuerier addressed by capability constant rather than a raw SQL substring."""
+    return FakeQuerier(
+        {
+            RedshiftWorkloadAdapter.SQL[capability]: rows
+            for capability, rows in rows_by_capability.items()
+        }
+    )
+
+
+def test_fetch_workload_maps_rows_and_reports_no_filter_applied():
+    querier = _canned({CAP_WORKLOAD: [("select id from orders where status = 'x'", 25_000)]})
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert fetch.rows[0].sql == "select id from orders where status = 'x'"
+    # One row per execution, not pre-aggregated — see the aggregation test below.
+    assert fetch.rows[0].calls == 1
+    # elapsed_time is documented in microseconds; total_time_ms wants milliseconds.
+    assert fetch.rows[0].total_time_ms == pytest.approx(25.0)
+    assert "no --since filter" in fetch.window_description
+    assert "sys_query_history" in fetch.window_description
+
+
+def test_fetch_workload_window_is_honest_that_since_is_honoured():
+    """The opposite discipline from Postgres's identically-named test: `sys_query_history`
+    *does* carry a per-execution timestamp, so `--since` genuinely can be honoured, and the
+    window text must say so rather than staying silent or (worse) copying Postgres's
+    disclaimer that it cannot be.
+    """
+    querier = _canned({CAP_WORKLOAD: []})
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(timedelta(days=7), 500)
+    lowered = fetch.window_description.lower()
+    assert "since" in lowered
+    assert "honoured" in lowered
+    assert "not supported" not in lowered
+
+
+def test_fetch_workload_since_is_actually_bound_into_the_statement():
+    """Guards the claim the test above makes in prose: `--since` must change what the
+    statement is run with, not just what the sentence says. Without this, a
+    `window_description` claiming the window was honoured while the query ran with no
+    cutoff at all would still pass every other test here.
+    """
+    querier = FakeQuerier({RedshiftWorkloadAdapter.SQL[CAP_WORKLOAD]: []})
+    RedshiftWorkloadAdapter(querier=querier).fetch_workload(timedelta(days=1), 10)
+    assert len(querier.calls) == 1
+    _sql, params = querier.calls[0]
+    cutoff, cutoff_again, limit = params
+    assert cutoff is not None
+    assert cutoff == cutoff_again
+    assert limit == 10
+
+
+def test_fetch_workload_without_since_binds_no_cutoff():
+    """The control for the test above: no `--since` must mean no cutoff bound in either
+    placeholder, not merely a friendlier sentence with a filter silently applied anyway.
+    """
+    querier = FakeQuerier({RedshiftWorkloadAdapter.SQL[CAP_WORKLOAD]: []})
+    RedshiftWorkloadAdapter(querier=querier).fetch_workload(None, 10)
+    _sql, params = querier.calls[0]
+    cutoff, cutoff_again, limit = params
+    assert cutoff is None
+    assert cutoff_again is None
+    assert limit == 10
+
+
+def test_two_executions_of_the_same_statement_collapse_to_one_query_stat_via_ingest():
+    """Task 3's central aggregation claim, confirmed rather than assumed: unlike
+    `pg_stat_statements`, `sys_query_history` returns one row per *execution*, so
+    `fetch_workload` emits `calls=1` on every row (pinned below). The collapse into one
+    `QueryStat` per fingerprint, with `calls` and `total_time_ms` summed, is not this
+    adapter's job at all — it happens in the engine-agnostic `ingest()` — and this test is
+    what actually proves that happens for Redshift's rows, rather than assuming `ingest()`'s
+    Postgres behaviour carries over unchanged.
+    """
+    querier = _canned(
+        {
+            CAP_WORKLOAD: [
+                ("select id from orders where status = 'a'", 120_000),
+                ("select id from orders where status = 'b'", 80_000),
+            ]
+        }
+    )
+    fetch = RedshiftWorkloadAdapter(querier=querier).fetch_workload(None, 500)
+    assert len(fetch.rows) == 2
+    assert all(row.calls == 1 for row in fetch.rows)
+
+    workload = ingest(fetch, "redshift")
+    assert len(workload.stats) == 1
+    stat = workload.stats[0]
+    assert stat.calls == 2
+    assert stat.total_time_ms == pytest.approx(200.0)
+
+
+def test_fetch_schema_builds_a_sqlglot_schema_mapping():
+    querier = _canned(
+        {
+            CAP_SCHEMA: [
+                ("public", "orders", "id", "integer"),
+                ("public", "orders", "status", "character varying"),
+                ("public", "customers", "id", "integer"),
+            ]
+        }
+    )
+    schema = RedshiftWorkloadAdapter(querier=querier).fetch_schema(("public",))
+    assert schema == {
+        "public": {
+            "orders": {"id": "integer", "status": "character varying"},
+            "customers": {"id": "integer"},
+        },
+    }
+
+
+def test_fetch_schema_is_nested_by_schema():
+    rows = {
+        CAP_SCHEMA: [
+            ("sales", "orders", "id", "integer"),
+            ("sales", "orders", "status", "text"),
+            ("staging", "orders", "id", "integer"),
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    assert adapter.fetch_schema(("sales", "staging")) == {
+        "sales": {"orders": {"id": "integer", "status": "text"}},
+        "staging": {"orders": {"id": "integer"}},
+    }
 
 
 class _FakeCursor:
@@ -280,6 +430,33 @@ def test_a_refused_read_only_statement_degrades_rather_than_aborts(monkeypatch):
     # separate, already-pinned guarantee (test_no_statement_writes). What is missing is
     # the extra belt-and-braces defense, and the message must say which.
     assert "belt-and-braces" in reason.lower()
+
+
+def test_the_read_only_degradation_survives_past_fetch_workload(monkeypatch):
+    """A carried-forward item from Task 2: the read-only degradation above was recorded
+    correctly, but it could never reach a user, because `cli.py` calls `fetch_workload()`
+    immediately after `connect()` and that call raised `NotImplementedError` — an unhandled
+    exception that crashed the whole run before it ever reached the loop that prints
+    `adapter.degraded` to stderr. `fetch_workload` is now a real method, so that call
+    succeeds instead of raising, and `degraded` survives to be printed later.
+
+    This does not exercise `cli.py` end to end — `propose()` is still `NotImplementedError`
+    until Task 5/6 builds it, so a full `advise` run cannot complete yet — but it proves
+    the specific failure this task closes: the read-only warning is no longer lost between
+    `connect()` and the rest of the run.
+    """
+    seen: dict = {}
+    _install_fake_psycopg(monkeypatch, seen, fail_on=frozenset({READ_ONLY_SQL}))
+    adapter = RedshiftWorkloadAdapter()
+    adapter.connect(
+        ConnectionParams(engine="redshift", dsn="postgresql:///x", fields={}, source="--dsn"), 30
+    )
+    assert len(adapter.degraded) == 1  # the read-only degradation recorded by connect()
+
+    fetch = adapter.fetch_workload(None, 10)  # must not raise, and must not touch degraded
+    assert fetch.rows == ()
+    assert len(adapter.degraded) == 1
+    assert adapter.degraded[0][0] == DEGRADATION_READ_ONLY
 
 
 def test_the_read_only_degradation_message_is_scrubbed(monkeypatch):
