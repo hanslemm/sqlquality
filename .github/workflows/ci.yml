@@ -68,76 +68,51 @@ jobs:
   # failed on the wire for every default run. Each was invisible to `pytest` and to review.
   integration:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: sqlquality
-          POSTGRES_DB: sqlquality_test
-        # Same host port as tests/integration/docker-compose.yml, so one DSN describes both.
-        # `tests/test_ci_integration_job.py` pins these against the fixture's own constants:
-        # a port or database name that drifts here turns every live test into a skip, which
-        # this job's final step is specifically built to refuse.
-        ports:
-          - 27432:5432
-        # A service container cannot be given a command — GitHub's `services:` schema has no
-        # `command`/`entrypoint` key, and `options` is passed to `docker create` *before* the
-        # image, so the `-c shared_preload_libraries=...` flags the compose file uses cannot be
-        # expressed here. The preload is applied in the first step instead. What `options` is
-        # for is the health check: the job does not start its steps until Postgres answers.
-        options: >-
-          --health-cmd "pg_isready -U postgres -d sqlquality_test"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      # `pg_stat_statements` must be loaded by the postmaster at startup; `CREATE EXTENSION`
-      # alone leaves the extension installed and every read of its view failing. Since the
-      # service container's command cannot carry the flags, they are written with ALTER SYSTEM
-      # (which persists them to postgresql.auto.conf) and the container is restarted so the
-      # postmaster picks them up. `pg_reload_conf()` is not enough: both settings are
-      # postmaster-level, so a reload leaves them inactive with no error.
+      # Started with `docker run` rather than a `services:` container, and that is the whole
+      # reason this step exists in this shape. `pg_stat_statements` must be loaded by the
+      # postmaster at startup, but a service container cannot be given a command — GitHub's
+      # `services:` schema has no `command` key, and `options` is passed to `docker create`
+      # before the image, so the `-c shared_preload_libraries=...` flags cannot be expressed
+      # there at all.
       #
-      # `docker exec` rather than a host psql: the client is guaranteed to exist inside the
-      # postgres image, and no assumption is made about what the runner image ships.
-      - name: Preload pg_stat_statements and restart the service container
+      # The first attempt worked around that with `ALTER SYSTEM` plus a restart, and it failed
+      # on the real runner: `ALTER SYSTEM SET pg_stat_statements.track` is rejected with
+      # "unrecognized configuration parameter" because that setting does not exist until the
+      # library is loaded, which is precisely what the restart was meant to achieve. Ordering
+      # the two calls correctly would need two restarts. Running the container directly is
+      # simpler, and — more importantly — takes the same flags as
+      # tests/integration/docker-compose.yml, so the server this job tests against is
+      # configured from one description rather than two that can drift.
+      - name: Start Postgres with pg_stat_statements preloaded
         run: |
           set -euo pipefail
-          container="$(docker ps --filter ancestor=postgres:16 --format '{{.ID}}' | head -n1)"
-          if [ -z "$container" ]; then
-            echo "::error::no postgres:16 service container found — the service failed to start"
-            docker ps -a
-            exit 1
-          fi
-          # One `psql -c` per statement, deliberately: psql wraps multiple `-c` options in a
-          # single implicit transaction, and ALTER SYSTEM cannot run inside a transaction block.
-          docker exec "$container" psql -U postgres -d sqlquality_test -v ON_ERROR_STOP=1 \
-            -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements'"
-          # `pg_stat_statements.track = all` matters as much as the preload: the live suite
-          # covers nested statements (a DECLARE ... CURSOR unwrapped to its inner query), which
-          # only appear in pg_stat_statements under `track = all`.
-          docker exec "$container" psql -U postgres -d sqlquality_test -v ON_ERROR_STOP=1 \
-            -c "ALTER SYSTEM SET pg_stat_statements.track = 'all'"
-          docker restart "$container"
-          # The health check gates the *start of the job*, not a mid-job restart, so the wait
-          # is explicit. Failing here rather than letting the suite skip is the whole point:
-          # a server that never came back must not read as a pass.
-          for _ in $(seq 1 30); do
-            if docker exec "$container" pg_isready -U postgres -d sqlquality_test; then
+          docker run -d --name sqlquality-ci-pg \
+            -e POSTGRES_PASSWORD=sqlquality \
+            -e POSTGRES_DB=sqlquality_test \
+            -p 27432:5432 \
+            postgres:16 \
+            postgres -c shared_preload_libraries=pg_stat_statements \
+                     -c pg_stat_statements.track=all
+          # No health check gates a plain `docker run`, so wait explicitly. Failing here rather
+          # than letting the suite skip is the point: a server that never came up must not read
+          # as a pass, which is what the final step enforces.
+          for _ in $(seq 1 45); do
+            if docker exec sqlquality-ci-pg pg_isready -U postgres -d sqlquality_test; then
               break
             fi
             sleep 2
           done
-          docker exec "$container" pg_isready -U postgres -d sqlquality_test
-          # Prove both settings actually took effect before any test runs, so a failure here
-          # names the cause instead of surfacing as an error deep inside a fixture.
-          docker exec "$container" psql -U postgres -d sqlquality_test -tAc \
+          docker exec sqlquality-ci-pg pg_isready -U postgres -d sqlquality_test
+          # Prove both settings took effect before any test runs, so a misconfiguration names
+          # itself here instead of surfacing as an error deep inside a fixture.
+          docker exec sqlquality-ci-pg psql -U postgres -d sqlquality_test -tAc \
             "SELECT current_setting('shared_preload_libraries')" | grep -q pg_stat_statements
-          test "$(docker exec "$container" psql -U postgres -d sqlquality_test -tAc \
+          test "$(docker exec sqlquality-ci-pg psql -U postgres -d sqlquality_test -tAc \
             "SELECT current_setting('pg_stat_statements.track')")" = "all"
       # The `postgres` extra, since psycopg is what the live tests connect with. Not
       # `--all-extras`: nothing here needs the llm extra.

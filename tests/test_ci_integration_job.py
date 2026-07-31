@@ -5,11 +5,12 @@ it *can* do is pin every piece of wiring whose silent breakage would turn the li
 into something that never runs, which is the state this job was added to end:
 
 * the job existing at all;
-* the service publishing the port and creating the database the fixture actually looks for
-  (a mismatch makes every test skip, and a skip exits 0);
-* the two `pg_stat_statements` server settings, without which the suite connects and then
-  fails on every workload read;
-* the health check, and the step that refuses a run which skipped or executed nothing.
+* the step that starts the server publishing the port and creating the database the fixture
+  actually looks for (a mismatch makes every test skip, and a skip exits 0);
+* the two `pg_stat_statements` server flags, without which the suite connects and then fails on
+  every workload read;
+* the explicit readiness wait — `docker run` has no health check to gate the job's steps — and
+  the final step that refuses a run which skipped or executed nothing.
 
 Each of those is a one-line edit away from being silently wrong, and none of them is visible in
 a green run. `tests/integration/conftest.py`'s own constants are the source of truth here, so
@@ -50,59 +51,83 @@ def job(workflow: dict) -> dict:
     return workflow["jobs"][_JOB]
 
 
-@pytest.fixture(scope="module")
-def service(job: dict) -> dict:
-    services = job.get("services", {})
-    assert list(services) == ["postgres"], services
-    return services["postgres"]
-
-
 def _steps_text(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in job["steps"])
 
 
-def test_the_service_is_postgres_16(service: dict):
+@pytest.fixture(scope="module")
+def server_step(job: dict) -> str:
+    """The step that starts Postgres, as shell text.
+
+    Deliberately a step and not a `services:` container, and the history is worth keeping
+    because the obvious approach fails on a real runner. A service container cannot be given
+    a command — GitHub's schema has no `command` key, and `options` is passed to
+    `docker create` *before* the image — so the `-c shared_preload_libraries=…` flags the
+    compose file uses cannot be expressed there. The first version worked around that with
+    `ALTER SYSTEM` plus a restart and failed in CI: `ALTER SYSTEM SET
+    pg_stat_statements.track` is rejected outright with "unrecognized configuration
+    parameter", because that setting does not exist until the library is loaded — which is
+    what the restart was supposed to accomplish. Getting the order right would need two
+    restarts.
+
+    `docker run` takes the same flags as `tests/integration/docker-compose.yml`, so the
+    server CI tests against is described once rather than twice.
+    """
+    steps = [
+        str(step.get("run", ""))
+        for step in job["steps"]
+        if "docker run" in str(step.get("run", ""))
+    ]
+    assert len(steps) == 1, (
+        "expected exactly one step starting the server; found "
+        f"{len(steps)}. Without it the live suite skips itself and the job exits 0."
+    )
+    return steps[0]
+
+
+def test_the_server_is_postgres_16(server_step: str):
     """The live suite reads `pg_stat_statements` columns and `reltuples` semantics that are
     version-dependent; the compose file pins 16 and CI must not silently test another major."""
-    assert service["image"] == "postgres:16"
+    assert "postgres:16" in server_step
 
 
-def test_the_service_publishes_the_port_the_fixture_connects_to(service: dict):
+def test_the_server_publishes_the_port_the_fixture_connects_to(server_step: str):
     """A port that drifts from the fixture's makes every test skip — and pytest exits 0 on a
     skip, so the job would pass having run nothing. The final step catches that; this catches
     it earlier and says which side is wrong."""
-    assert [str(port) for port in service["ports"]] == [f"{DEFAULT_PORT}:5432"]
+    assert f"-p {DEFAULT_PORT}:5432" in server_step
 
 
-def test_the_service_creates_the_database_the_fixture_verifies(service: dict):
-    """`live_dsn` now fails when `current_database()` is not this name, so a change here would
-    turn the whole job red with a port-collision message that is not the real cause."""
-    assert service["env"]["POSTGRES_DB"] == EXPECTED_DATABASE
-    assert service["env"]["POSTGRES_PASSWORD"], "the fixture's DSN authenticates with a password"
+def test_the_server_creates_the_database_the_fixture_verifies(server_step: str):
+    """`live_dsn` fails when `current_database()` is not this name, so a change here would turn
+    the whole job red with a port-collision message that is not the real cause."""
+    assert f"POSTGRES_DB={EXPECTED_DATABASE}" in server_step
+    assert "POSTGRES_PASSWORD=" in server_step, "the fixture's DSN authenticates with a password"
 
 
-def test_the_service_has_a_health_check_so_steps_wait_for_the_server(service: dict):
-    """Without it the first step races the server's startup and the whole job fails
-    intermittently, which reads as flakiness rather than as a missing wait."""
-    options = service["options"]
-    assert "--health-cmd" in options
-    assert "pg_isready" in options
-    assert "--health-retries" in options
+def test_ci_waits_for_the_server_before_running_anything(server_step: str):
+    """`docker run` has no health check to gate the job's steps, so the wait is explicit.
+    Without it the suite races startup, every test skips itself, and the job exits 0 — the
+    exact silent no-op this job was added to end. The final `pg_isready` outside the retry
+    loop is what turns a server that never came up into a failure rather than a skip."""
+    assert "pg_isready" in server_step
+    assert "seq 1" in server_step, "a bounded retry loop, not a single optimistic check"
 
 
-def test_ci_sets_both_pg_stat_statements_server_settings(job: dict):
+def test_ci_passes_both_pg_stat_statements_settings_as_server_flags(server_step: str):
     """Neither can be reached by `CREATE EXTENSION`: `shared_preload_libraries` is loaded at
     postmaster start, and `track = all` is what makes nested statements (the DECLARE ... CURSOR
-    case the live suite unwraps) appear at all. A service container takes no command, so these
-    are applied by a step — and a step is exactly the kind of thing that gets dropped in an
-    edit."""
-    steps = _steps_text(job)
-    assert "shared_preload_libraries = 'pg_stat_statements'" in steps
-    assert "pg_stat_statements.track = 'all'" in steps
-    assert "docker restart" in steps, (
-        "both settings are postmaster-level, so pg_reload_conf() leaves them inactive with no "
-        "error — the container has to be restarted"
-    )
+    case the live suite unwraps) appear at all.
+
+    Asserted as **command flags**, which is the only form that works. Applying them with
+    `ALTER SYSTEM` and a restart was tried and failed in CI: `ALTER SYSTEM SET
+    pg_stat_statements.track` is rejected with "unrecognized configuration parameter", because
+    the setting does not exist until the library is loaded. These same two flags appear in
+    `tests/integration/docker-compose.yml`; a drift between the two would mean local and CI
+    runs test differently configured servers.
+    """
+    assert "-c shared_preload_libraries=pg_stat_statements" in server_step
+    assert "-c pg_stat_statements.track=all" in server_step
 
 
 def test_ci_verifies_the_preload_took_effect_before_running_any_test(job: dict):
