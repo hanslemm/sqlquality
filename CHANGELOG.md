@@ -5,9 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-03
+
+`advise` is new in this release. Everything below describes it as it ships; it has no
+previously-released behaviour, so there is no "Fixed" section — bugs found and fixed while
+building it are in the git history, not here.
 
 ### Added
+
+- `sqlquality advise` — reads Postgres query history (`pg_stat_statements`) and catalog
+  metadata over a read-only connection and proposes indexes, index removals, partial
+  indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV008), with a `--json`
+  and `--markdown` report and a reviewable `--ddl` script.
 
 - `sqlquality advise --engine redshift` — reads Redshift query history
   (`sys_query_history`) and catalog metadata (`svv_columns`, `svv_table_info`,
@@ -25,32 +34,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dbt-enrichment path Postgres's index proposals use. **Redshift's introspection SQL has
   not been executed against a live cluster** — see the README's `advise` section for what
   is and is not verified, and run `--dry-run` before pointing this at production.
-- `sqlquality advise` — reads Postgres query history (`pg_stat_statements`) and catalog
-  metadata over a read-only connection and proposes indexes, index removals, partial
-  indexes, sargability fixes and `SELECT *` cleanups (ADV001–ADV008), with a `--json`
-  and `--markdown` report and a reviewable `--ddl` script.
+
 - `advise` supports multiple `--schema` flags: every catalog fact (table sizes, NDV,
   index lists, generated DDL) is keyed by `schema.table`, so same-named tables in
   different introspected schemas no longer alias into one another.
+
 - ADV007 proposes an index on a hot, unindexed join key; ADV008 proposes a composite
   index for a hot `GROUP BY`.
-- Overlapping proposals are reconciled before the report is written, so the eight rules
-  cannot contradict each other: two rules reaching identical DDL collapse into one entry,
-  and a proposed index whose columns are a leading prefix of another proposed index for the
-  same table collapses into the wider one (creating both would have produced a pair ADV003
-  flags as redundant on the next run). The absorbed proposal's rationale and confidence are
-  folded into the survivor's, attributed by rule code; its `evidence` block is **not**
-  merged and is discarded. Two proposals covering the same columns in a different order are
-  both kept, each naming the other. Consequence for `--json` consumers: a rule can fire and
-  contribute no entry of its own to `proposals`, so counting entries by `code` is not a
-  count of which rules matched.
-- ADV001 now requires the columns of a composite candidate to co-occur in at least one query
-  group, and reports that joint count as `co_occurring_fingerprints` in place of the former
-  per-column `fingerprints`. Previously a near-free query could contribute a column to the
-  middle of an otherwise correct composite, producing an index that no query used and that
-  could no longer satisfy the hot query's `ORDER BY`.
-- ADV003 is scoped to the tables the workload was observed using, like ADV002 — it no longer
-  proposes `DROP INDEX` for a relation the run never analysed.
+
+- Overlapping proposals are reconciled before the report is written, so no two rules can
+  advise contradictory work on one relation. On Postgres: two rules reaching identical DDL
+  collapse into one entry, and a proposed index whose columns are a leading prefix of another
+  proposed index for the same table collapses into the wider one (creating both would have
+  produced a pair ADV003 flags as redundant on the next run). On Redshift, where the conflict
+  is between whole strategies rather than prefixes, an ADV103 `DISTSTYLE ALL` withholds the
+  ADV102 `DISTKEY` proposal for the same relation, since `ALL` subsumes it — otherwise an
+  operator would run one hours-long table rewrite and then a second undoing it. The absorbed
+  proposal's rationale and confidence are folded into the survivor's, attributed by rule code;
+  its `evidence` block is **not** merged and is discarded. Two proposals covering the same
+  columns in a different order are both kept, each naming the other. Consequence for `--json`
+  consumers: a rule can fire and contribute no entry of its own to `proposals`, so counting
+  entries by `code` is not a count of which rules matched.
+
+- A composite index proposal requires its columns to co-occur in at least one query group, and
+  reports that joint count as `co_occurring_fingerprints` rather than a per-column
+  `fingerprints` — so the number beside a multi-column proposal is the support for *that
+  combination*, not the highest support any one column has. ADV001, ADV004 and ADV008 all
+  report it; the single-candidate rules (ADV005, ADV007) keep a per-column count, which for
+  them is the whole truth.
+
 - Optional dbt enrichment for `advise`: `--project-dir` (reads
   `<project-dir>/target/manifest.json`) or `--manifest <path>` layers dbt model metadata
   onto the same analysis, and every manifest-free `advise` invocation is proven
@@ -86,74 +98,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped from matching (not guessed at) and counted in the CLI disclosure and the JSON
   payload's `dbt.dropped_collisions`.
 
-### Fixed
-
-- CI now runs the 23 live-Postgres integration tests, in a job with a `postgres:16` service
-  container that has `pg_stat_statements` preloaded. Until now they ran only on a contributor's
-  own machine, while this feature's live suite was repeatedly the only thing that caught a
-  whole class of bug — a `reltuples = -1` sentinel that suppressed every proposal, redaction
-  dismembering `$N` placeholders, a `toplevel` filter that produced confidently-wrong advice,
-  and a workload statement that failed on the wire for every default run. The job fails if the
-  suite skipped or executed nothing, since every one of those tests skips itself when no server
-  answers and `pytest` exits 0 on a skip.
-- The integration compose file publishes host port 27432 instead of 55432, which collided with
-  an unrelated container in practice — and because `docker compose up` neither binds nor fails
-  in that case, the suite silently talked to whatever else was listening. The fixture now also
-  verifies which server answered (database name, and `pg_stat_statements` in
-  `shared_preload_libraries`) and fails naming a port collision as the likely cause, rather
-  than trusting that a successful connection reached the right database.
-- `--ddl`'s guarantee that every line of the generated script is either an intended statement
-  or a `--` comment now holds for all ten codepoints `str.splitlines()` treats as a line
-  boundary, on both the Postgres and Redshift renderers. The guard tested only `\n` and `\r`,
-  while everything that splits the text uses `splitlines()`, so an introspected identifier
-  containing `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `U+2028` or `U+2029` — all legal
-  inside a quoted Postgres identifier — produced a second physical line the guard never
-  examined, and the tail of the statement was emitted looking like a bare statement of its own.
-- ADV004 (partial index) now consults the existing-index list, which it was alone among the
-  index-creating rules in never doing. A plain index leading with the guarded column now
-  suppresses the proposal — that index already serves the lookup, and the partial index's only
-  advantage is a size saving this tool cannot measure against a second index's write cost (and
-  which ADV003 would never flag as redundant, since its prefix check is restricted to plain
-  indexes). Where a check genuinely could not run it is now stated rather than skipped: an
-  unreadable existing-index list caps confidence at LOW and says so, and an existing *partial*
-  or expression index that leads with the same column is named, since sqlquality does not
-  compare index predicates and so cannot tell whether the proposal is already applied. New
-  evidence keys `partial_indexes_not_compared` and `expression_indexes`; deliberately not
-  ADV001's `partial_indexes_skipped`, which records a different fact.
-- dbt enrichment now discloses itself in the terminal on **every** engine. The stderr
-  disclosure line counted only ADV302's config-block rewrite, which no Redshift proposal can
-  reach (nothing Redshift emits is a `CREATE INDEX`), so a `--project-dir` run on Redshift
-  warned in `rationale` and in the `--ddl` note that `dbt run` may undo an hours-long
-  full-table rewrite while the terminal row stayed byte-identical to a dbt-free run. Any
-  proposal whose DDL cannot be expressed as dbt config is now counted and reported too, as is
-  an index *drop* (ADV002, ADV003) on a dbt-managed relation — the case reachable on Postgres,
-  where a run proposing only drops enriched every one of them and still said nothing, so an
-  operator applied a drop that the next `dbt run` recreated from the model's `indexes:` config.
-  Each of the three outcomes is reported as its own clause, because each calls for a different
-  action: paste a config block, expect a runnable statement not to survive the next rebuild, or
-  delete a config entry as well as running the drop.
-- `IS NOT NULL` predicates were classified as `IS NULL` when sqlglot 30.13 or newer was
-  installed, because that release moved the negation from a wrapping `Not` node onto a
-  `negate` flag on the `Is` node itself. Both encodings are now read. This was not cosmetic:
-  ADV004 turns these roles directly into a partial index's `WHERE` clause, so it proposed
-  `WHERE col IS NULL` for a workload filtering `WHERE col IS NOT NULL` — an index over exactly
-  the complement of the intended rows. `uv.lock` pins 30.12, so development and CI never saw
-  it while any fresh `pip install sqlquality` resolved a newer 30.x and did. CI now also runs
-  the suite against the highest versions the declared dependency ranges allow.
-- `advise` unwraps `DECLARE ... CURSOR FOR` and `COPY (...) TO` reads to their inner
-  query before filtering, so server-side-cursor and `COPY`-based workloads (what
-  psycopg2, Django and SQLAlchemy emit for large result sets) reach the analysis
-  instead of being discarded as maintenance statements.
-- Connections resolve from `--dsn`, `SQLQUALITY_DSN`, or a dbt `profiles.yml`, in that
-  order. dbt is optional throughout.
-- `advise --dry-run` prints every introspection statement without connecting.
-- Optional extras `sqlquality[postgres]` and `sqlquality[warehouse]`.
+- `advise` resolves connections from `--dsn`, the `SQLQUALITY_DSN` environment variable, or a
+  dbt `profiles.yml`, in that order. dbt is optional throughout: every `advise` invocation
+  behaves identically without a manifest, which is verified by comparing stdout, JSON, markdown
+  and the DDL file byte-for-byte.
+- `advise --dry-run` prints every introspection statement the chosen engine can issue, and
+  exits without connecting — so the exact reads can be audited, or handed to a DBA, before any
+  credential is used.
+- `advise` unwraps `DECLARE ... CURSOR FOR` and `COPY (...) TO` reads to their inner query
+  before filtering, so server-side-cursor and `COPY`-based workloads — what psycopg2, Django
+  and SQLAlchemy emit for large result sets — reach the analysis instead of being discarded as
+  maintenance traffic. Note that on Postgres a cursor's cost is attributed to its `FETCH`
+  statements, so such a read contributes its predicate columns but little of its cost.
+- Optional extras `sqlquality[postgres]` and `sqlquality[warehouse]`, both currently psycopg.
+  Without one, `advise` exits with an install hint rather than a traceback.
+- Every line of the `--ddl` script is either a statement `advise` intends or a `--` comment,
+  including when an introspected identifier contains a character `str.splitlines()` treats as a
+  line boundary. sqlquality never executes the script.
 
 ### Changed
 
-- The "static tool, never connects" claim is now scoped: sqlquality never executes your
-  SQL, and only `advise` opens a (read-only, metadata-only) connection.
+- The "static tool, never connects" claim is now scoped: sqlquality never executes your SQL,
+  and only `advise` opens a connection — read-only, metadata-only, with a statement timeout.
 - Query literals are redacted at ingest by default; `--keep-literals` opts back in.
+
+### Known limitations
+
+- **Redshift's introspection SQL has never been executed against a live cluster.** Its
+  connection path is verified against a real server (Redshift speaks the PostgreSQL wire
+  protocol) and every statement is syntax-checked and proven bindable, but the column names and
+  proposal semantics come from AWS documentation. Run `advise --engine redshift --dry-run` and
+  check the statements against your cluster before relying on the output — and please report
+  what you find.
+- Snowflake is designed but not implemented; `advise` supports `postgres` and `redshift`.
+- `advise`'s remaining engine-specific caveats — cursor cost attribution, `COPY` and PL/pgSQL
+  double-counting under `pg_stat_statements.track = all`, Redshift's `--limit` semantics, and
+  what `svv_table_info` absence cannot distinguish — are documented in the README's Limitations
+  section rather than repeated here.
 
 ## [0.2.0] - 2026-07-20
 
