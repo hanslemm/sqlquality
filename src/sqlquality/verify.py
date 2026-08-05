@@ -13,6 +13,9 @@ different recommendations into one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+
+from sqlquality.models import Confidence
 
 
 def proposal_key(proposal: dict[str, object]) -> tuple[str, ...] | None:
@@ -257,3 +260,189 @@ def group_index(payload: dict[str, object]) -> dict[str, dict[str, object]]:
         if isinstance(digest, str):
             index[digest] = group
     return index
+
+
+class WindowRelation(str, Enum):
+    """How comparable two `advise --json` payloads' `"window"` objects are — and
+    therefore what confidence, if any, a verdict built from them may claim.
+
+    Every field the `"window"` object carries (`engine`, `stats_reset_at`, `since`,
+    `limit`) is *present-but-null* rather than absent when the engine cannot supply it
+    (see `report.py`'s `advise_report_payload`): `null` means "this engine cannot tell
+    you," not a value comparable to anything — including another `null`. Every rule below
+    exists to keep that distinction intact; see `classify_windows` for the exact decision
+    order and the rulings each guards against.
+
+    * `DISJOINT` — both sides' `stats_reset_at` are non-null and differ: the counters were
+      cleared between the two runs, so the two measurements are independent samples. The
+      strongest relation this module reports.
+    * `COMPARABLE` — both sides' `since` are non-null and equal: both runs measured the
+      same explicit duration by construction.
+    * `NESTED` — both sides' `stats_reset_at` are non-null and equal, and both sides'
+      `since` are null: the common Postgres case — baselined once, never reset since.
+      `pg_stat_statements` is cumulative, so the later window's counters necessarily
+      *contain* the earlier window's; a real improvement is still visible, just diluted by
+      pre-change executions.
+    * `INCOMPARABLE` — every other case: the engines differ or either window is
+      missing/malformed (checked first, ahead of every other rule); a `stats_reset_at`
+      pair with a null on either side, which is missing information rather than evidence
+      of a reset; both `stats_reset_at` and both `since` null on both sides, which is no
+      evidence about either window's extent at all; `since` set on only one side, meaning
+      one run filtered its window and the other did not; `since` set on both sides but
+      unequal, which is two different explicit cutoffs rather than the reset-driven
+      containment that earns `NESTED` its grade.
+
+    `limit` — how many query groups a run sampled — plays no part in this classification.
+    See `window_limits` for why that fact is exposed separately instead of being folded
+    into the relation or the confidence it earns.
+    """
+
+    DISJOINT = "disjoint"
+    COMPARABLE = "comparable"
+    NESTED = "nested"
+    INCOMPARABLE = "incomparable"
+
+
+#: The spec's fixed mapping from relation to confidence. A plain lookup rather than a
+#: re-derivation: the grading judgement already happened in `classify_windows`, which
+#: earned each relation by the specific fact it detected (or the absence of one, for
+#: `INCOMPARABLE`). This table only attaches the number the spec assigns to that fact.
+_CONFIDENCE_BY_RELATION: dict[WindowRelation, Confidence] = {
+    WindowRelation.DISJOINT: Confidence.HIGH,
+    WindowRelation.COMPARABLE: Confidence.HIGH,
+    WindowRelation.NESTED: Confidence.MEDIUM,
+    WindowRelation.INCOMPARABLE: Confidence.LOW,
+}
+
+
+def confidence_for(relation: WindowRelation) -> Confidence:
+    """The confidence grade every downstream verdict may claim for this window relation.
+
+    See `WindowRelation`'s docstring for why each grade is what it is; this function only
+    looks the fixed mapping up, so a fifth relation added to the enum without an entry
+    here raises `KeyError` rather than silently defaulting to some existing grade.
+    """
+    return _CONFIDENCE_BY_RELATION[relation]
+
+
+def classify_windows(before: dict[str, object], after: dict[str, object]) -> WindowRelation:
+    """How comparable `before` and `after`'s `"window"` objects are, per `WindowRelation`.
+
+    `before` and `after` are the two payloads' top-level dicts (matching the brief's own
+    `classify_windows({"window": w}, {"window": dict(w)})`), not the `"window"` objects
+    themselves — this function reads `["window"]` out of each.
+
+    Checked in this order, each rule guarding against a specific way an *absence* of
+    evidence could be mistaken for evidence of a relation:
+
+    1. **Engines first.** If either `"window"` is missing, not a dict, or its `engine` is
+       missing/not a string, or the two `engine` values differ, the answer is
+       `INCOMPARABLE` before any other rule runs. A Postgres mean and a Redshift mean
+       measure different servers, and nothing below this line can override that.
+    2. **`DISJOINT`.** Requires both `stats_reset_at` non-null *and* different. A null on
+       either side is missing information, not evidence the counters were cleared — the
+       brief's own wording ("`stats_reset_at` differs between runs") would fire for a
+       null-versus-timestamp pair, which is why the non-null requirement is explicit
+       here rather than left to `!=` alone (`None != "T"` is `True`).
+    3. **`COMPARABLE`.** Both `since` non-null and equal: equal durations by construction.
+    4. **`NESTED`.** Both `stats_reset_at` non-null and equal, *and* both `since` null.
+       The `since`-null requirement is what stops two payloads with nothing to report on
+       either field (`stats_reset_at` null on both, `since` null on both) from reading as
+       "same `stats_reset_at`, no `since`" under the brief's literal wording: `None ==
+       None` is `True`, so without the explicit non-null check on `stats_reset_at` here
+       too, that double-absence would wrongly earn `NESTED`'s `MEDIUM` — a grade meant for
+       the demonstrated fact that counters were *not* reset, not for knowing nothing.
+    5. **Otherwise, `INCOMPARABLE`.** Covers `since` set on only one side (one run
+       filtered its window, the other did not — no rule above matches, since `COMPARABLE`
+       needs both non-null and `NESTED` needs both null); `since` set on both sides but
+       unequal (two different explicit cutoffs, a different claim from the reset-driven
+       containment that earns `NESTED` — deliberately not given a second, directional
+       meaning of `NESTED` here); and both `stats_reset_at` and both `since` null.
+
+    A pair with both a differing, non-null `stats_reset_at` *and* an equal, non-null
+    `since` is graded `DISJOINT`, not `COMPARABLE` — rule 2 runs before rule 3. No engine
+    shipped today can produce this (Postgres never reports `since`; Redshift never
+    reports `stats_reset_at`), but a malformed or hand-built artifact could, and
+    "counters were cleared, independent samples" is the more specific fact of the two
+    when both are present.
+
+    Never raises. Every field is read with `.get` and compared with `==`/`!=`/`is`, none
+    of which can raise on a value of unexpected type, so a malformed or partial
+    `"window"` degrades to `INCOMPARABLE` rather than raising — Task 7 validates the
+    payload shape before handing artifacts here, but this function does not assume that
+    already happened, exactly like `proposal_key` above does not assume `evidence` is
+    well-formed.
+    """
+    before_window = before.get("window")
+    after_window = after.get("window")
+    if not isinstance(before_window, dict) or not isinstance(after_window, dict):
+        return WindowRelation.INCOMPARABLE
+
+    before_engine = before_window.get("engine")
+    after_engine = after_window.get("engine")
+    if (
+        not isinstance(before_engine, str)
+        or not isinstance(after_engine, str)
+        or before_engine != after_engine
+    ):
+        return WindowRelation.INCOMPARABLE
+
+    before_reset = before_window.get("stats_reset_at")
+    after_reset = after_window.get("stats_reset_at")
+    before_since = before_window.get("since")
+    after_since = after_window.get("since")
+
+    if before_reset is not None and after_reset is not None and before_reset != after_reset:
+        return WindowRelation.DISJOINT
+
+    if before_since is not None and after_since is not None and before_since == after_since:
+        return WindowRelation.COMPARABLE
+
+    if (
+        before_reset is not None
+        and after_reset is not None
+        and before_reset == after_reset
+        and before_since is None
+        and after_since is None
+    ):
+        return WindowRelation.NESTED
+
+    return WindowRelation.INCOMPARABLE
+
+
+def window_limits(
+    before: dict[str, object], after: dict[str, object]
+) -> tuple[int | None, int | None]:
+    """`(before_limit, after_limit)` — the raw `--limit` each side's window reports.
+
+    **For Task 6: read this before grading any `disappeared` verdict.** `limit` is how
+    many query groups a run sampled, and it plays no part in `classify_windows`'s
+    relation or `confidence_for`'s grade — a differing `limit` does not make two windows
+    more or less comparable as *measurements*. But it changes what a missing query group
+    *means*: if `before_limit != after_limit`, or either is `None`, a query group present
+    in one artifact's `query_groups` and absent from the other's **may be a sampling
+    artifact rather than a real disappearance** — a smaller `limit` can drop a group from
+    the sampled set with no change to the group's underlying workload at all. Task 6 must
+    not report a group as gone on the strength of a smaller `limit` alone, and must
+    surface the mismatch (or the unknown) alongside any `disappeared` verdict it grades,
+    rather than silently trusting the absence.
+
+    Deliberately kept out of `classify_windows`'s relation and out of `confidence_for`'s
+    grade (Ruling 6): folding it in there would let a sampling difference silently change
+    a verdict's stated confidence instead of being reported as the distinct fact it is.
+
+    Returns `None` for a side whose `"window"` is missing/not a dict, or whose `limit` is
+    not an `int` — including the null case both engines report whenever `--limit` was not
+    passed. Never raises. A `None` here carries the same "cannot rule out a sampling
+    explanation" weight as a genuine mismatch: it is not evidence the limits matched, so
+    Task 6 should treat it at least as cautiously as a demonstrated difference, never more
+    leniently.
+    """
+    before_window = before.get("window")
+    after_window = after.get("window")
+    before_limit = before_window.get("limit") if isinstance(before_window, dict) else None
+    after_limit = after_window.get("limit") if isinstance(after_window, dict) else None
+    return (
+        before_limit if isinstance(before_limit, int) else None,
+        after_limit if isinstance(after_limit, int) else None,
+    )

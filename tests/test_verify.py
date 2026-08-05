@@ -1,14 +1,29 @@
 """Tests for `sqlquality.verify`'s matching layer: `proposal_key`, `index_proposals`,
-`group_index`.
+`group_index`; and its window-classification layer: `WindowRelation`, `classify_windows`,
+`confidence_for`, `window_limits`.
 
 Every evidence shape used here is copied from the real rule that emits it (see
 `src/sqlquality/workload/postgres.py` and `src/sqlquality/workload/redshift.py`), not
 invented, so a test failure here means the real rule's evidence would be mis-keyed too.
+The window shapes below are likewise copied from `report.py`'s real `"window"` object
+(`description`, `engine`, `stats_reset_at`, `since`, `limit`, all keys always present,
+values nullable) — see `postgres.py`'s and `redshift.py`'s `window_facts()` for which
+fields each engine can and cannot supply.
 """
 
 from __future__ import annotations
 
-from sqlquality.verify import ProposalIndex, group_index, index_proposals, proposal_key
+from sqlquality.models import Confidence
+from sqlquality.verify import (
+    ProposalIndex,
+    WindowRelation,
+    classify_windows,
+    confidence_for,
+    group_index,
+    index_proposals,
+    proposal_key,
+    window_limits,
+)
 
 
 # --- relation-scoped, plural `columns` (ADV001, ADV002, ADV003, ADV004, ADV007, ADV008) ---
@@ -454,3 +469,271 @@ def test_group_index_skips_a_group_with_no_usable_digest():
 
 def test_group_index_on_a_payload_with_no_query_groups_list():
     assert group_index({}) == {}
+
+
+# --- classify_windows / confidence_for / window_limits ---
+#
+# `classify_windows` takes the two top-level payload dicts (matching
+# `classify_windows({"window": w}, {"window": dict(w)})` in the brief), not the `"window"`
+# sub-objects directly, and reads `["window"]` out of each itself.
+
+
+def test_the_same_stats_reset_means_the_later_window_contains_the_earlier():
+    """This is the common Postgres case — baselined last week, never reset. The comparison
+    is still worth making, but a real improvement is diluted by pre-change executions, so
+    it is graded MEDIUM rather than HIGH and the report says so."""
+    w = {"engine": "postgres", "stats_reset_at": "2026-08-01T00:00:00", "since": None, "limit": 500}
+    assert classify_windows({"window": w}, {"window": dict(w)}) is WindowRelation.NESTED
+    assert confidence_for(WindowRelation.NESTED) is Confidence.MEDIUM
+
+
+def test_two_engines_are_never_comparable():
+    """A Postgres mean and a Redshift mean measure different servers. Grading this at all
+    would be inventing a comparison."""
+    before = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": 500}}
+    after = {"window": {"engine": "redshift", "stats_reset_at": None, "since": "T2", "limit": 500}}
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+    assert confidence_for(WindowRelation.INCOMPARABLE) is Confidence.LOW
+
+
+def test_disjoint_requires_both_stats_reset_at_non_null_and_different():
+    """Two Postgres runs whose `stats_reset_at` genuinely differ: the counters were
+    cleared between them, so they are two independent samples — the strongest relation."""
+    before = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-04T00:00:00",
+            "since": None,
+            "limit": 500,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.DISJOINT
+    assert confidence_for(WindowRelation.DISJOINT) is Confidence.HIGH
+
+
+def test_ruling_1_a_null_stats_reset_at_paired_with_a_timestamp_is_not_disjoint():
+    """The brief's own wording ('differs between runs') would fire for a null-versus-
+    timestamp pair. That pair is *missing information* on one side, not evidence the
+    counters were cleared, so it must not be graded DISJOINT — or anything but
+    INCOMPARABLE, since nothing else can be concluded either."""
+    before = {"window": {"engine": "redshift", "stats_reset_at": None, "since": None, "limit": 500}}
+    after = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": "2026-08-04T00:00:00",
+            "since": None,
+            "limit": 500,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+
+
+def test_comparable_requires_both_since_set_and_equal():
+    """Two Redshift runs with the same explicit `--since` cutoff: equal durations by
+    construction, regardless of `stats_reset_at` (Redshift never sets it)."""
+    before = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": "2026-08-01T00:00:00",
+            "limit": 200,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.COMPARABLE
+    assert confidence_for(WindowRelation.COMPARABLE) is Confidence.HIGH
+
+
+def test_ruling_2_both_stats_reset_at_and_both_since_null_is_incomparable_not_nested():
+    """Under the brief's literal wording, two nulls read as 'same `stats_reset_at`, no
+    `since`' and would be graded NESTED/MEDIUM. Two nulls mean nothing is known about
+    either window's extent — NESTED's MEDIUM must be earned by the demonstrated fact
+    that counters were not reset, never handed out for an absence of information."""
+    before = {"window": {"engine": "redshift", "stats_reset_at": None, "since": None, "limit": 500}}
+    after = {"window": {"engine": "redshift", "stats_reset_at": None, "since": None, "limit": 500}}
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+
+
+def test_ruling_4_since_set_on_only_one_side_is_incomparable():
+    """One run filtered its window with `--since` and the other did not; there is no
+    defensible relation between the two, even if `stats_reset_at` happens to match."""
+    before = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    after = {"window": {"engine": "redshift", "stats_reset_at": None, "since": None, "limit": 500}}
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+
+
+def test_ruling_4_one_sided_since_is_incomparable_even_with_matching_reset():
+    """Guards the AND, not just the overall fallback: even when `stats_reset_at`
+    matches on both sides (which no real engine produces alongside a `since` value
+    today, but a malformed or hand-built artifact could), `since` set on only one side
+    must still read as INCOMPARABLE rather than let a permissive "not both `since` set"
+    condition smuggle it into NESTED."""
+    before = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "limit": 500,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+
+
+def test_ruling_5_since_set_on_both_sides_but_unequal_is_incomparable():
+    """Two different explicit cutoffs is a different claim from the reset-driven
+    containment that earns NESTED its MEDIUM — reusing that reasoning here would be a
+    different claim wearing the same label, so this is graded exactly as no relation at
+    all, not as a directional containment."""
+    before = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": "2026-08-02T00:00:00",
+            "limit": 500,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.INCOMPARABLE
+
+
+def test_disjoint_is_checked_before_comparable_when_both_conditions_hold():
+    """No real payload can produce both a differing, non-null `stats_reset_at` pair and an
+    equal, non-null `since` pair at once (Postgres never sets `since`; Redshift never sets
+    `stats_reset_at`), but a malformed or hand-built artifact could. `DISJOINT`'s cleared-
+    counters fact is graded ahead of `COMPARABLE`'s equal-duration fact when both are
+    present — see `classify_windows`'s docstring for why."""
+    before = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-04T00:00:00",
+            "since": "2026-08-01T00:00:00",
+            "limit": 500,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.DISJOINT
+
+
+def test_classify_windows_does_not_raise_on_a_malformed_or_partial_window():
+    """Task 7 validates the payload shape before this runs; this function must not assume
+    that already happened. A missing `"window"` key, a `"window"` that is not a dict, and
+    a window missing/mistyping `engine` must all degrade to INCOMPARABLE rather than
+    raise."""
+    good = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": 1}}
+    assert classify_windows({}, good) is WindowRelation.INCOMPARABLE
+    assert classify_windows({"window": "not-a-dict"}, good) is WindowRelation.INCOMPARABLE
+    assert classify_windows({"window": {}}, good) is WindowRelation.INCOMPARABLE
+    assert (
+        classify_windows({"window": {"engine": None, "stats_reset_at": "T"}}, good)
+        is WindowRelation.INCOMPARABLE
+    )
+    assert classify_windows({}, {}) is WindowRelation.INCOMPARABLE
+
+
+def test_confidence_for_grades_every_relation_per_the_spec():
+    """A classifier where three of four rungs are pinned and one is only implied is
+    precisely the defect this checks against: every member of `WindowRelation` is
+    asserted individually, and the set comparison catches a fifth relation being added
+    without a matching confidence entry."""
+    expected = {
+        WindowRelation.DISJOINT: Confidence.HIGH,
+        WindowRelation.COMPARABLE: Confidence.HIGH,
+        WindowRelation.NESTED: Confidence.MEDIUM,
+        WindowRelation.INCOMPARABLE: Confidence.LOW,
+    }
+    assert set(WindowRelation) == set(expected)
+    for relation, confidence in expected.items():
+        assert confidence_for(relation) is confidence
+
+
+# --- window_limits (Ruling 6) ---
+
+
+def test_window_limits_returns_the_raw_pair():
+    before = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": 500}}
+    after = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": 200}}
+    assert window_limits(before, after) == (500, 200)
+
+
+def test_window_limits_treats_a_missing_or_non_int_limit_as_unknown_not_zero():
+    """`None` here must carry the same weight as a genuine mismatch for Task 6 — it is not
+    evidence the limits were equal."""
+    before = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": None}}
+    after = {"window": {"engine": "postgres", "stats_reset_at": "T", "since": None, "limit": "500"}}
+    assert window_limits(before, after) == (None, None)
+
+
+def test_window_limits_does_not_raise_on_a_malformed_window():
+    assert window_limits({}, {}) == (None, None)
+    assert window_limits({"window": "not-a-dict"}, {"window": "not-a-dict"}) == (None, None)
+
+
+def test_a_differing_limit_does_not_change_the_window_relation_or_confidence():
+    """Ruling 6: `limit` is recorded and passed on via `window_limits`, but it must not be
+    folded into `classify_windows`'s relation or `confidence_for`'s grade. The same window
+    pair as the NESTED test above, but with different `limit` values on each side, must
+    still classify as NESTED at MEDIUM — and `window_limits` must still report the
+    mismatch for Task 6 to consume separately."""
+    before = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "limit": 500,
+        }
+    }
+    after = {
+        "window": {
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "limit": 50,
+        }
+    }
+    assert classify_windows(before, after) is WindowRelation.NESTED
+    assert confidence_for(classify_windows(before, after)) is Confidence.MEDIUM
+    assert window_limits(before, after) == (500, 50)
