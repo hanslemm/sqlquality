@@ -2040,6 +2040,18 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
         Only within one relation: a prefix relationship across two different tables is
         meaningless. Only plain proposals participate — see `_index_creation_columns`.
+
+        **An absorbed proposal's `evidence` — including its own `fingerprint_digests` — is
+        discarded along with it, not merged into the survivor's.** `_fold_discarded` carries
+        forward the absorbed proposal's distinguishing *rationale* sentences, but nothing
+        merges the two proposals' `evidence` dicts, so the survivor's `fingerprint_digests`
+        stays exactly what it already was — the query groups that motivated *it*, not the
+        union of both. This is pre-existing behaviour (`_dedupe_by_ddl` throws evidence away
+        identically), not a regression, and it produces no dangling reference: every digest
+        the survivor cites still resolves to a real query group. But it does mean a
+        surviving proposal's `fingerprint_digests` can be a strict subset of every query
+        group that actually motivated *some* proposal now folded into it — worth knowing for
+        whoever builds `sqlquality verify`'s "did this proposal's evidence hold up" check.
         """
         eligible: dict[int, tuple[Relation, tuple[str, ...]]] = {}
         for i, proposal in enumerate(proposals):

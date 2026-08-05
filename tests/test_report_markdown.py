@@ -777,4 +777,36 @@ def test_markdown_renders_evidence_the_way_json_does():
         proposals, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
     )
     assert "columns=['status', 'created_at']" in md
+
+
+def test_markdown_suppresses_fingerprint_digests_but_keeps_the_human_count():
+    """`fingerprint_digests` is a machine correlation key for `sqlquality verify` — a list
+    of opaque 12-character hashes, one per backing query group, meaningless to a human
+    reading a report. For a proposal backed by many query groups this would print a line
+    full of hashes where the human-relevant number (`co_occurring_fingerprints`) is already
+    right beside it. `--json` still carries the key; only `--markdown` must not."""
+    digests = ("00b9a0c6bf02", "11c0b1d7c013", "22d1c2e8d124")
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="Add index on orders(status, created_at)",
+            rationale="r",
+            evidence={
+                "co_occurring_fingerprints": len(digests),
+                "fingerprint_digests": digests,
+                "cost_share": 0.5,
+            },
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        proposals, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "fingerprint_digests" not in md
+    for digest in digests:
+        assert digest not in md
+    # The suppression must not swallow the whole evidence line, nor the human-meaningful
+    # count that sits beside the suppressed key.
+    assert "co_occurring_fingerprints=3" in md
     assert "('status', 'created_at')" not in md

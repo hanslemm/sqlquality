@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[]`, since an empty list would misread as "zero query groups support this" rather than
   the true "this rule is not workload-derived."
 
+  `evidence["fingerprint_digests"]` is a `--json`-only key: `--markdown`'s evidence line
+  omits it, since a list of opaque 12-character hashes (one per backing query group) is a
+  machine correlation key for `verify` with no meaning to a human reader — the
+  human-relevant number is already right beside it as `fingerprints` /
+  `co_occurring_fingerprints`. `--markdown` output is otherwise unchanged by this release.
+
 ### Changed
 
 - **Breaking:** `advise --json`'s `"window"` key is now an object —
