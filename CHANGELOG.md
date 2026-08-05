@@ -63,12 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because there is nothing to compare them against.
 
   **Whether an after-only proposal is a *new* finding is itself a claim `verify` will not make
-  unless the before run's coverage supports it.** A before run whose reads were degraded, or
-  whose window sampled fewer (or an unknown number of) query groups, may simply never have had
-  the evidence to make that recommendation — so the absence is a fact about that run, not about
-  your database. In those cases the proposals are still listed, and the reason they cannot be
-  called new is stated: exactly the treatment a query group's absence from the *after* run
-  already gets before `disappeared` may be graded.
+  unless both runs' coverage supports it.** Three conditions withhold it, and in each the
+  proposals are still listed with the reason stated rather than being called new — exactly the
+  treatment a query group's absence from the *after* run already gets before `disappeared` may
+  be graded:
+
+  - the **before** run's reads were degraded, so it may never have had the evidence to make
+    that recommendation — the absence is a fact about that run, not about your database;
+  - the **before** run's window sampled fewer (or an unknown number of) query groups, for the
+    same reason;
+  - the **after** run's reads were degraded in a way that can *relax* a rule rather than
+    silence it. A rule that cannot evaluate a threshold proposes anyway at reduced confidence —
+    correct for `advise`, whose job is to disclose rather than withhold — so a run that could
+    not read table sizes, or could not see an existing index, can make a recommendation a
+    fully-observed run would not have made at all.
 
 - `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
   relation some proposal targets *or* the run's workload analysis touched

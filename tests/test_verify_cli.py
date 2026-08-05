@@ -1039,6 +1039,137 @@ def test_a_truncated_before_window_does_not_make_an_after_only_proposal_a_new_fi
     assert "ADV001 public.orders (created_at)" in result.stderr
 
 
+#: The two measured routes by which a **degraded `after` run** emits a proposal a fully-observed
+#: run withholds — the inverse of F1's mechanism and the same false sentence to the user. Each
+#: entry is `(marker to deny, capability name, the base rows that make the fully-observed run
+#: propose nothing)`.
+#:
+#: * `table_facts` — a 50-row table is below the size threshold ADV001 applies when it can read
+#:   the size, and the threshold cannot be applied at all when `pg_total_relation_size` is denied.
+#: * `indexes` — an existing index already covers the hot predicate, so ADV001 has nothing to
+#:   recommend; with `pg_index` denied the coverage check cannot see it.
+_RELAXATION_ROUTES = [
+    (
+        "pg_total_relation_size",
+        "table_facts",
+        {"pg_total_relation_size": [("public", "orders", 50, 8192)]},
+    ),
+    ("pg_index", "indexes", {"pg_index": _INDEX_ON_STATUS}),
+]
+
+
+@pytest.mark.parametrize(
+    ("marker", "capability", "base_rows"),
+    _RELAXATION_ROUTES,
+    ids=[route[1] for route in _RELAXATION_ROUTES],
+)
+def test_a_degraded_after_run_does_not_make_its_own_relaxed_proposal_a_new_finding(
+    tmp_path, monkeypatch, marker, capability, base_rows
+):
+    """**The sixth door: a *presence* fabricated by missing coverage, rather than an absence read
+    as a measurement.** Found while measuring F1's dependency table, and fixed here because the
+    user-visible outcome is identical — `verify` asserting "this is new" on the strength of one
+    run's own limitations.
+
+    A rule that cannot evaluate a threshold proposes anyway at reduced confidence, which is the
+    right posture for `advise` (disclose rather than withhold) and a false claim once `verify`
+    reads the result as new. Both routes are measured, not theorised — each `base_rows` below
+    makes the fully-observed run propose **nothing**, and the assertions check that before using
+    it, so a route that stopped relaxing would fail here rather than pass vacuously.
+
+    **The isolation that makes this test about the new arm and nothing else:** `before`'s
+    `degraded` list is empty, so F1's before-side arm cannot fire, and both runs record the same
+    known `--limit`, so the sampling arm cannot either.
+    """
+    base = {**_pg_rows(), **base_rows}
+    before = _artifact(tmp_path, "before.json", _advise_stdout(monkeypatch, base))
+    after = _artifact(
+        tmp_path,
+        "after.json",
+        _advise_stdout(monkeypatch, {**base, marker: RuntimeError("denied")}),
+    )
+
+    before_payload = json.loads(before.read_text())
+    after_payload = json.loads(after.read_text())
+    # The premise of the whole test, asserted from the two real artifacts.
+    assert before_payload["degraded"] == [], "the before run must be fully observed"
+    assert before_payload["proposals"] == [], (
+        f"the fully-observed run already proposes something, so {capability} is not relaxing "
+        f"anything here: {before_payload['proposals']}"
+    )
+    assert [d["capability"] for d in after_payload["degraded"]] == [capability]
+    assert [p["code"] for p in after_payload["proposals"]] == ["ADV001"], (
+        f"denying {marker} did not relax a rule into proposing, so this route no longer "
+        f"reproduces: {after_payload['proposals']}"
+    )
+
+    payload = _payload_of(before, after)
+    assert payload["new_in_after"] == [["ADV001", "public", "orders", "status"]]
+    assert payload["limit"]["may_be_sampling_artifact"] is False, (
+        "the --limit arm can fire here, so this test would not prove the relaxation arm"
+    )
+    assert payload["new_in_after_withheld"] is not None
+    assert capability in payload["new_in_after_withheld"]
+
+    result = _verify(str(before), str(after))
+    assert result.exit_code == 0, result.output
+    assert "new rather than changed" not in result.stderr
+    assert "cannot rule out that they were already true and unseen" in result.stderr
+    # The relaxation's own wording, not the absence arm's: the after run may have made a
+    # recommendation nobody fully observing the database would have made.
+    assert "a fully-observed run would not have made at all" in result.stderr
+    assert "ADV001 public.orders (status)" in result.stderr
+
+
+def test_an_ndv_denied_after_run_is_gated_and_a_workload_denied_one_has_nothing_to_claim(
+    tmp_path, monkeypatch
+):
+    """Two facts about the relaxation set that the two routes above do not establish.
+
+    First, that the set is consulted for `ndv` — the member included on the
+    disclose-an-unproven-premise posture rather than on a demonstrated route (see
+    `_PROPOSAL_RELAXING_DEGRADATIONS`), so a narrowing of the set would show up here.
+
+    Second, why the *inverse* control cannot be written from the Postgres side at all: the only
+    removal-only capabilities Postgres can degrade are `workload` and `schema`, and both empty
+    `proposals` entirely, so a run degraded that way has no after-only proposal to mis-call new
+    in the first place. The genuine "a non-relaxing degradation must not gate" control is
+    therefore a unit test over a synthetic `degraded` list — see
+    `tests/test_verify.py::test_new_proposal_disclosure_withholds_on_a_degraded_before_and_on_a_limit_mismatch`
+    — and this assertion records why it lives there rather than here.
+    """
+    before = _pg_artifact(tmp_path, monkeypatch, "before.json")
+    after_rows = {
+        **_pg_rows(
+            statement="select id from orders where created_at > $1",
+            indexed=True,
+            calls=1000,
+            total_ms=2000.0,
+        ),
+        "pg_stats": RuntimeError("denied"),
+    }
+    after = _artifact(tmp_path, "after.json", _advise_stdout(monkeypatch, after_rows))
+    assert [d["capability"] for d in json.loads(after.read_text())["degraded"]] == ["ndv"]
+
+    payload = _payload_of(before, after)
+    assert payload["new_in_after"] == [["ADV001", "public", "orders", "created_at"]]
+    # `ndv` *is* in the relaxation set (see `_PROPOSAL_RELAXING_DEGRADATIONS`: included on the
+    # disclose-an-unproven-premise posture rather than a demonstrated route), so this pair is
+    # correctly gated — which is exactly what pins that the set is consulted rather than ignored.
+    assert payload["new_in_after_withheld"] is not None
+    assert "ndv" in payload["new_in_after_withheld"]
+
+    # And the genuinely-inert direction: a `workload` denial in `after` empties `proposals`
+    # entirely, so there is no after-only proposal to mis-call new in the first place.
+    empty_after = _artifact(
+        tmp_path,
+        "empty_after.json",
+        _advise_stdout(monkeypatch, {**_pg_rows(), "pg_stat_statements": RuntimeError("denied")}),
+    )
+    assert json.loads(empty_after.read_text())["proposals"] == []
+    assert _payload_of(before, empty_after)["new_in_after"] == []
+
+
 def test_the_new_claim_and_the_disappeared_claim_are_gated_symmetrically(tmp_path, monkeypatch):
     """The asymmetry was the tell, so it is what this test pins.
 

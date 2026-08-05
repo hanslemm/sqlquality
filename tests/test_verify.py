@@ -2819,6 +2819,66 @@ def test_new_proposal_disclosure_withholds_on_a_degraded_before_and_on_a_limit_m
     read_only = payload(degraded=[{"capability": "read_only", "reason": "could not pin"}])
     assert new_proposal_disclosure(read_only, payload()) is None
 
+    # --- the third arm: a degraded `after` that may have *relaxed* a rule into proposing ---
+    #
+    # The sixth door, and the inverse mechanism: nothing is missing from `before`, but `after`
+    # could not evaluate a threshold, so a rule proposed where a fully-observed run would have
+    # withheld. Measured on the real `advise` path for `table_facts` and `indexes`; see
+    # `_PROPOSAL_RELAXING_DEGRADATIONS`.
+    for capability in ("table_facts", "indexes", "ndv"):
+        relaxed = new_proposal_disclosure(
+            payload(), payload(degraded=[{"capability": capability, "reason": "denied"}])
+        )
+        assert relaxed is not None, capability
+        assert "after run" in relaxed and capability in relaxed
+        assert "a fully-observed run would not have made at all" in relaxed
+
+    # **The control that keeps the relaxation set from becoming "any degradation in `after`".**
+    # `advisor` and `read_only` can only ever *remove* a proposal, so an after-only proposal is
+    # not explicable by either and "new" is a claim the artifacts support. This assertion is the
+    # one that fails if someone widens the set to `KNOWN_DEGRADATIONS`, and it cannot be written
+    # from the CLI side, where Postgres's removal-only denials empty `proposals` outright.
+    for capability in ("advisor", "read_only", "workload", "schema"):
+        assert (
+            new_proposal_disclosure(
+                payload(), payload(degraded=[{"capability": capability, "reason": "denied"}])
+            )
+            is None
+        ), f"{capability} in the after run cannot relax a rule and must not gate the claim"
+
+    # An `after` degradation this version cannot name at all is disclosed in this direction too:
+    # whether it relaxes a rule, suppresses one, or neither cannot be bounded.
+    unknown = new_proposal_disclosure(
+        payload(), payload(degraded=[{"capability": "quantum_stats", "reason": "denied"}])
+    )
+    assert unknown is not None and "cannot interpret" in unknown
+
+
+def test_every_proposal_relaxing_degradation_is_a_name_an_adapter_records():
+    """`_PROPOSAL_RELAXING_DEGRADATIONS` gets the same guard every other hand-maintained table
+    in this module carries, on the day it is introduced rather than three rounds later.
+
+    A name no adapter records would be a dead entry giving false assurance — the set would look
+    like it covered a capability while gating nothing. Non-emptiness is asserted too: an empty
+    set is the shape a well-meaning simplification collapses to, and it would silently delete the
+    sixth door's whole fix.
+
+    Deliberately **not** compared for equality with `KNOWN_DEGRADATIONS`: this set is a proper
+    subset by construction (`workload`, `schema`, `advisor`, `physical_facts_gap`, `read_only` and
+    `stats_reset` can only ever remove a proposal), and the unit test above pins that direction
+    behaviourally.
+    """
+    from sqlquality.verify import _PROPOSAL_RELAXING_DEGRADATIONS, KNOWN_DEGRADATIONS
+
+    assert _PROPOSAL_RELAXING_DEGRADATIONS, "an empty set gates nothing"
+    assert _PROPOSAL_RELAXING_DEGRADATIONS <= KNOWN_DEGRADATIONS, (
+        f"names no adapter records: {sorted(_PROPOSAL_RELAXING_DEGRADATIONS - KNOWN_DEGRADATIONS)}"
+    )
+    assert _PROPOSAL_RELAXING_DEGRADATIONS < KNOWN_DEGRADATIONS, (
+        "every degradation cannot relax a rule into proposing — see the removal-only entries "
+        "documented at the table"
+    )
+
 
 def test_every_absence_member_is_consulted_by_a_gate_somewhere():
     """The registry is only worth what its *use* is worth: a member classified in
