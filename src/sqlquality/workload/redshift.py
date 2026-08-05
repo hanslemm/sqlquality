@@ -1476,6 +1476,21 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         and genuinely empty local tables, which can; nothing available to this adapter
         distinguishes the two (see `RedshiftTableFacts`'s docstring), so a genuine `False`
         here conflates "not a table" with "a table nobody has written to yet".
+
+        **`sortkey1`, `diststyle`, `unsorted` and `stats_off` are themselves ambiguous
+        `None`s and must not be read on their own** — unlike `indexes` on the Postgres
+        side, none of the four carries an unambiguous "measured, and it is empty" value
+        the way `[]` does, so a consumer cannot tell "never looked" apart from "looked,
+        and the relation is genuinely absent from `svv_table_info`" by inspecting any of
+        them directly: both conditions leave `phys` as `None`, hence all four `None`, for
+        entirely different reasons. `is_ordinary_table` is the one field that disambiguates
+        — `None` means "this run could not tell you" (never requested, or the capability
+        degraded), while `False` means "requested, succeeded, and the relation is not in
+        `svv_table_info`" (which is itself, per the paragraph above, a genuine but weaker-
+        than-Postgres measurement, not a further unknown). A consumer must therefore gate
+        on `is_ordinary_table` before drawing any conclusion from the other four — reading
+        `sortkey1 is None` in isolation cannot tell you which of the two very different
+        situations it is in.
         """
         facts_degraded = any(cap == CAP_TABLE_FACTS for cap, _ in self.degraded)
         state: dict[str, dict[str, object]] = {}

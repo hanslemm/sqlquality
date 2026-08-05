@@ -15,9 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence the
   upcoming `sqlquality verify` command diffs between two artifacts to tell whether a
   proposal was actually applied — observed from what the run's own catalog reads already
-  returned, never a second round trip. Always present, even when empty: an *absent* key
-  (an artifact from before this feature) and an *empty* one (this run found nothing
-  physical to report) are different facts, and `verify` needs to tell them apart.
+  returned, never a second round trip. The key itself is always present, even when empty:
+  an *absent* `physical_state` key (an artifact from before this feature) and an *empty*
+  `{}` one (this run found no relation to report on at all) are different facts, and
+  `verify` needs to tell them apart.
+
+  **Each field within an entry is a genuine three-way signal, not just present-vs-absent:**
+  `null` means *this run could not tell you* — either the relation's catalog facts were
+  never fetched at all (e.g. a dbt-enriched proposal for a relation outside the analyzed
+  workload), or the relevant catalog read was denied (see `degraded`) — while `false` /
+  `[]` is a real measurement (Postgres's `is_ordinary_table: false` means a view, a
+  foreign table, or a partitioned parent; `indexes: []` means the relation was fetched and
+  genuinely has none). Treating `null` as `false`/`[]`, or the reverse, fabricates a
+  transition across two runs where nothing physically changed — only what each run
+  happened to fetch did.
 
 ### Changed
 
