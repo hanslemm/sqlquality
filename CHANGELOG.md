@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transition across two runs where nothing physically changed — only what each run
   happened to fetch did.
 
+  **`is_ordinary_table` is not at parity between the two engines, and deliberately so.** On
+  Postgres it comes from a catalog read filtered `relkind = 'r'`, so `false` unambiguously
+  means "not an ordinary table". On Redshift it comes from the relation's presence in
+  `svv_table_info`, which omits external (Spectrum) tables — those cannot carry a SORTKEY,
+  DISTKEY or DISTSTYLE at all — *and* genuinely **empty** local tables, which can. Nothing
+  available to the adapter tells those two apart, so a Redshift `false` conflates "not a
+  table" with "a table nobody has written to yet", and any `verify` verdict resting on it is
+  correspondingly weaker than the identical field name suggests. `null` still means "this run
+  could not tell you" on both engines; it is only `false` whose meaning differs.
+
 - `advise --json` now carries `query_groups`, a top-level `list[dict]` of **every** workload
   query group this run analysed, each with `digest`
   (the same 12-character id as `evidence["fingerprint"]`/`evidence["fingerprint_digests"]`),
@@ -119,12 +129,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ADV008, ADV101, ADV102, ADV103) now also carries `evidence["fingerprint_digests"]`: a
   sorted tuple of the same 12-character digests, naming which of `query_groups` back that
   specific proposal — beside the existing `fingerprints` / `co_occurring_fingerprints`
-  counts, not replacing them. The three rules with no query-group backing at all —
-  Postgres's ADV002/ADV003 (catalog measurements: index scan counts, index-prefix
-  comparisons) and Redshift's ADV104/ADV105 (a direct catalog measurement and a verbatim
-  Amazon Redshift Advisor relay, respectively) — omit the key entirely rather than emit
-  `[]`, since an empty list would misread as "zero query groups support this" rather than
-  the true "this rule is not workload-derived."
+  counts, not replacing them. Every other rule omits the key entirely rather than emit `[]`,
+  since an empty list would misread as "zero query groups support this" rather than the true
+  "this rule does not name individual query groups": Postgres's ADV002/ADV003 (catalog
+  measurements — index scan counts, index-prefix comparisons), Redshift's ADV104/ADV105 (a
+  direct catalog measurement and a verbatim Amazon Redshift Advisor relay, respectively), and
+  the dbt rules ADV301/ADV303 — the first proposes on a relation's *aggregate* share of
+  workload cost rather than on any one group's timings, the second on a model the workload
+  never touched at all. `sqlquality verify` consequently never grades those rules
+  `improved`, `unchanged` or `regressed` — there is no per-group timing to compare — only
+  `not_applied` when the change demonstrably was not made, and `unobservable` otherwise, with
+  the applied signal reported beside it.
 
   `evidence["fingerprint_digests"]` is a `--json`-only key: `--markdown`'s evidence line
   omits it, since a list of opaque 12-character hashes (one per backing query group) is a

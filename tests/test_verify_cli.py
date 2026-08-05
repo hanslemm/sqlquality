@@ -4,9 +4,17 @@
 `runner.invoke(app, ["advise", "--json", ...])` over a stubbed querier, and written to disk
 exactly as `advise --json > before.json` would write it. That is deliberate and it is the
 single most important property of this file: Task 6's headline test asserted against a
-hand-built payload pairing `"proposals": []` with a populated `"query_groups"` — a shape
-production cannot emit — and passed while the real path was broken. A fixture that `advise`
-cannot emit proves nothing about `verify`, which only ever reads what `advise` wrote.
+hand-built payload pairing `"proposals": []` with a populated `"query_groups"`, which the
+then-current `_query_groups_payload` — scoped to the digests proposals cited — could not
+produce, and it passed while the real path was broken. A fixture that `advise` cannot emit
+proves nothing about `verify`, which only ever reads what `advise` wrote.
+
+**That particular shape is emittable now** (Task 6's fix made `query_groups` cover the whole
+workload, so a resolved proposal leaves an empty `proposals` beside a populated
+`query_groups` — see `tests/fixtures/verify/improved.after.json`, generated from a real
+server). It is named here as the mechanism, not as a shape to avoid: the only way to know a
+fixture is emittable is to have emitted it, which is why every artifact below comes from the
+real command.
 
 The two places a payload *is* edited after the fact are the pre-0.4.0 refusals, and they
 edit by *removing* keys from a real artifact rather than by inventing a shape: an artifact
@@ -284,6 +292,31 @@ def test_a_complete_artifact_pair_is_not_refused_by_the_version_check(tmp_path, 
     result = _verify(str(before), str(after))
     assert result.exit_code == 0, result.output
     assert "0.4.0" not in result.stderr
+
+
+def test_the_required_key_set_is_exactly_what_advise_emits(monkeypatch):
+    """The refusal is pinned in **both** directions, and the second one is the gap this test
+    closes.
+
+    The control above catches *over-tightening*: a required key `advise` never writes would
+    refuse every artifact. Nothing caught the opposite — a key added to `advise_payload` later
+    that `_VERIFY_REQUIRED_KEYS` does not know about. An artifact from an intermediate build,
+    carrying every key listed here but not the new one, would then pass the version check and
+    earn a verdict derived from data it does not contain, which is the exact failure this
+    refusal exists to prevent. Set equality against a freshly generated artifact means such a
+    key cannot be added without this test naming it.
+
+    `dbt` cannot be in the required set and is absent here for the reason it can never be
+    required: `advise_payload` omits it entirely unless a manifest was loaded, so demanding it
+    would refuse every dbt-free run — and this artifact, produced without `--manifest`, does
+    not carry it.
+    """
+    from sqlquality.cli import _VERIFY_REQUIRED_KEYS, _VERIFY_REQUIRED_WINDOW_KEYS
+
+    payload = json.loads(_advise_stdout(monkeypatch, _pg_rows()))
+    assert "dbt" not in payload
+    assert set(_VERIFY_REQUIRED_KEYS) == set(payload)
+    assert set(_VERIFY_REQUIRED_WINDOW_KEYS) == set(payload["window"])
 
 
 # --- the same artifact twice ---------------------------------------------------------------
@@ -734,6 +767,45 @@ def test_the_markdown_report_carries_the_table_the_caveats_and_the_notes(tmp_pat
     assert "improved" in text
     assert "understate" in text
     assert "50.0 → 2.0 ms" in text
+
+
+def test_an_unreadable_engine_renders_as_unknown_not_as_none(tmp_path, monkeypatch):
+    """One rendering of "this artifact does not say", not two.
+
+    `{"engine": null}` passes every check `verify` makes: the version check tests only whether
+    the key is *present*, and `artifact_incomparabilities` reads `window["engine"]`, which is
+    intact here. The heading then interpolated `ArtifactFacts.engine`'s `None` directly and
+    printed `Verify — None`, while `verify_workload_line` two lines above rendered its own
+    unreadable values as `unknown`. A Python repr in user-facing text is also indistinguishable
+    from an engine literally named `None`.
+
+    Cosmetic — `advise_payload` writes `engine` from a required argument, so only a hand-edited
+    artifact reaches it — and asserted on both rendered surfaces. `--json` deliberately keeps
+    the real `null`, which the last assertion pins: a machine consumer needs the distinction the
+    label flattens.
+    """
+
+    def blank_engine(text: str) -> str:
+        payload = json.loads(text)
+        payload["engine"] = None
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    before = _artifact(
+        tmp_path, "before.json", blank_engine(_advise_stdout(monkeypatch, _pg_rows(calls=100)))
+    )
+    after = _artifact(
+        tmp_path,
+        "after.json",
+        blank_engine(_advise_stdout(monkeypatch, _pg_rows(calls=1000, indexed=True))),
+    )
+    out = tmp_path / "verify.md"
+    result = _verify(str(before), str(after), "--markdown", str(out))
+    assert result.exit_code == 0, result.output
+    assert "# sqlquality verify — unknown" in out.read_text(encoding="utf-8")
+    stdout = _plain(result.stdout)
+    assert "unknown" in stdout
+    assert "None" not in stdout
+    assert _payload_of(before, after)["before"]["engine"] is None
 
 
 def test_an_unwritable_markdown_path_exits_2_not_1(tmp_path, monkeypatch):

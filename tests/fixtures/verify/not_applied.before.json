@@ -1,0 +1,91 @@
+{
+  "analyzed": {
+    "query_groups": 3,
+    "query_groups_in_window": 3,
+    "tables": [
+      "g_not_applied.orders"
+    ],
+    "total_cost_ms": 176.35926600000002
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "physical_state": {
+    "g_not_applied.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
+  "proposals": [
+    {
+      "code": "ADV001",
+      "confidence": "high",
+      "ddl": "CREATE INDEX ON \"g_not_applied\".\"orders\" (\"status\");",
+      "evidence": {
+        "calls": 20,
+        "co_occurring_fingerprints": 1,
+        "columns": [
+          "status"
+        ],
+        "cost_share": 0.999826847771072,
+        "expression_indexes": [],
+        "fingerprint_digests": [
+          "81de6a261275"
+        ],
+        "leading_ndv": 3000.0,
+        "partial_indexes_skipped": [],
+        "roles": [
+          "equality"
+        ],
+        "row_estimate": 300000,
+        "schema": "g_not_applied",
+        "table": "orders"
+      },
+      "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
+      "title": "Add index on g_not_applied.orders(status)"
+    }
+  ],
+  "query_groups": [
+    {
+      "calls": 20,
+      "digest": "81de6a261275",
+      "mean_ms": 8.816436450000001,
+      "total_time_ms": 176.328729
+    },
+    {
+      "calls": 1,
+      "digest": "57e8bbc60586",
+      "mean_ms": 0.023872,
+      "total_time_ms": 0.023872
+    },
+    {
+      "calls": 1,
+      "digest": "b529b333724a",
+      "mean_ms": 0.006665,
+      "total_time_ms": 0.006665
+    }
+  ],
+  "redacted": true,
+  "skipped": {
+    "ambiguous": 0,
+    "noise": 2,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": {
+    "description": "since stats reset at 2026-08-05 21:06:14.490088+00:00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-08-05 21:06:14.490088+00:00"
+  }
+}
