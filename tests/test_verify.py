@@ -1238,6 +1238,40 @@ def test_ruling_1_a_null_indexes_on_either_side_yields_none_not_false():
     assert verdict_null_after.outcome is VerifyOutcome.UNOBSERVABLE
 
 
+# --- Finding 4, fix round 3: the "similar cost" note must evaluate the cost, not assert it ---
+
+
+def test_finding_4_the_group_still_present_note_evaluates_the_grade_before_asserting_cost():
+    """Design spec §3: "one whose group is still there **at the same cost** is *not
+    addressed*, and that verdict is solid" — the condition is explicitly conditional.
+    Before fix round 3, the `applied is None` / group-present branch asserted "at a
+    similar cost — not addressed" unconditionally, without ever calling `_grade`. Three
+    cases, asserted individually: unchanged (the claim is finally earned), 10x faster
+    (the claim must not be made), and uncomparable means (say so, do not guess)."""
+    unchanged_before = _payload(adv005=True, groups=[("aaa", 10, 1000.0)])
+    unchanged_after = _payload(adv005=True, groups=[("aaa", 10, 1000.0)])
+    [verdict_unchanged] = verdicts(unchanged_before, unchanged_after)
+    assert verdict_unchanged.applied is None
+    assert "similar cost" in verdict_unchanged.note
+    assert "not addressed" in verdict_unchanged.note
+
+    faster_before = _payload(adv005=True, groups=[("aaa", 10, 1000.0)])
+    faster_after = _payload(adv005=True, groups=[("aaa", 10, 100.0)])  # 10x faster
+    [verdict_faster] = verdicts(faster_before, faster_after)
+    assert verdict_faster.applied is None
+    assert "similar cost" not in verdict_faster.note
+    assert "not addressed" not in verdict_faster.note
+    assert "changed" in verdict_faster.note
+
+    # present_after > 0 but the calls summed to zero -> means genuinely uncomparable.
+    uncomparable_before = _payload(adv005=True, groups=[("aaa", 10, 1000.0)])
+    uncomparable_after = _payload(adv005=True, groups=[("aaa", 0, 0.0)])
+    [verdict_uncomparable] = verdicts(uncomparable_before, uncomparable_after)
+    assert verdict_uncomparable.applied is None
+    assert "could not be compared" in verdict_uncomparable.note
+    assert "similar cost" not in verdict_uncomparable.note
+
+
 # --- Ruling 2: a limit mismatch forbids DISAPPEARED --------------------------------------
 
 
@@ -1457,6 +1491,51 @@ def test_ruling_9_adv105_applied_comes_from_advisor_row_presence_in_after():
     assert "more than one" in verdict_collision.note
 
 
+# --- Finding 2, fix round 3: ADV105 must not read a denied Advisor read as applied -----
+
+
+def test_finding_2_adv105_applied_is_none_when_the_after_advisor_read_was_denied():
+    """Ruling 1 arriving through a third door: a denied `CAP_ADVISOR` read produces the
+    identical empty proposal list a genuinely resolved recommendation would, so `verify`
+    must consult `degraded` for this one code — nothing else disambiguates the two."""
+    sort_rec = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": None,
+            "current_ddl": None,
+        },
+        "ddl": None,
+    }
+    window = {
+        "description": "d",
+        "engine": "redshift",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": 500,
+    }
+    before = {"proposals": [sort_rec], "physical_state": {}, "query_groups": [], "window": window}
+    after_denied = {
+        "proposals": [],
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+        "degraded": [{"capability": "advisor", "reason": "permission denied"}],
+    }
+    [verdict] = verdicts(before, after_denied)
+    assert verdict.applied is None
+    assert "degraded" in verdict.note.lower() or "denied" in verdict.note.lower()
+
+    # The identical shape with degraded == [] genuinely reaches applied=True -- the fix
+    # must not collapse every ADV105 verdict into "unknown".
+    after_clean = {**after_denied, "degraded": []}
+    [verdict_clean] = verdicts(before, after_clean)
+    assert verdict_clean.applied is True
+
+
 def test_concern_3_adv105_confidence_never_exceeds_medium_even_under_a_disjoint_window():
     """Concern 3 (fix round 1, accepted): ADV105's applied signal is Advisor's own row
     disappearing, not this project's own catalog read — weaker evidence than every other
@@ -1589,6 +1668,45 @@ def test_applied_drop_index_true_when_the_named_index_is_gone():
     assert verdict.applied is True
 
 
+def test_finding_5_applied_drop_index_null_gate_is_pinned():
+    """F5 (fix round 3): `_applied_drop_index`'s Ruling 1 null-gate could be deleted with
+    the whole suite green. `before`'s `indexes` is `null` (this run never fetched them);
+    `after`'s `indexes` is `[]` (measured, the named index genuinely absent) — without the
+    gate this reads as `applied=True` (the index is gone); with it, correctly `None`."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV002",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "index": "orders_idx",
+                    "columns": ["status"],
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": None}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "T",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+
+
 def test_applied_redshift_sortkey_true_when_after_matches_the_proposed_column():
     before = {
         "proposals": [
@@ -1664,6 +1782,59 @@ def test_applied_redshift_sortkey_is_false_when_a_different_sortkey_was_set():
     }
     [verdict] = verdicts(before, after)
     assert verdict.applied is False
+
+
+def test_finding_3_adv101_a_null_sortkey1_is_none_not_a_guessed_false():
+    """Before fix round 3, `_applied_redshift_key` compared `after`'s `sortkey1` to the
+    proposed column with plain `==`, so `None == "created_at"` silently graded `False` —
+    inconsistent with ADV102/ADV103, which already read an unparseable `diststyle` as
+    `None` (fix round 2). `redshift.py`'s own docstring says `sortkey1` "must not be read
+    on its own," and `propose_sortkey`'s docstring treats a null `sortkey1` as unknowable,
+    not "no sort key set" — `is_ordinary_table` being `True` does not rescue this field."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV101",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "column": "created_at",
+                    "current_sortkey1": None,
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after_null = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_null] = verdicts(before, after_null)
+    assert verdict_null.applied is None
+    assert "could not be read" in verdict_null.note
+
+    # A genuinely different sortkey is still a real, reportable mismatch -- the fix must
+    # not collapse into "everything unknown".
+    after_mismatch = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "tenant_id"}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_mismatch] = verdicts(before, after_mismatch)
+    assert verdict_mismatch.applied is False
 
 
 def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_proposed_column():
@@ -1850,6 +2021,41 @@ def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
     assert verdict.applied is True
 
 
+def test_finding_5_applied_maintenance_numeric_guard_is_pinned():
+    """F5 (fix round 3): `_applied_maintenance`'s Ruling 7 numeric guard on `after_value`
+    could be deleted with the whole suite green. `after`'s `unsorted` is `null` even
+    though `is_ordinary_table` is `True` — an ambiguous field, same family as ADV101's
+    `sortkey1` (Finding 3) — so comparing it against the recorded baseline is not possible;
+    the gate must read this as `None`, never coerce it into a comparison."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV104",
+                "evidence": {"schema": "public", "table": "orders", "unsorted": 30.0},
+                "ddl": "VACUUM public.orders;",
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 30.0}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": None}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+
+
 def test_applied_materialize_true_when_the_view_becomes_an_ordinary_table():
     before = {
         "proposals": [
@@ -1878,6 +2084,41 @@ def test_applied_materialize_true_when_the_view_becomes_an_ordinary_table():
     }
     [verdict] = verdicts(before, after)
     assert verdict.applied is True
+
+
+def test_finding_5_applied_materialize_null_gate_is_pinned():
+    """F5 (fix round 3): `_applied_materialize`'s Ruling 1 null-gate could be deleted with
+    the whole suite green. `before`'s `is_ordinary_table` is `null` (never fetched);
+    `after`'s is `False` (measured, still a view) — without the gate this reads as
+    `applied=False` (a real, wrong claim: "you did not do it"); with it, correctly
+    `None` ("we could not tell")."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV301",
+                "evidence": {"schema": "public", "table": "orders_view", "cost_share": 0.4},
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders_view": {"is_ordinary_table": None}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "T",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders_view": {"is_ordinary_table": False}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
 
 
 def test_applied_is_none_for_an_unrecognized_future_code():
@@ -1915,14 +2156,28 @@ def test_applied_is_none_for_an_unrecognized_future_code():
 
 
 def test_the_headline_case_a_resolved_proposal_still_grades_applied_and_improved():
-    """The critical fix round 1 exists for. Before it, `physical_state` was scoped to
-    proposal relations alone, so `after` — where the recommended index now exists and
-    ADV001 no longer fires for `public.orders` at all — would have carried *no*
-    `physical_state` entry for that relation, and this verdict would have come back
-    `applied=None`, UNOBSERVABLE: the tool structurally unable to confirm its own
-    headline case. `physical_state` is now scoped to `proposal_relations(proposals) |
-    aggregation.tables` (`cli.py`), so `after`'s payload — built from a real `advise` run
-    that produced zero proposals for this relation — still carries its physical facts."""
+    """The critical fixes rounds 1 *and* 3 exist for.
+
+    Round 1: before it, `physical_state` was scoped to proposal relations alone, so
+    `after` — where the recommended index now exists and ADV001 no longer fires for
+    `public.orders` at all — would have carried *no* `physical_state` entry for that
+    relation, and this verdict would have come back `applied=None`, UNOBSERVABLE: the
+    tool structurally unable to confirm its own headline case. `physical_state` is now
+    scoped to `proposal_relations(proposals) | aggregation.tables` (`cli.py`), so
+    `after`'s payload — built from a real `advise` run that produced zero proposals for
+    this relation — still carries its physical facts.
+
+    Round 3: before it, `after["query_groups"]` populated here (`"aaa"` present with its
+    own timing) alongside `after["proposals"] == []` was a shape `advise` could never
+    actually emit — `_query_groups_payload` scoped `query_groups` to citations from
+    `proposals` itself, so an empty `proposals` list forced an empty `query_groups` list
+    too, and this fixture's `IMPROVED` outcome was pinned against an artifact no real run
+    could produce. `_query_groups_payload` now reports every group in `workload.stats`
+    regardless of citation (`report.py`), so this exact shape — no proposals, but the
+    query group's own timing still present — is what a real `after` run now looks like.
+    `tests/integration/test_verify_headline_live.py` proves the same scenario against a
+    real Postgres round trip; this unit test pins the same fixed shape fast and offline.
+    """
     before = {
         "proposals": [
             {

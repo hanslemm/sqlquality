@@ -805,7 +805,15 @@ def _applied_redshift_key(
 
     - ADV101: `True` iff `after`'s `sortkey1` equals the proposed `column`, exactly.
       `sortkey1` is a bare column name with nothing to parse, so no shape question
-      arises here — only the Ruling 1 gate below.
+      arises here — but a `null` `sortkey1` is still ambiguous even once
+      `is_ordinary_table` is known `True` (Finding 3, fix round 3): `propose_sortkey`'s
+      own docstring treats a null `sortkey1` as "could not be read," not "no sort key
+      set," and drops to `LOW` for exactly that reason. Reading `None == column` as a
+      plain equality would silently grade this `False` — this function's first version
+      did, inconsistently with `_diststyle_shape` three lines away already reading a
+      null `diststyle` as unrecognized-hence-`None` — so `after`'s `sortkey1` is checked
+      for `None` explicitly before the comparison, matching ADV102/ADV103's discipline
+      rather than contradicting it.
     - ADV102: `after`'s `diststyle` classified (`_diststyle_shape`) as `("key",
       column)` with `column` equal to the proposed one -> `True`; classified as
       anything else recognized (`EVEN`, `ALL`, or `KEY(`some other column`)`) -> `False`,
@@ -836,7 +844,14 @@ def _applied_redshift_key(
     if not isinstance(column, str):
         return None, None
     if code == "ADV101":
-        return after_phys.get("sortkey1") == column, None
+        after_sortkey1 = after_phys.get("sortkey1")
+        if after_sortkey1 is None:
+            return None, (
+                "after's sortkey1 could not be read (SQL NULL), even though the relation "
+                "is an ordinary table; whether the proposed SORTKEY was applied is "
+                "unknowable, not a measured absence."
+            )
+        return after_sortkey1 == column, None
     # ADV102
     shape = _diststyle_shape(after_diststyle)
     if shape is None:
@@ -892,8 +907,46 @@ def _applied_materialize(
     return after_ordinary is True
 
 
+#: `workload/redshift.py`'s `CAP_ADVISOR` value, duplicated rather than imported for the
+#: same reason `_diststyle_shape`'s regexes are duplicated: that module transitively pulls
+#: in this project's live-connection machinery, which `verify.py` must never import. Only
+#: the string value is needed here, and it is Amazon Redshift Advisor's own capability
+#: name, not project logic that could drift between the two copies.
+_CAP_ADVISOR = "advisor"
+
+
+def _capability_denied(payload: dict[str, object], capability: str) -> bool:
+    """Whether `payload["degraded"]` records `capability` as denied.
+
+    **Finding 2 (fix round 3) — Ruling 1 arriving through a third door.** Absence of a
+    *reading* is not a reading, and `physical_state`'s own null discipline (Ruling 1)
+    already protects every code that reads it: `PostgresWorkloadAdapter.physical_state`/
+    `RedshiftWorkloadAdapter.physical_state` both fold a denied capability into `null`
+    fields directly (see their docstrings' `have_facts`/`have_indexes` gates), so
+    `_applied_create_index`, `_applied_drop_index`, `_applied_redshift_key`,
+    `_applied_maintenance` and `_applied_materialize` are already correct here — a denied
+    `CAP_TABLE_FACTS`/`CAP_INDEXES` read shows up as `null`, never as a measurement, before
+    this function would ever need to be consulted. ADV105 is the one code that does *not*
+    read `physical_state` at all (see `_applied_advisor`): its applied signal is a
+    proposal's absence, which a denied `CAP_ADVISOR` read produces identically to a
+    genuine "Advisor has nothing to say" — `_advisor_rows` catches the failure, records it
+    in `degraded`, and returns `[]` either way. `verify.py` must consult `degraded`
+    directly for exactly this one code, since nothing else disambiguates the two.
+
+    `payload["degraded"]` entries are `{"capability": ..., "reason": ...}` dicts (see
+    `report.py`'s `advise_payload`); malformed entries are ignored rather than raised on,
+    matching this module's discipline everywhere else.
+    """
+    degraded = payload.get("degraded")
+    if not isinstance(degraded, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("capability") == capability for entry in degraded
+    )
+
+
 def _applied_advisor(
-    key: tuple[str, ...], after_index: ProposalIndex
+    key: tuple[str, ...], after: dict[str, object], after_index: ProposalIndex
 ) -> tuple[bool | None, str | None]:
     """ADV105 — verified at proposal level, per the design spec, not from `physical_state`
     at all: no catalog field corresponds to whatever Advisor's own internal heuristic
@@ -902,11 +955,22 @@ def _applied_advisor(
     row disappearing *is* the applied signal — a deliberate, disclosed exception to every
     other code's "from `physical_state` and nothing else" rule (see the Task 6 report).
 
-    `True` when this exact key is absent from `after`'s *matched* proposals (Advisor no
-    longer recommends it); `False` when still present, unambiguously, under the same key;
-    `None`, with an explanatory note, when the key collides in `after` (Ruling 4 — an
-    ambiguous match must never be read as either "gone" or "still there").
+    **Checked first, before proposal presence at all (Finding 2, fix round 3):** if
+    `after`'s `CAP_ADVISOR` read was denied, Advisor's row being absent proves nothing —
+    the read never happened, so `None` with the reason in the note, never a guessed
+    `True`.
+
+    Otherwise: `True` when this exact key is absent from `after`'s *matched* proposals
+    (Advisor no longer recommends it); `False` when still present, unambiguously, under
+    the same key; `None`, with an explanatory note, when the key collides in `after`
+    (Ruling 4 — an ambiguous match must never be read as either "gone" or "still there").
     """
+    if _capability_denied(after, _CAP_ADVISOR):
+        return None, (
+            "The after run's Amazon Redshift Advisor read was denied (see its `degraded` "
+            "entry); the recommendation's absence proves nothing when the read never "
+            "happened."
+        )
     if key in after_index.collisions:
         return None, (
             "This recommendation's key matched more than one proposal in the after run; "
@@ -935,7 +999,7 @@ def _detect_applied(
     if code in _UNOBSERVABLE_CODES:
         return None, None
     if code == _ADVISOR_CODE:
-        return _applied_advisor(key, after_index)
+        return _applied_advisor(key, after, after_index)
     relation_key = _relation_key(evidence)
     if relation_key is None:
         return None, "No relation identified in this proposal's evidence."
@@ -1148,11 +1212,29 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
                     "alone is not proof."
                 )
             elif present_after > 0:
-                notes.append(
-                    "This proposal's application cannot be observed directly, and its "
-                    "cited query group(s) are still present in the after run at a "
-                    "similar cost — not addressed."
-                )
+                # Finding 4 (fix round 3): the design spec's "still there at the same
+                # cost" claim is conditional on the cost actually being the same — never
+                # asserted without checking `_grade(mean_before, mean_after)` first.
+                if mean_before is None or mean_after is None:
+                    notes.append(
+                        "This proposal's application cannot be observed directly, and "
+                        "its cited query group(s) are present in the after run, but "
+                        "their mean time per call could not be compared; whether the "
+                        "recommendation was addressed is unknown."
+                    )
+                elif _grade(mean_before, mean_after) is VerifyOutcome.UNCHANGED:
+                    notes.append(
+                        "This proposal's application cannot be observed directly, and "
+                        "its cited query group(s) are still present in the after run at "
+                        "a similar cost — not addressed."
+                    )
+                else:
+                    notes.append(
+                        "This proposal's application cannot be observed directly, and "
+                        "its cited query group(s) are present in the after run, but "
+                        "their mean time per call changed; this alone does not "
+                        "establish whether the recommendation was addressed."
+                    )
             else:
                 notes.append("This proposal's application cannot be observed from physical_state.")
         elif not digests or mean_before is None:
