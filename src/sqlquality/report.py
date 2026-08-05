@@ -169,6 +169,15 @@ def advise_payload(
     below — because an *absent* key is how `verify` tells a pre-this-feature artifact
     apart from one that genuinely has nothing to report for a field.
 
+    `"since_duration_seconds"` is the *requested* `--since` duration (e.g. `7d`'s
+    `604800.0`), distinct from `"since"`'s *absolute cutoff*: `sqlquality verify` grades
+    two windows comparable on equal durations, not equal cutoffs, since two runs a week
+    apart with the identical `--since 7d` bind two different absolute cutoffs but request
+    the same duration — see `sqlquality.verify.classify_windows`'s docstring. Postgres
+    reports it as `None` unconditionally, for the same reason it reports `"since"` as
+    `None`: it cannot apply `--since` at all, so even the bare duration must not be echoed
+    back as though a filter had been applied.
+
     `physical_state` is the adapter's own `WorkloadAdapter.physical_state(relations)`,
     called by the caller (`cli.advise`) with `models.proposal_relations(proposals)` so its
     size scales with findings rather than with schema size. Unlike `dbt`, this key is
@@ -207,6 +216,7 @@ def advise_payload(
             # information.
             "stats_reset_at": window_facts.get("stats_reset_at"),
             "since": window_facts.get("since"),
+            "since_duration_seconds": window_facts.get("since_duration_seconds"),
             "limit": window_facts.get("limit"),
         },
         "analyzed": {
