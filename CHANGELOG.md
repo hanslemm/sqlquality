@@ -34,20 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transition across two runs where nothing physically changed — only what each run
   happened to fetch did.
 
-- `advise --json` now carries `query_groups`, a top-level `list[dict]` of the specific
-  workload query groups some proposal actually cites as evidence, each with `digest`
+- `advise --json` now carries `query_groups`, a top-level `list[dict]` of **every** workload
+  query group this run analysed, each with `digest`
   (the same 12-character id as `evidence["fingerprint"]`/`evidence["fingerprint_digests"]`),
   `calls`, `total_time_ms`, and `mean_ms` (`total_time_ms / calls`, or `null` — never
   `0.0` — when `calls` is `0`, since a group with no recorded calls has no meaningful mean
   to report). This is the workload evidence the upcoming `sqlquality verify` command
   compares against a later run's timings for the same query groups. The key is always
-  present, `[]` when nothing references it, for the same reason `physical_state` is: an
-  absent key marks a pre-this-feature artifact, distinct from a genuinely-empty run.
+  present, `[]` when the run analysed no query groups at all, for the same reason
+  `physical_state` is: an absent key marks a pre-this-feature artifact, distinct from a
+  genuinely-empty run.
+
+  **Not scoped to what some proposal currently cites**, for the same reason
+  `physical_state` is not scoped to proposal relations alone: a group whose proposal got
+  resolved between two runs (the recommended index now exists, so the rule stops firing and
+  stops citing the group) would otherwise vanish from the later artifact even though the
+  query is still running, and `verify` would read that as the query having disappeared
+  rather than as the improvement it is. The list is bounded by the same `--limit` that
+  bounds the workload itself, and `analyzed.query_groups_in_window` reports its size, so it
+  scales with the workload rather than with the schema.
 
   **This is a different key from, and coexists with, the existing
   `payload["analyzed"]["query_groups"]`** — that one is (and remains) an integer count of
-  how many query groups this run understood; the new one is a list of the specific groups
-  backing a proposal. JSON nesting disambiguates the two (one is nested under
+  how many query groups this run understood; the new one is the list of those groups with
+  their timings. JSON nesting disambiguates the two (one is nested under
   `"analyzed"`, the other sits at the payload's root) — renaming the older, already-shipped
   key to avoid the collision would itself be a breaking change to existing consumers, and
   is out of scope here.

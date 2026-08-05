@@ -907,41 +907,236 @@ def _applied_materialize(
     return after_ordinary is True
 
 
-#: `workload/redshift.py`'s `CAP_ADVISOR` value, duplicated rather than imported for the
-#: same reason `_diststyle_shape`'s regexes are duplicated: that module transitively pulls
-#: in this project's live-connection machinery, which `verify.py` must never import. Only
-#: the string value is needed here, and it is Amazon Redshift Advisor's own capability
-#: name, not project logic that could drift between the two copies.
-_CAP_ADVISOR = "advisor"
+#: Every capability and degradation name either workload adapter can record in a payload's
+#: `degraded` list. Duplicated as plain strings rather than imported for the same reason
+#: `_diststyle_shape`'s regexes are duplicated: `workload/postgres.py` and
+#: `workload/redshift.py` transitively pull in this project's live-connection machinery,
+#: which `verify.py` must never import (see this module's own docstring). Only the string
+#: values are needed here, and they are the adapters' own capability names, not project
+#: logic that could drift between the two copies.
+_CAP_WORKLOAD: Final = "workload"
+_CAP_STATS_RESET: Final = "stats_reset"
+_CAP_SCHEMA: Final = "schema"
+_CAP_TABLE_FACTS: Final = "table_facts"
+_CAP_NDV: Final = "ndv"
+_CAP_INDEXES: Final = "indexes"
+_CAP_ADVISOR: Final = "advisor"
+_DEGRADATION_READ_ONLY: Final = "read_only"
+_DEGRADATION_PHYSICAL_FACTS_GAP: Final = "physical_facts_gap"
+
+#: The complete vocabulary of `payload["degraded"][*]["capability"]` values this version of
+#: `verify` has *classified* — i.e. for which someone has decided, in
+#: `_ABSENCE_DEPENDENCIES` below, which of `verify`'s absence-derived conclusions the
+#: degradation can fabricate. Pinned against the adapters' own module constants by
+#: `test_every_degradation_either_adapter_can_record_is_classified`, so a seventh capability
+#: added to either adapter reddens the suite until it has been classified here: the omission
+#: this module's recurring defect has arrived through three times cannot be made silently.
+#:
+#: A name *outside* this set, encountered at runtime, is the same situation seen from the
+#: other side — an artifact written by a newer `sqlquality` than the `verify` reading it —
+#: and `_absence_disclosure` treats it as blocking **every** absence, because a degradation
+#: this version cannot name is a degradation whose blind spot it cannot bound.
+KNOWN_DEGRADATIONS: Final[frozenset[str]] = frozenset(
+    {
+        _CAP_WORKLOAD,
+        _CAP_STATS_RESET,
+        _CAP_SCHEMA,
+        _CAP_TABLE_FACTS,
+        _CAP_NDV,
+        _CAP_INDEXES,
+        _CAP_ADVISOR,
+        _DEGRADATION_READ_ONLY,
+        _DEGRADATION_PHYSICAL_FACTS_GAP,
+    }
+)
 
 
-def _capability_denied(payload: dict[str, object], capability: str) -> bool:
-    """Whether `payload["degraded"]` records `capability` as denied.
+class Absence(str, Enum):
+    """Each absence in an `advise --json` artifact that `verify` reads as *evidence about
+    the user's database*, rather than as a fact about the artifact.
 
-    **Finding 2 (fix round 3) — Ruling 1 arriving through a third door.** Absence of a
-    *reading* is not a reading, and `physical_state`'s own null discipline (Ruling 1)
-    already protects every code that reads it: `PostgresWorkloadAdapter.physical_state`/
-    `RedshiftWorkloadAdapter.physical_state` both fold a denied capability into `null`
-    fields directly (see their docstrings' `have_facts`/`have_indexes` gates), so
-    `_applied_create_index`, `_applied_drop_index`, `_applied_redshift_key`,
-    `_applied_maintenance` and `_applied_materialize` are already correct here — a denied
-    `CAP_TABLE_FACTS`/`CAP_INDEXES` read shows up as `null`, never as a measurement, before
-    this function would ever need to be consulted. ADV105 is the one code that does *not*
-    read `physical_state` at all (see `_applied_advisor`): its applied signal is a
-    proposal's absence, which a denied `CAP_ADVISOR` read produces identically to a
-    genuine "Advisor has nothing to say" — `_advisor_rows` catches the failure, records it
-    in `degraded`, and returns `[]` either way. `verify.py` must consult `degraded`
-    directly for exactly this one code, since nothing else disambiguates the two.
+    **This enum exists because one defect class has now recurred three times through three
+    different doors, and each time the mechanism was identical: an absence produced by one
+    run's own limitations was read as a measurement.** `physical_state` scoped to that
+    run's proposal relations (Task 6 fix round 1); `query_groups` scoped to that run's own
+    citations (fix round 3); a denied capability read emptying the data (fix round 3's
+    ADV105 fix, applied to exactly one capability of nine — finding N1). Naming the
+    absences instead of the capabilities inverts the question that kept being answered
+    incompletely: not "which capability did we remember to check?" but "which conclusions
+    rest on something *not* being there, and what could have produced that emptiness
+    without the database having changed at all?"
+
+    A member here is a claim `verify` makes **from nothing being present**. An absence is
+    only evidence when every read that would have put something there actually ran — which
+    is what `_ABSENCE_DEPENDENCIES` records and `_absence_disclosure` enforces. Adding a
+    member without an entry in that table raises `KeyError` at first use rather than
+    defaulting to "nothing can fabricate this", and
+    `test_every_absence_verify_reads_as_evidence_is_classified` pins it directly.
+
+    * `CITED_QUERY_GROUP` — "a query group this proposal cited is not in `after`'s
+      `query_groups`". Read three ways in `verdicts`: as `DISAPPEARED`, as the
+      `applied is None` "possibly addressed by a query rewrite" reading, and (negatively)
+      as the absence of a comparable `mean_after`.
+    * `ADVISOR_RECOMMENDATION` — "this ADV105 recommendation is not in `after`'s
+      `proposals`". ADV105 is the one code whose applied signal is a *proposal's* absence
+      rather than a `physical_state` delta (see `_applied_advisor`), so it is the one code
+      for which a missing proposal is a claim about the database rather than about the
+      artifact.
+
+    **Absences deliberately not members, each checked rather than assumed:**
+
+    * *A relation missing from `physical_state`, or a null field within an entry.* Both
+      adapters fold every capability denial into `null` themselves — `have_facts`/
+      `have_indexes` in `PostgresWorkloadAdapter.physical_state` and
+      `RedshiftWorkloadAdapter.physical_state` gate on `... not in self.degraded` — and
+      `_physical_entry` maps a wholly missing relation onto the same `null`s. Every
+      `_applied_*` helper then returns `None` on a `null`, never a guessed `False`
+      (Ruling 1). So the denial is already disclosed one layer down, in the artifact
+      itself, and re-checking `degraded` here would be a second, weaker copy of a gate
+      that is already load-bearing and already pinned.
+    * *A null `window` field.* `classify_windows` reads a null `stats_reset_at` as
+      `INCOMPARABLE` (never as "equal to the other null"), and `WindowLimits.
+      may_be_sampling_artifact` reads a null `limit` as "cannot rule out sampling". Both
+      already treat the absence as unknown rather than as a measurement, which is exactly
+      what a `CAP_STATS_RESET` denial needs.
+    * *Only N of M cited groups resolving in `after`* (the partial-citation note). That
+      note states a property of the artifact ("N of M were present … the figures above
+      reflect only those") and draws no conclusion about the database from the M−N that
+      were not, so there is nothing for a degradation to fabricate.
+    * *`cost_share_after` being `None`.* Ruling 4: `None` there already means "could not be
+      read off unambiguously", identical for an absent and an ambiguous key.
+    * *A proposal absent from `after` for any code other than ADV105.* `verdicts` derives
+      `applied` for every other code from `physical_state` alone, and Ruling 10 keeps
+      "new in `after`" out of this module entirely.
+    """
+
+    CITED_QUERY_GROUP = "cited_query_group"
+    ADVISOR_RECOMMENDATION = "advisor_recommendation"
+
+
+#: Which degradations can produce each `Absence` **without the database having changed** —
+#: the general form of finding N1, which fix round 3 solved for one cell of this table only.
+#: A plain lookup, like `_CONFIDENCE_BY_RELATION`, so a third `Absence` member added without
+#: an entry raises `KeyError` rather than silently earning "nothing can fabricate this".
+#:
+#: Capability by capability, for both engines:
+#:
+#: * `workload` — the whole of `query_groups`. `_query_groups_payload` emits one entry per
+#:   `workload.stats` group, and a denied read leaves `stats` empty: `_run` swallows the
+#:   failure into `degraded` and returns `[]` (postgres.py, redshift.py), while
+#:   `self._window_limit` is recorded regardless, so both sides report the same `limit` and
+#:   Ruling 2's `may_be_sampling_artifact` gate does *not* fire. Blocks
+#:   `CITED_QUERY_GROUP`. It also empties `aggregation.tables`, and ADV105's Advisor rows
+#:   are fetched for `aggregation.tables | facts` (redshift.py's `propose`), so it blocks
+#:   `ADVISOR_RECOMMENDATION` too — a route the round-3 fix missed entirely.
+#: * `schema` — no column metadata, so the aggregator cannot qualify relations and
+#:   `aggregation.tables` shrinks or empties; same consequence for ADV105's row fetch.
+#:   Blocks `ADVISOR_RECOMMENDATION`. Does *not* touch `workload.stats`, so
+#:   `query_groups` is unaffected.
+#: * `table_facts` — empties `facts`, the other half of ADV105's fetch set: a relation
+#:   reached only through `star_tables` has facts but never appears in
+#:   `aggregation.tables`, so its Advisor row is fetched solely because `facts` covers it.
+#:   Blocks `ADVISOR_RECOMMENDATION`. Its effect on `physical_state` is already `null`, per
+#:   `Absence`'s docstring.
+#: * `advisor` — Advisor's own rows; `_advisor_rows` records the failure and returns `[]`,
+#:   producing the identical empty list a resolved recommendation does. Blocks
+#:   `ADVISOR_RECOMMENDATION` (fix round 3's original fix, preserved).
+#: * `indexes` — Postgres index lists. Postgres emits no ADV105, and this read feeds no
+#:   query group, so it fabricates neither absence; it is already `null`-disclosed in
+#:   `physical_state`.
+#: * `ndv` — `pg_stats` selectivity, Postgres-only. Can suppress a Postgres *proposal*, but
+#:   no Postgres code reads a proposal's absence as evidence (Ruling 10, and ADV105 is
+#:   Redshift-only), and it feeds no query group. Fabricates neither absence.
+#: * `stats_reset` — `pg_stat_database.stats_reset`, Postgres-only; only ever reaches the
+#:   `window` object, where null already means `INCOMPARABLE`. Fabricates neither absence.
+#: * `read_only` — Redshift's session could not be pinned read-only. Reads no data at all,
+#:   so it removes nothing from any payload key. Fabricates neither absence — and it is the
+#:   reason `_degraded_names` must compare capability *names* rather than merely asking
+#:   whether `degraded` is non-empty (finding N3): this entry is common on real clusters and
+#:   would otherwise collapse every ADV105 verdict to "unknown".
+#: * `physical_facts_gap` — Redshift relations with a hot predicate that `svv_table_info`
+#:   omits, which `propose` declines to grade rather than guessing. It suppresses
+#:   ADV101/ADV102/ADV103 proposals, whose applied signal is `physical_state`, never a
+#:   proposal's absence; ADV105's own row fetch is unaffected by it. Fabricates neither
+#:   absence.
+_ABSENCE_DEPENDENCIES: Final[dict[Absence, frozenset[str]]] = {
+    Absence.CITED_QUERY_GROUP: frozenset({_CAP_WORKLOAD}),
+    Absence.ADVISOR_RECOMMENDATION: frozenset(
+        {_CAP_ADVISOR, _CAP_WORKLOAD, _CAP_SCHEMA, _CAP_TABLE_FACTS}
+    ),
+}
+
+#: How to name each absence inside `_absence_disclosure`'s sentence. Separate from the enum
+#: values so the wording can be a readable clause without the enum member becoming prose.
+_ABSENCE_SUBJECTS: Final[dict[Absence, str]] = {
+    Absence.CITED_QUERY_GROUP: "a cited query group's absence from that run's query_groups",
+    Absence.ADVISOR_RECOMMENDATION: "this recommendation's absence from that run's proposals",
+}
+
+
+def _degraded_names(payload: dict[str, object]) -> frozenset[str]:
+    """The `capability` names `payload["degraded"]` records, as a set.
 
     `payload["degraded"]` entries are `{"capability": ..., "reason": ...}` dicts (see
-    `report.py`'s `advise_payload`); malformed entries are ignored rather than raised on,
-    matching this module's discipline everywhere else.
+    `report.py`'s `advise_payload`); a non-list `degraded`, a non-dict entry, or a
+    non-string `capability` is ignored rather than raised on, matching this module's
+    discipline everywhere else. An **absent** `degraded` key likewise yields the empty set:
+    an artifact predating the key is not an artifact that declared a denial, and Task 7
+    validates payload shape before handing artifacts here.
     """
     degraded = payload.get("degraded")
     if not isinstance(degraded, list):
-        return False
-    return any(
-        isinstance(entry, dict) and entry.get("capability") == capability for entry in degraded
+        return frozenset()
+    names: set[str] = set()
+    for entry in degraded:
+        if not isinstance(entry, dict):
+            continue
+        capability = entry.get("capability")
+        if isinstance(capability, str):
+            names.add(capability)
+    return frozenset(names)
+
+
+def _absence_disclosure(payload: dict[str, object], absence: Absence, side: str) -> str | None:
+    """Why `absence`, observed in `payload`, is **not** evidence — or `None` when it is.
+
+    The single gate every absence-derived conclusion in this module passes through. `side`
+    is `"before"`/`"after"`, for the sentence only.
+
+    Two independent reasons to withhold, both reported when both apply:
+
+    * `payload` declares a degradation `_ABSENCE_DEPENDENCIES` says can produce this exact
+      emptiness. The absence is then indistinguishable from the read simply not having
+      happened.
+    * `payload` declares a degradation this version of `verify` cannot name at all — an
+      artifact from a newer `sqlquality`. `KNOWN_DEGRADATIONS` is pinned to the adapters'
+      own constants, so this cannot mean "someone forgot to add it here" within one
+      version; across versions it means the blind spot is real and unbounded, which is
+      precisely the case for disclosing rather than assuming.
+
+    Deliberately *not* consulted when the absence is not actually being read as evidence:
+    a fully-resolved `after` still grades `IMPROVED` at full confidence even under an
+    unrecognized degradation, because nothing about that verdict rests on something being
+    missing. Over-caution is cheaper than over-claiming, but only where the claim exists.
+    """
+    declared = _degraded_names(payload)
+    blocking = sorted(declared & _ABSENCE_DEPENDENCIES[absence])
+    unrecognized = sorted(declared - KNOWN_DEGRADATIONS)
+    if not blocking and not unrecognized:
+        return None
+    causes: list[str] = []
+    if blocking:
+        causes.append("degraded read(s) " + ", ".join(blocking))
+    if unrecognized:
+        causes.append(
+            "degradation(s) this version of sqlquality cannot interpret ("
+            + ", ".join(unrecognized)
+            + ")"
+        )
+    return (
+        f"The {side} run reported {' and '.join(causes)} in its `degraded` list; a read "
+        f"that could not run produces the same emptiness a real change would, so "
+        f"{_ABSENCE_SUBJECTS[absence]} is not evidence here."
     )
 
 
@@ -955,22 +1150,23 @@ def _applied_advisor(
     row disappearing *is* the applied signal — a deliberate, disclosed exception to every
     other code's "from `physical_state` and nothing else" rule (see the Task 6 report).
 
-    **Checked first, before proposal presence at all (Finding 2, fix round 3):** if
-    `after`'s `CAP_ADVISOR` read was denied, Advisor's row being absent proves nothing —
-    the read never happened, so `None` with the reason in the note, never a guessed
-    `True`.
+    **Checked first, before proposal presence at all (Finding 2, fix round 3; widened for
+    finding N1, fix round 4):** if anything in `after`'s `degraded` list could have removed
+    this recommendation from `after`'s own proposal list, its absence proves nothing — the
+    read never happened, so `None` with the reason in the note, never a guessed `True`.
+    Round 3 checked `CAP_ADVISOR` alone; `Absence.ADVISOR_RECOMMENDATION` covers the three
+    further capabilities that suppress an ADV105 proposal just as completely, because
+    `propose` fetches Advisor's rows for `aggregation.tables | facts` rather than for the
+    whole cluster — see `_ABSENCE_DEPENDENCIES` for the per-capability reasoning.
 
     Otherwise: `True` when this exact key is absent from `after`'s *matched* proposals
     (Advisor no longer recommends it); `False` when still present, unambiguously, under
     the same key; `None`, with an explanatory note, when the key collides in `after`
     (Ruling 4 — an ambiguous match must never be read as either "gone" or "still there").
     """
-    if _capability_denied(after, _CAP_ADVISOR):
-        return None, (
-            "The after run's Amazon Redshift Advisor read was denied (see its `degraded` "
-            "entry); the recommendation's absence proves nothing when the read never "
-            "happened."
-        )
+    withheld = _absence_disclosure(after, Absence.ADVISOR_RECOMMENDATION, "after")
+    if withheld is not None:
+        return None, withheld
     if key in after_index.collisions:
         return None, (
             "This recommendation's key matched more than one proposal in the after run; "
@@ -1140,7 +1336,12 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
     2. `applied is None` -> `UNOBSERVABLE`. Ruling 1 makes this reachable via two
        independent routes — a code with nothing to observe by design (ADV005, ADV006,
        ADV303), or a code that could observe something but `physical_state` reports
-       `null` for the field it needs — and both must land here, never at `False`.
+       `null` for the field it needs — and both must land here, never at `False`. The
+       "cited group vanished, so possibly addressed by a rewrite" reading inside this
+       branch is itself gated by `_absence_disclosure` (finding N1): the same denied
+       `CAP_WORKLOAD` read that empties `query_groups` also empties `physical_state`, so
+       this is the *reachable* route by which a degraded `after` run used to be reported
+       as a query that stopped running.
     3. Only once `applied is True` does this function look at the cited query groups at
        all:
        - no citation resolves to a usable mean in `before` (no citations at all, by
@@ -1149,9 +1350,12 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
          `UNOBSERVABLE`: an applied signal exists, but no workload evidence to grade a
          speed change against.
        - at least one citation resolves in `before` but none resolve in `after` -> a
-         candidate `DISAPPEARED`, gated by Ruling 2:
-         `window_limits(before, after).may_be_sampling_artifact` forbids grading
-         `DISAPPEARED` outright, downgrading to `UNOBSERVABLE` with the reason stated in
+         candidate `DISAPPEARED`, gated **twice**, in this order: first by
+         `_absence_disclosure(after, Absence.CITED_QUERY_GROUP, ...)` (finding N1 — a
+         degraded workload read in `after` empties `query_groups` while still recording
+         `limit`, so it slips past the second gate entirely), then by Ruling 2's
+         `window_limits(before, after).may_be_sampling_artifact`. Either forbids grading
+         `DISAPPEARED`, downgrading to `UNOBSERVABLE`/`LOW` with the reason stated in
          `note` instead.
        - citations resolve in `after` but sum to zero calls -> `UNOBSERVABLE` (Ruling 7
          again, this time on the `after` side).
@@ -1197,13 +1401,35 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
             notes.append(applied_note)
         confidence = ceiling
 
+        # Finding N1 (fix round 4): the one gate every conclusion drawn from a cited
+        # group's *absence* from `after` passes through. Evaluated once, here, and
+        # consulted as the first condition of each branch below that reads
+        # `present_after == 0` — so a branch cannot reach a conclusion about the user's
+        # workload from an emptiness `after`'s own degraded read produced. See
+        # `Absence`/`_ABSENCE_DEPENDENCIES` for why this is a table rather than one more
+        # hand-placed capability check, and `_absence_disclosure` for why it is not
+        # consulted where no absence is being read.
+        after_groups_withheld = _absence_disclosure(after, Absence.CITED_QUERY_GROUP, "after")
+
         if applied is False:
             outcome = VerifyOutcome.NOT_APPLIED
             notes.append("physical_state shows the proposed change was not made.")
         elif applied is None:
             vanished = bool(digests) and present_before > 0 and present_after == 0
             outcome = VerifyOutcome.UNOBSERVABLE
-            if vanished:
+            if vanished and after_groups_withheld is not None:
+                # The reachable half of finding N1: a denied `CAP_WORKLOAD` read in `after`
+                # empties `query_groups` *and* `physical_state` at once (the same denial
+                # empties `aggregation.tables`, so no relation is fetched), so `applied` is
+                # `None` and every cited digest is unresolvable — which read as "the query
+                # stopped running, possibly because you rewrote it" for a query that may
+                # well still be running unchanged.
+                confidence = Confidence.LOW
+                notes.append(
+                    "This proposal's application cannot be observed directly. "
+                    + after_groups_withheld
+                )
+            elif vanished:
                 confidence = Confidence.LOW
                 notes.append(
                     "This proposal's application cannot be observed directly, and its "
@@ -1250,7 +1476,15 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
                     "mean in the before run; only the applied signal above is available."
                 )
         elif present_after == 0:
-            if limits.may_be_sampling_artifact:
+            if after_groups_withheld is not None:
+                # Ruling 2's sibling, and the door finding N1 came through: `limit` is
+                # recorded even when the workload read itself was refused, so the two sides'
+                # limits match and `may_be_sampling_artifact` stays `False`. A degraded read
+                # must be checked *before* that gate, not after it.
+                outcome = VerifyOutcome.UNOBSERVABLE
+                confidence = Confidence.LOW
+                notes.append(after_groups_withheld)
+            elif limits.may_be_sampling_artifact:
                 outcome = VerifyOutcome.UNOBSERVABLE
                 confidence = Confidence.LOW
                 notes.append(

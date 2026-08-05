@@ -1076,6 +1076,7 @@ def _payload(
     stats_reset_at: str | None = "2026-08-01T00:00:00",
     since_duration_seconds: float | None = None,
     limit: int | None = 500,
+    degraded: Sequence[dict[str, object]] = (),
 ) -> dict[str, object]:
     relation_key = f"{schema}.{table}"
     digests = [g[0] for g in groups]
@@ -1132,6 +1133,9 @@ def _payload(
             "since_duration_seconds": since_duration_seconds,
             "limit": limit,
         },
+        # Always present, `[]` by default, exactly as `advise_payload` emits it — an absent
+        # `degraded` key is a pre-this-feature artifact, not a run that declared nothing.
+        "degraded": list(degraded),
         "proposals": [
             {"code": proposal_code, "title": "test proposal", "evidence": evidence, "ddl": ddl}
         ],
@@ -2225,3 +2229,282 @@ def test_the_headline_case_a_resolved_proposal_still_grades_applied_and_improved
     [verdict] = verdicts(before, after)
     assert verdict.applied is True
     assert verdict.outcome is VerifyOutcome.IMPROVED
+
+
+# --- Finding N1, fix round 4: the general form -------------------------------------------
+#
+# One defect class has now recurred three times through three different doors, always by the
+# same mechanism: an absence produced by one run's own limitations read as a measurement
+# about the user's database. Round 3 fixed the third instance for exactly one capability of
+# the nine either adapter can record. These tests pin the *class*: `Absence` names each
+# absence `verify` reads as evidence, `_ABSENCE_DEPENDENCIES` records what can fabricate it,
+# and the two "…is_classified" tests below make omission impossible rather than merely
+# discouraged.
+#
+# The `after` payload in the first test is not invented. It was captured from a real `advise
+# --json` run against a live PostgreSQL 16 whose `pg_stat_statements` read genuinely failed
+# (see tests/integration/test_verify_degraded_after_live.py, which reproduces it end to end):
+# `proposals: []`, `physical_state: {}`, `query_groups: []`, `degraded` naming `workload`,
+# and — the mechanism that made this slip past Ruling 2 — `window.limit` still recorded as
+# `500`, identical to the before run's, so `may_be_sampling_artifact` stays `False`.
+
+_WORKLOAD_DENIED = {
+    "capability": "workload",
+    "reason": (
+        'relation "pg_stat_statements" does not exist — requires the pg_stat_statements '
+        "extension (PostgreSQL 13+) and pg_read_all_stats or superuser"
+    ),
+}
+
+
+def _degraded_workload_after(*, limit: int | None = 500) -> dict[str, object]:
+    """The whole payload a real `advise --json` run emits when its `CAP_WORKLOAD` read
+    fails — captured live, not composed. Every emptiness here follows from that one denial:
+    `_run` swallows the failure into `degraded` and returns `[]`, so `workload.stats` is
+    empty, so `query_groups` is `[]` *and* `aggregation.tables` is empty, so no proposal
+    fires and `physical_state` (built from `proposal_relations(proposals) |
+    aggregation.tables`) is `{}`. `window.limit` is recorded regardless."""
+    return {
+        "engine": "postgres",
+        "redacted": True,
+        "window": {
+            "description": "since stats reset at an unknown time",
+            "engine": "postgres",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": limit,
+        },
+        "analyzed": {
+            "query_groups": 0,
+            "query_groups_in_window": 0,
+            "total_cost_ms": 0,
+            "tables": [],
+        },
+        "skipped": {"unparseable": 0, "noise": 0, "unqualifiable": 0, "ambiguous": 0},
+        "degraded": [dict(_WORKLOAD_DENIED)],
+        "proposals": [],
+        "physical_state": {},
+        "query_groups": [],
+    }
+
+
+def test_finding_n1_a_degraded_after_workload_read_is_not_a_query_group_that_stopped_running():
+    """The reachable half of finding N1, and the third recurrence of this task's defect
+    class. `before` is an ordinary run: ADV001 on `public.orders`, citing one query group
+    that ran ten times. `after` is a real run whose `pg_stat_statements` read was refused.
+
+    Before this fix `verify` said: "its cited query group(s) are absent from the after run
+    — possibly addressed (for example, by a query rewrite)". The query may well still be
+    running, unchanged, every minute; the *read* is what did not happen. Note that both
+    runs report `limit: 500`, so Ruling 2's sampling gate cannot catch this — the reason a
+    second, earlier gate is needed rather than a wider version of that one."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], stats_reset_at=None)
+    after = _degraded_workload_after()
+
+    # The exact mechanism, asserted rather than assumed: the limits match, so Ruling 2's
+    # gate is not what saves this.
+    limits = window_limits(before, after)
+    assert limits.may_be_sampling_artifact is False
+
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.mean_before == 100.0 and verdict.mean_after is None
+    assert "degraded" in verdict.note and "workload" in verdict.note
+    assert "possibly addressed" not in verdict.note
+    assert "absent from the after run" not in verdict.note
+
+    # The control: the identical artifact pair with nothing degraded genuinely *is* a
+    # vanished query group, and must still be reported as one. The fix must not collapse
+    # every unobservable proposal into "we cannot say".
+    after_clean = {**after, "degraded": []}
+    [verdict_clean] = verdicts(before, after_clean)
+    assert verdict_clean.applied is None
+    assert verdict_clean.outcome is VerifyOutcome.UNOBSERVABLE
+    assert "possibly addressed" in verdict_clean.note
+
+
+def _adv105_pair(after_degraded: Sequence[dict[str, object]]) -> tuple[dict, dict]:
+    """A Redshift ADV105 pair whose recommendation is present in `before` and absent from
+    `after` — the shape `_applied_advisor` reads as "Advisor no longer recommends it"."""
+    sort_rec = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": None,
+            "current_ddl": None,
+        },
+        "ddl": None,
+    }
+    window = {
+        "description": "d",
+        "engine": "redshift",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": 500,
+    }
+    before = {
+        "proposals": [sort_rec],
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+        "degraded": [],
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+        "degraded": [dict(entry) for entry in after_degraded],
+    }
+    return before, after
+
+
+@pytest.mark.parametrize("capability", ["advisor", "workload", "schema", "table_facts"])
+def test_finding_n1_adv105_applied_is_none_when_any_read_feeding_its_proposal_was_denied(
+    capability,
+):
+    """Round 3 gated ADV105 on `CAP_ADVISOR` alone. Three further capabilities suppress an
+    ADV105 proposal just as completely, because `RedshiftWorkloadAdapter.propose` fetches
+    Advisor's rows for `aggregation.tables | frozenset(facts)` rather than for the whole
+    cluster: `workload` empties `aggregation.tables` (the same denial demonstrated live for
+    Postgres above), `schema` leaves the aggregator unable to qualify relations into it, and
+    `table_facts` empties `facts`, which is the *only* reason a relation reached solely
+    through `star_tables` gets an Advisor row at all.
+
+    Each therefore produces the identical empty `proposals` list a genuinely-resolved
+    recommendation does — `applied=True` there is the tool telling a user they addressed
+    something when it never looked."""
+    before, after = _adv105_pair([{"capability": capability, "reason": "permission denied"}])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert "degraded" in verdict.note and capability in verdict.note
+
+
+def test_finding_n3_a_degradation_that_cannot_suppress_the_proposal_still_reaches_applied():
+    """Finding N3, and the boundary that keeps this fix from being a blanket "any
+    degradation means we cannot say". `read_only` (Redshift could not pin the session
+    read-only) reads no data at all, so it removes nothing from `proposals` — a real
+    cluster that reports it must still get a real ADV105 verdict.
+
+    This is what the removed `_capability_denied` could not express: mutating its
+    `entry.get("capability") == capability` to `"capability" in entry` left the whole suite
+    green (re-review finding N3). The replacement compares *names* against a per-absence
+    dependency set, and this test fails the moment that comparison stops discriminating."""
+    before, after = _adv105_pair([{"capability": "read_only", "reason": "not permitted"}])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+
+    # …and `physical_facts_gap`, the other Redshift degradation that suppresses only
+    # ADV101/ADV102/ADV103 (whose applied signal is `physical_state`), never ADV105's row.
+    _, after_gap = _adv105_pair([{"capability": "physical_facts_gap", "reason": "2 relations"}])
+    [verdict_gap] = verdicts(before, after_gap)
+    assert verdict_gap.applied is True
+
+
+def test_finding_n1_a_degradation_this_version_cannot_name_forbids_a_disappeared_verdict():
+    """The structural half of the fix, seen from the runtime side. `verify` and `advise` are
+    two commands over an artifact that can be weeks old, so an `after` written by a *newer*
+    sqlquality can name a degradation this version has never heard of. It cannot know what
+    that read would have populated, so it cannot rule out that the absence it is about to
+    grade `DISAPPEARED` was manufactured by it.
+
+    This payload is the genuine `DISAPPEARED` shape — the index is in `physical_state`, so
+    `applied` is `True`, and both limits are `500` — with one unrecognizable `degraded`
+    entry added. That combination is emittable by any future version whose new capability
+    does not itself feed `aggregation`; it is exactly the "seventh capability" case."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], limit=500)
+    after = _payload(
+        groups=(),
+        limit=500,
+        degraded=[{"capability": "lock_contention", "reason": "permission denied"}],
+    )
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.confidence is Confidence.LOW
+    assert "lock_contention" in verdict.note
+    assert "no longer appear" not in verdict.note
+
+    # The control this gate needs to be worth anything: a *recognized* degradation that
+    # cannot empty `query_groups` (`ndv` reads pg_stats for selectivity only) must leave the
+    # genuine DISAPPEARED verdict exactly as it was.
+    after_ndv = _payload(
+        groups=(),
+        limit=500,
+        degraded=[{"capability": "ndv", "reason": "permission denied for relation pg_stats"}],
+    )
+    [verdict_ndv] = verdicts(before, after_ndv)
+    assert verdict_ndv.outcome is VerifyOutcome.DISAPPEARED
+    assert "no longer appear" in verdict_ndv.note
+
+
+def test_an_unrecognized_degradation_does_not_downgrade_a_verdict_that_reads_no_absence():
+    """The other boundary: `_absence_disclosure` is consulted only where a conclusion rests
+    on something being missing. A fully-resolved `after` — the group is present, the mean
+    dropped 60% — rests on measurements, so an unrecognizable `degraded` entry must not
+    touch it. Without this pin, "disclose the blind spot" degenerates into "cap everything
+    to LOW whenever `degraded` is non-empty", which would make the tool useless on exactly
+    the clusters that report a routine degradation on every run."""
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(
+        groups=[("aaa", 10, 400.0)],
+        degraded=[{"capability": "lock_contention", "reason": "permission denied"}],
+    )
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.IMPROVED
+    assert verdict.confidence is confidence_for(classify_windows(before, after))
+    assert "lock_contention" not in verdict.note
+
+
+def test_every_degradation_either_adapter_can_record_is_classified():
+    """The structural pin. `verify.py` may never import either adapter (both pull in this
+    project's live-connection machinery), so `KNOWN_DEGRADATIONS` duplicates their capability
+    names as plain strings — and a duplicated list is exactly the kind of thing that silently
+    falls behind. This test is the link: adding a `CAP_*` or `DEGRADATION_*` constant to
+    either adapter reddens the suite until someone has decided, in `_ABSENCE_DEPENDENCIES`,
+    which of `verify`'s absence-derived conclusions the new denial can fabricate.
+
+    Three rounds of this task's review have found that decision missing — for
+    `physical_state`, for `query_groups`, and for eight of nine capabilities. Making the
+    omission fail a test is the only version of the fix that does not depend on the next
+    person remembering."""
+    from sqlquality.verify import KNOWN_DEGRADATIONS
+    from sqlquality.workload import postgres, redshift
+
+    recorded = {
+        value
+        for module in (postgres, redshift)
+        for name, value in vars(module).items()
+        if (name.startswith("CAP_") or name.startswith("DEGRADATION_")) and isinstance(value, str)
+    }
+    assert recorded, "collected no capability constants — this test would pass vacuously"
+    assert recorded == set(KNOWN_DEGRADATIONS), (
+        "the adapters and verify.py disagree about which degradations exist; "
+        f"only in the adapters: {sorted(recorded - set(KNOWN_DEGRADATIONS))}, "
+        f"only in verify.py: {sorted(set(KNOWN_DEGRADATIONS) - recorded)}"
+    )
+
+
+def test_every_absence_verify_reads_as_evidence_is_classified():
+    """The enum's own half of the same pin, matching `_CONFIDENCE_BY_RELATION`'s established
+    pattern: a third `Absence` member added without a dependency set must not silently earn
+    "nothing can fabricate this". Also checks the table names no degradation the adapters
+    cannot produce, which would be a dead entry giving false assurance."""
+    from sqlquality.verify import _ABSENCE_DEPENDENCIES, Absence, KNOWN_DEGRADATIONS
+
+    assert set(Absence) == set(_ABSENCE_DEPENDENCIES), (
+        f"unclassified: {sorted(a.value for a in set(Absence) - set(_ABSENCE_DEPENDENCIES))}"
+    )
+    for absence, dependencies in _ABSENCE_DEPENDENCIES.items():
+        assert dependencies, f"{absence.value} claims nothing can fabricate it"
+        assert dependencies <= KNOWN_DEGRADATIONS, (
+            f"{absence.value} depends on names no adapter records: "
+            f"{sorted(dependencies - KNOWN_DEGRADATIONS)}"
+        )

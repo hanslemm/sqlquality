@@ -70,7 +70,18 @@ Consequences worth stating plainly:
 Today's top-level keys are `analyzed`, `degraded`, `engine`, `proposals`, `redacted`, `skipped`, `window`. Three additions are purely additive; the fourth changes an existing key's type.
 
 - **`proposals[].evidence.fingerprint_digests`** — digests of the groups backing this proposal. **Added alongside** today's `fingerprints` / `co_occurring_fingerprints` counts, which stay as they are. Reuses the existing `_fingerprint_id` (sha256, 12 hex chars).
-- **`query_groups`** — new top level: `digest`, `calls`, `total_time_ms`, `mean_ms`. **Only groups referenced by a proposal**, so size scales with findings rather than schema. Query text is not duplicated here; it already appears in the evidence of the rules that carry it. `mean_ms` is `total_time_ms / calls`, and is `null` when `calls` is 0 — a group with no recorded calls has no meaningful mean, and emitting `0.0` would read as "instant".
+- **`query_groups`** — new top level: `digest`, `calls`, `total_time_ms`, `mean_ms`. Query text is not duplicated here; it already appears in the evidence of the rules that carry it. `mean_ms` is `total_time_ms / calls`, and is `null` when `calls` is 0 — a group with no recorded calls has no meaningful mean, and emitting `0.0` would read as "instant".
+
+  **Every query group the run's workload analysis carries (`workload.stats`)** — corrected
+  during Task 6's fix round 3 after review found the original requirement here, "only
+  groups referenced by a proposal", to be the *identical* blind spot as the `physical_state`
+  scoping corrected below, one payload key over: a group whose proposal is resolved between
+  two runs (the index now exists, so the rule stops citing it) vanished from `after` even
+  though it was still running, and `verify` graded the success case `DISAPPEARED`. Size
+  still scales with the workload rather than the schema, because `workload.stats` is bounded
+  by the same `--limit` — `analyzed.query_groups_in_window` reports the count. Recorded here
+  rather than silently amended in the implementation so this requirement cannot instruct a
+  future implementer to reintroduce the bug review already found once.
 - **`physical_state`** — new top level, keyed by the **string** `"schema.table"` (a `Relation` is not JSON-serializable — a `TypeError` here would fire after the whole analysis had run, which this project has already shipped once). Records, per relation:
   - both engines: `relkind` — table, view, or materialized view — which is what makes ADV301's application observable;
   - Postgres: each index's `name`, `columns`, `is_partial`, `is_unique`;

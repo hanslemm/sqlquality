@@ -363,7 +363,9 @@ def test_mean_ms_is_null_rather_than_zero_when_a_group_has_no_calls():
     assert group["mean_ms"] is None
 ```
 
-Plus: `query_groups` contains only digests referenced by a proposal, and every digest in every proposal's `fingerprint_digests` resolves to a group (no dangling references — a dangling digest would make a proposal unverifiable).
+Plus: every digest in every proposal's `fingerprint_digests` resolves to a group (no dangling references — a dangling digest would make a proposal unverifiable).
+
+**Corrected during Task 6's fix round 3, recorded here rather than silently amended in the code:** this criterion originally also required that `query_groups` contain *only* digests referenced by a proposal. Review found that to be the identical blind spot as the `physical_state` scoping corrected in the design doc, one payload key over — a group whose proposal is resolved between two runs (the index now exists, so the rule stops citing it) vanished from the later artifact even though the query was still running, and `verify` graded the success case `DISAPPEARED`. `query_groups` therefore carries one entry per `workload.stats` group, unconditionally; it stays bounded by `--limit`, so size still scales with the workload rather than the schema.
 
 - [ ] **Step 2–6:** run red, implement, run green, then run the full suite and all four gates.
 
