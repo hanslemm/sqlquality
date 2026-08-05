@@ -82,6 +82,13 @@ _INDEX_ON_STATUS = [
     )
 ]
 
+#: The same index row with `idx_scan = 0` — an **unused** index, so ADV002 fires on it. Field 7 is
+#: the scan count; `_INDEX_ON_STATUS`'s 42 makes it a used index and no ADV002 is proposed. Needed
+#: because ADV002 is the proposal a denied `pg_index` read suppresses, which is the member of
+#: `_ABSENCE_DEPENDENCIES[BEFORE_COUNTERPART]` whose absence from the suite let the set be
+#: narrowed to one member with everything green.
+_UNUSED_INDEX_ON_STATUS = [(*_INDEX_ON_STATUS[0][:7], 0, *_INDEX_ON_STATUS[0][8:])]
+
 #: The hot statement whose ADV001 proposal every headline test below follows.
 _HOT_STATEMENT = "select id from orders where status = $1"
 
@@ -1168,6 +1175,85 @@ def test_an_ndv_denied_after_run_is_gated_and_a_workload_denied_one_has_nothing_
     )
     assert json.loads(empty_after.read_text())["proposals"] == []
     assert _payload_of(before, empty_after)["new_in_after"] == []
+
+
+#: The denials whose *suppression* of a proposal can be demonstrated on Postgres through the real
+#: `advise` path, as `(marker to deny, capability)`. Measured: each makes the run below propose
+#: strictly less than the same rows fully observed, which is asserted from the two artifacts before
+#: any verdict is examined.
+#:
+#: `indexes` is the one re-review demonstrated live (by revoking `SELECT ON pg_index`) and the one
+#: whose absence from the suite let `_ABSENCE_DEPENDENCIES[BEFORE_COUNTERPART]` be narrowed from
+#: seven members to `{workload}` with all 1209 tests green. `table_facts`, `advisor`,
+#: `physical_facts_gap` and `ndv` have no Postgres suppression case to write — see
+#: `tests/test_verify.py::_BEFORE_COUNTERPART_MEMBERS`, which carries the per-member reasoning and
+#: the behavioural case for all seven.
+_SUPPRESSION_ROUTES = [
+    ("pg_stat_statements", "workload"),
+    ("information_schema.columns", "schema"),
+    ("pg_index", "indexes"),
+]
+
+
+@pytest.mark.parametrize(
+    ("marker", "capability"), _SUPPRESSION_ROUTES, ids=[route[1] for route in _SUPPRESSION_ROUTES]
+)
+def test_a_real_denial_that_suppresses_a_proposal_gates_the_new_claim(
+    tmp_path, monkeypatch, marker, capability
+):
+    """Each demonstrable member of the before-side set, end to end through the real `advise` path:
+    the denial genuinely removes a proposal, and `verify` therefore refuses to call that proposal
+    new when the later, fully-observed run makes it.
+
+    The suppression is **asserted from the two artifacts**, not assumed: the fully-observed run's
+    proposal keys must be a strict superset of the denied run's, and the key that goes missing must
+    be exactly the one `new_in_after` then reports. A denial that stopped suppressing would fail
+    here rather than pass vacuously.
+
+    The isolation: `after` is fully observed (`degraded == []`) and both runs record the same known
+    `--limit`, so neither the relaxation arm nor the sampling arm can be what gates the claim.
+    """
+
+    def keys(payload: dict) -> set[tuple]:
+        return {
+            (p["code"], p["evidence"].get("index"), tuple(p["evidence"].get("columns", ())))
+            for p in payload["proposals"]
+        }
+
+    rows = {**_pg_rows(), "pg_index": _UNUSED_INDEX_ON_STATUS}
+    before = _artifact(
+        tmp_path,
+        "before.json",
+        _advise_stdout(monkeypatch, {**rows, marker: RuntimeError("denied")}),
+    )
+    after = _artifact(tmp_path, "after.json", _advise_stdout(monkeypatch, rows))
+
+    before_payload = json.loads(before.read_text())
+    after_payload = json.loads(after.read_text())
+    assert [d["capability"] for d in before_payload["degraded"]] == [capability]
+    assert after_payload["degraded"] == [], "the after run must be fully observed"
+    suppressed = keys(after_payload) - keys(before_payload)
+    assert suppressed, (
+        f"denying {marker} suppressed no proposal at all, so this route no longer demonstrates "
+        f"why {capability!r} is in the set: before={keys(before_payload)} after={keys(after_payload)}"
+    )
+
+    payload = _payload_of(before, after)
+    assert payload["new_in_after"], "the suppressed proposal did not reach the 'new' claim"
+    assert payload["limit"]["may_be_sampling_artifact"] is False, (
+        "the --limit arm can fire here, so this test would not prove the before-degraded arm"
+    )
+    assert payload["new_in_after_withheld"] is not None, (
+        f"a before run that could not read {capability!r} still had its missing proposal reported "
+        "as a new finding"
+    )
+    assert capability in payload["new_in_after_withheld"]
+
+    result = _verify(str(before), str(after))
+    assert result.exit_code == 0, result.output
+    assert "new rather than changed" not in result.stderr
+    assert "cannot rule out that they were already true and unseen" in result.stderr
+    assert f"degraded read(s) {capability}" in result.stderr
 
 
 def test_the_new_claim_and_the_disappeared_claim_are_gated_symmetrically(tmp_path, monkeypatch):
