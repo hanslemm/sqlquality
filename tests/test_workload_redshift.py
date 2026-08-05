@@ -242,6 +242,41 @@ def test_fetch_workload_window_names_the_truncation_not_full_coverage():
     assert "most expensive" in fetch.window_description.lower()
 
 
+def test_redshift_reports_the_since_cutoff_it_actually_bound():
+    """Unlike Postgres, `sys_query_history` carries timestamps, so `--since` is real and the
+    window is comparable by construction — which is what lets `verify` grade it HIGH."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["since"] is not None
+    assert facts["limit"] == 500
+    assert facts["stats_reset_at"] is None, "Redshift has no cumulative-counter reset"
+
+
+def test_redshift_window_facts_report_no_since_when_not_requested():
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(None, 500)
+    facts = adapter.window_facts()
+    assert facts["since"] is None
+    assert facts["limit"] == 500
+
+
+def test_redshift_window_facts_do_not_issue_sql():
+    """See the identical Postgres test's docstring: `window_facts()` must only read what
+    `fetch_workload` already recorded on the instance.
+
+    Recording the call rather than raising from the stub: `_run` swallows any exception
+    into `degraded` and returns `[]`, so a stub that raises would be silently absorbed and
+    this test would pass whether or not `window_facts()` actually queried.
+    """
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.window_facts()
+    assert calls == [], "window_facts() must not issue any SQL"
+
+
 def test_fetch_workload_since_is_actually_bound_into_the_statement():
     """Guards the claim the test above makes in prose: `--since` must change what the
     statement is run with, not just what the sentence says. Without this, a

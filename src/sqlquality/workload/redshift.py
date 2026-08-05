@@ -1162,6 +1162,12 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         #: second introspection round trip, since one CAP_TABLE_FACTS query already carries
         #: both the engine-neutral and the Redshift-specific columns.
         self.physical_facts: dict[Relation, RedshiftTableFacts] = {}
+        #: Recorded by `fetch_workload` for `window_facts()` to report without re-querying
+        #: — see that method's docstring on `PostgresWorkloadAdapter` for why it must not
+        #: issue SQL. `None` until `fetch_workload` runs, or when it ran with no `--since`.
+        self._since_cutoff: str | None = None
+        #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
+        self._window_limit: int | None = None
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1296,6 +1302,12 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
                 f"the {limit} most expensive successful queries recorded in "
                 "sys_query_history (no --since filter applied)"
             )
+        # Recorded for `window_facts()`, which must not issue SQL of its own — see
+        # `PostgresWorkloadAdapter.window_facts`'s docstring for why. Unlike Postgres,
+        # `since` genuinely is honoured here, so the cutoff actually bound is what gets
+        # reported — not merely echoing the caller's request back.
+        self._since_cutoff = cutoff.isoformat() if cutoff is not None else None
+        self._window_limit = limit
         return WorkloadFetch(
             rows=tuple(
                 RawQueryRow(
@@ -1317,6 +1329,21 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             ),
             window_description=window,
         )
+
+    def window_facts(self) -> dict[str, object]:
+        """What `fetch_workload` already read, recorded rather than re-queried.
+
+        `stats_reset_at` is always `None`: Redshift has no cumulative-counter reset the
+        way Postgres does, so there is nothing to report there. `since` is the actual
+        cutoff `fetch_workload` bound into the statement — see its docstring — not merely
+        the caller's request, since `sys_query_history` genuinely lets `--since` be
+        honoured.
+        """
+        return {
+            "stats_reset_at": None,
+            "since": self._since_cutoff,
+            "limit": self._window_limit,
+        }
 
     def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
         """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""

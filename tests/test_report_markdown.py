@@ -126,7 +126,13 @@ def test_payload_reports_proposals_window_and_skips():
     payload = _payload()
     assert payload["engine"] == "postgres"
     assert payload["redacted"] is True
-    assert payload["window"] == "since stats reset at 2026-07-01"
+    assert payload["window"] == {
+        "description": "since stats reset at 2026-07-01",
+        "engine": "postgres",
+        "stats_reset_at": None,
+        "since": None,
+        "limit": None,
+    }
     assert payload["proposals"][0]["code"] == "ADV001"
     assert payload["skipped"] == {
         "unparseable": 2,
@@ -135,6 +141,62 @@ def test_payload_reports_proposals_window_and_skips():
         "ambiguous": 4,
     }
     assert payload["degraded"] == [{"capability": "ndv", "reason": "permission denied"}]
+
+
+def test_window_is_an_object_carrying_what_the_comparison_needs():
+    """`verify` classifies two runs' windows as nested, disjoint or comparable, and cannot
+    do that from a prose sentence. Each field answers one question: `stats_reset_at`
+    whether Postgres's cumulative counters were cleared between runs, `since` whether a
+    duration was applied, `limit` whether the window was truncated."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="since stats reset at 2026-08-01T00:00:00"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={"stats_reset_at": "2026-08-01T00:00:00", "since": None, "limit": 500},
+    )
+    window = payload["window"]
+    assert isinstance(window, dict), "a prose string cannot be compared across runs"
+    assert window["description"] == "since stats reset at 2026-08-01T00:00:00"
+    assert window["engine"] == "postgres"
+    assert window["stats_reset_at"] == "2026-08-01T00:00:00"
+    assert window["since"] is None
+    assert window["limit"] == 500
+
+
+def test_the_window_description_is_preserved_verbatim():
+    """The prose sentence is what a human reads and it is already carefully worded — the
+    structured fields are added beside it, not instead of it."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="since stats reset at T (--since is not supported)"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={},
+    )
+    assert payload["window"]["description"] == ("since stats reset at T (--since is not supported)")
+
+
+def test_missing_window_facts_are_null_not_absent():
+    """A key that is absent and a key that is null are different to a consumer. `verify`
+    distinguishes "this engine cannot tell you" from "this field was never written", and
+    only the second is a reason to reject the artifact."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={},
+    )
+    for key in ("stats_reset_at", "since", "limit"):
+        assert key in payload["window"], f"{key} must be present even when unknown"
+        assert payload["window"][key] is None
 
 
 def test_payload_is_json_serializable():
