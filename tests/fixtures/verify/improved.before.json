@@ -1,0 +1,91 @@
+{
+  "analyzed": {
+    "query_groups": 3,
+    "query_groups_in_window": 3,
+    "tables": [
+      "g_improved.orders"
+    ],
+    "total_cost_ms": 43.236012
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "physical_state": {
+    "g_improved.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
+  "proposals": [
+    {
+      "code": "ADV001",
+      "confidence": "high",
+      "ddl": "CREATE INDEX ON \"g_improved\".\"orders\" (\"status\");",
+      "evidence": {
+        "calls": 5,
+        "co_occurring_fingerprints": 1,
+        "columns": [
+          "status"
+        ],
+        "cost_share": 0.9993813953053764,
+        "expression_indexes": [],
+        "fingerprint_digests": [
+          "d2e8aa0a67af"
+        ],
+        "leading_ndv": 3000.0,
+        "partial_indexes_skipped": [],
+        "roles": [
+          "equality"
+        ],
+        "row_estimate": 300000,
+        "schema": "g_improved",
+        "table": "orders"
+      },
+      "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
+      "title": "Add index on g_improved.orders(status)"
+    }
+  ],
+  "query_groups": [
+    {
+      "calls": 5,
+      "digest": "d2e8aa0a67af",
+      "mean_ms": 8.6418532,
+      "total_time_ms": 43.209266
+    },
+    {
+      "calls": 1,
+      "digest": "57e8bbc60586",
+      "mean_ms": 0.017372,
+      "total_time_ms": 0.017372
+    },
+    {
+      "calls": 1,
+      "digest": "b529b333724a",
+      "mean_ms": 0.009374,
+      "total_time_ms": 0.009374
+    }
+  ],
+  "redacted": true,
+  "skipped": {
+    "ambiguous": 0,
+    "noise": 2,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": {
+    "description": "since stats reset at 2026-08-05 21:06:05.975591+00:00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-08-05 21:06:05.975591+00:00"
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "analyzed": {
+    "query_groups": 3,
+    "query_groups_in_window": 3,
+    "tables": [
+      "g_unchanged.orders"
+    ],
+    "total_cost_ms": 981.440086
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "physical_state": {
+    "g_unchanged.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        },
+        {
+          "columns": [
+            "status"
+          ],
+          "is_partial": false,
+          "is_unique": false,
+          "name": "orders_status_idx"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
+  "proposals": [],
+  "query_groups": [
+    {
+      "calls": 105,
+      "digest": "be1661568483",
+      "mean_ms": 9.346700495238094,
+      "total_time_ms": 981.403552
+    },
+    {
+      "calls": 2,
+      "digest": "b529b333724a",
+      "mean_ms": 0.0094145,
+      "total_time_ms": 0.018829
+    },
+    {
+      "calls": 1,
+      "digest": "57e8bbc60586",
+      "mean_ms": 0.017705000000000002,
+      "total_time_ms": 0.017705000000000002
+    }
+  ],
+  "redacted": true,
+  "skipped": {
+    "ambiguous": 0,
+    "noise": 9,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": {
+    "description": "since stats reset at 2026-08-05 21:06:07.139364+00:00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-08-05 21:06:07.139364+00:00"
+  }
+}

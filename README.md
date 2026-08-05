@@ -590,8 +590,8 @@ DROP INDEX "public"."idx_orders_customer_ref";
 `engine`, `physical_state`, `proposals`, `query_groups`, `redacted`, `skipped`, `window`,
 plus `dbt` when — and only when — a manifest was loaded). This is the first proposal from
 the run above, and the block is abridged: the real payload lists all five proposals under
-`proposals`, and carries `physical_state` and `query_groups` — the catalog and workload
-baselines `sqlquality verify` diffs against a later run — which are omitted here for length.
+`proposals`, the `query_groups` list is trimmed to one entry, and a proposal's `evidence`
+carries whatever its own rule measured, so the exact key set varies by code.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
@@ -606,6 +606,21 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
   },
   "degraded": [],
   "engine": "postgres",
+  "physical_state": {
+    "public.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
   "proposals": [
     {
       "code": "ADV001",
@@ -618,6 +633,9 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
           "status"
         ],
         "cost_share": 0.6702702702702703,
+        "fingerprint_digests": [
+          "d2e8aa0a67af"
+        ],
         "leading_ndv": 500.0,
         "roles": [
           "equality"
@@ -630,6 +648,15 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     }
     /* … 4 more proposal objects, same shape … */
   ],
+  "query_groups": [
+    {
+      "calls": 15000,
+      "digest": "d2e8aa0a67af",
+      "mean_ms": 41.333333333333336,
+      "total_time_ms": 620000.0
+    }
+    /* … 2 more query groups, same shape … */
+  ],
   "redacted": true,
   "skipped": {
     "noise": 0,
@@ -637,9 +664,52 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     "unqualifiable": 0,
     "ambiguous": 0
   },
-  "window": "since stats reset at 2026-07-19 03:00:00+00"
+  "window": {
+    "description": "since stats reset at 2026-07-19 03:00:00+00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-07-19 03:00:00+00"
+  }
 }
 ```
+
+**Three of those keys exist so that [`verify`](#verify) can diff two runs**, and they are the
+only part of the payload whose contract is about a *later* run rather than this one:
+
+- **`window`** is an object, not the prose sentence 0.3.0 wrote there: `description` (that
+  same sentence, unchanged), `engine`, `stats_reset_at`, `since`,
+  `since_duration_seconds` (the *requested* `--since` duration, e.g. `604800.0` for `7d`,
+  as distinct from `since`'s absolute cutoff) and `limit`. Postgres reports `since` and
+  `since_duration_seconds` as `null` always: it cannot apply `--since` at all, so echoing
+  the flag back would claim a filter that was never applied.
+- **`physical_state`** records, per `"schema.table"`, what the run's catalog reads already
+  saw — no extra round trip. On Postgres that is `is_ordinary_table` plus each existing
+  index's `name`, `columns`, `is_partial` and `is_unique`; on Redshift it is
+  `is_ordinary_table`, `sortkey1`, `diststyle`, `unsorted` and `stats_off`. Every field is a
+  **three-way** signal: `null` means *this run could not tell you* (the relation's facts were
+  never fetched, or the read was denied — see `degraded`), while `false`/`[]` is a real
+  measurement. `verify` reads a `null` as unknown and never as "no".
+
+  On Postgres `is_ordinary_table: false` means a view, a foreign table or a partitioned
+  parent, because the catalog read behind it filters `relkind = 'r'`. **On Redshift the same
+  `false` means less**: it comes from the relation's presence in `svv_table_info`, which
+  omits external (Spectrum) tables *and* genuinely empty local tables, and nothing available
+  distinguishes those — so a Redshift `false` conflates "not a table" with "a table nobody
+  has written to yet". The two engines are deliberately not at parity here.
+- **`query_groups`** is every query group this run analysed — `digest`, `calls`,
+  `total_time_ms` and `mean_ms` (`null`, never `0.0`, when `calls` is `0`) — not only the
+  ones some proposal cites, and each index-rule proposal names the ones behind it in
+  `evidence.fingerprint_digests`. This is a **different key** from
+  `analyzed.query_groups`, which is (and stays) an integer count.
+
+  `analyzed.query_groups` is how many groups were understood; `analyzed.query_groups_in_window`
+  is how many the window held.
+
+All three keys are **always present** — `{}`, `[]` and a full object rather than omitted when
+empty. That is what lets `verify` tell an artifact written before these keys existed (which it
+refuses) from one that genuinely has nothing to report.
 
 **Coverage is always disclosed**, not just when it is bad — the terminal, markdown and
 JSON paths all print how many query groups were actually understood:
@@ -1318,3 +1388,11 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   SQL changed; ADV303 needs a dbt manifest an offline command does not have. Their verdict is
   `unobservable`, and a vanished query group is reported as *possibly* addressed at low
   confidence — disappearance is not proof.
+- **`verify`'s Redshift verdicts are weaker than its Postgres ones, beyond the standing
+  "never run against a live cluster" caveat.** ADV002/ADV003/ADV104/ADV105/ADV301 name no
+  individual query group, so none of them can ever be graded `improved`, `unchanged` or
+  `regressed` — only `not_applied` or `unobservable`, with the applied signal beside it — and
+  on Redshift that leaves ADV101/ADV102/ADV103 as the only rules whose speed change is
+  gradable at all. `is_ordinary_table` also means less there than on Postgres (see the
+  [`advise --json`](#advise) payload notes above), and the four Redshift physical fields
+  beneath it are unreadable until it is known.

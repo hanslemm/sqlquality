@@ -773,6 +773,26 @@ def verify_proposal_label(key: Sequence[str]) -> str:
     return f"{code} {' '.join(rest)}".rstrip()
 
 
+def verify_engine_label(facts: ArtifactFacts) -> str:
+    """The engine name for a heading, or `"unknown"` when the artifact does not record one.
+
+    `ArtifactFacts.engine` is `str | None` — `None` when `payload["engine"]` is absent or not a
+    string — and interpolating that `None` printed `Verify — None` as the table title and
+    `# sqlquality verify — None` as the markdown heading. `verify_workload_line` already renders
+    its own unreadable values as `"unknown"`, and two renderings of "this artifact does not say"
+    in one report is one too many: `None` is a Python repr leaking into user-facing text, and a
+    reader cannot tell it from an engine literally named `None`.
+
+    Cosmetic today, deliberately: `advise_payload` writes `engine` from a required argument, so
+    no artifact `advise` produces can reach this — and `artifact_incomparabilities` refuses a
+    pair whose `window["engine"]` is unreadable before any heading is rendered. It is reachable
+    only for a hand-edited artifact whose top-level `engine` was removed while
+    `window["engine"]` survived. The JSON surface keeps the real `null` (`_facts_payload`), since
+    a machine consumer needs the distinction this label deliberately flattens.
+    """
+    return facts.engine if facts.engine is not None else "unknown"
+
+
 def verify_applied_label(applied: bool | None) -> str:
     """`applied` as a word. `None` is "unknown", never "no": the distinction between "you
     did not do it" and "we could not tell whether you did" is the whole reason the field is
@@ -886,7 +906,7 @@ def render_verify_markdown(
     outcomes = summary["outcomes"]
     improved = outcomes["improved"] if isinstance(outcomes, dict) else 0
     lines = [
-        f"# sqlquality verify — {_md_escape(context.before.engine)}",
+        f"# sqlquality verify — {_md_escape(verify_engine_label(context.before))}",
         "",
         f"**Proposals graded:** {summary['proposals']}  ",
         f"**Applied:** {summary['applied']} (not applied {summary['not_applied']}, "

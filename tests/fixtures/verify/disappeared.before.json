@@ -1,0 +1,91 @@
+{
+  "analyzed": {
+    "query_groups": 3,
+    "query_groups_in_window": 3,
+    "tables": [
+      "g_disappeared.orders"
+    ],
+    "total_cost_ms": 167.89771400000004
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "physical_state": {
+    "g_disappeared.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
+  "proposals": [
+    {
+      "code": "ADV001",
+      "confidence": "high",
+      "ddl": "CREATE INDEX ON \"g_disappeared\".\"orders\" (\"status\");",
+      "evidence": {
+        "calls": 20,
+        "co_occurring_fingerprints": 1,
+        "columns": [
+          "status"
+        ],
+        "cost_share": 0.999816382252828,
+        "expression_indexes": [],
+        "fingerprint_digests": [
+          "b11f5648f63c"
+        ],
+        "leading_ndv": 3000.0,
+        "partial_indexes_skipped": [],
+        "roles": [
+          "equality"
+        ],
+        "row_estimate": 300000,
+        "schema": "g_disappeared",
+        "table": "orders"
+      },
+      "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
+      "title": "Add index on g_disappeared.orders(status)"
+    }
+  ],
+  "query_groups": [
+    {
+      "calls": 20,
+      "digest": "b11f5648f63c",
+      "mean_ms": 8.393344250000002,
+      "total_time_ms": 167.86688500000002
+    },
+    {
+      "calls": 1,
+      "digest": "57e8bbc60586",
+      "mean_ms": 0.022872,
+      "total_time_ms": 0.022872
+    },
+    {
+      "calls": 1,
+      "digest": "b529b333724a",
+      "mean_ms": 0.007957,
+      "total_time_ms": 0.007957
+    }
+  ],
+  "redacted": true,
+  "skipped": {
+    "ambiguous": 0,
+    "noise": 2,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": {
+    "description": "since stats reset at 2026-08-05 21:06:13.313276+00:00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-08-05 21:06:13.313276+00:00"
+  }
+}

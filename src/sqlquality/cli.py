@@ -45,6 +45,7 @@ from sqlquality.report import (
     verify_applied_label,
     verify_caveats,
     verify_context,
+    verify_engine_label,
     verify_mean_cell,
     verify_payload,
     verify_proposal_label,
@@ -1284,7 +1285,7 @@ def verify(
     improved = outcomes["improved"] if isinstance(outcomes, dict) else 0
     table = Table(
         title=(
-            f"Verify — {context.before.engine} "
+            f"Verify — {verify_engine_label(context.before)} "
             f"({_plural(len(results), 'proposal')}, "
             f"{summary['applied']} applied, {improved} improved)"
         )

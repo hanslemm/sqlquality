@@ -44,12 +44,40 @@ _STATUS_BUCKETS = 3_000
 @pytest.fixture
 def headline_schema(live_dsn: str) -> str:
     """A fresh, disposable table with a hot, unindexed equality predicate — nothing
-    shared with any other test's fixtures or connections."""
+    shared with any other test's fixtures or connections.
+
+    **`pg_stat_statements` is reset for this schema's own statements, by `queryid`** — the
+    same targeted reset `test_verify_redaction_live.py` uses, and for a related reason. A
+    blanket `pg_stat_statements_reset()` would wipe the cumulative counters the rest of this
+    package shares, so it is not called; resetting by `queryid` touches only rows whose text
+    names this schema, which nothing else in the suite uses.
+
+    Without it this test is **history-dependent, and fails on a second run against the same
+    container**. Measured: this statement's normalized text is identical every run, so
+    `advise` aggregates the previous run's rows into the same query group — including the 500
+    *post-index* executions below. The before window then already averages mostly fast calls,
+    and the improvement collapses to noise: `mean_before=0.1334, mean_after=0.1308` (1.9%,
+    graded `unchanged`) on the 8th consecutive run, 4 passes and 21 failures over 25
+    back-to-back runs. Dropping the schema does not help — the stale rows survive it, and
+    their text is what the aggregation keys on.
+
+    With the reset the margin is enormous and stable: over 25 consecutive runs `mean_before`
+    stayed in 7.7–8.9 ms and `mean_after` in 0.120–0.141 ms, a **98.2% improvement at worst**
+    against a 10% threshold, 25 passes and 0 failures. So `IMPROVED` is asserted below as a
+    genuinely deterministic fact about this workload rather than as a hopeful reading of a
+    timing — the ratio would have to degrade by more than fifty-fold before the verdict moved.
+    """
     import psycopg
 
     with psycopg.connect(live_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            cur.execute(
+                "SELECT pg_stat_statements_reset(userid, dbid, queryid) "
+                "FROM pg_stat_statements WHERE query LIKE %s",
+                (f"%{_SCHEMA}.%",),
+            )
+            cur.fetchall()
             cur.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
             cur.execute(f"CREATE SCHEMA {_SCHEMA}")
             cur.execute(
@@ -102,19 +130,18 @@ def test_the_headline_case_end_to_end_against_a_real_server(headline_schema):
     """Real `advise` (no index, hot predicate) -> real `CREATE INDEX` -> real `advise`
     (rule resolved, zero proposals for this relation) -> `verdicts()`.
 
-    No `pg_stat_statements_reset()` here: this test shares the live server with every
-    other integration test in this package, and resetting mid-session would wipe out
-    accumulated stats other tests still depend on. `pg_stat_statements` therefore stays
-    cumulative across the before/after halves below, diluting any real improvement — so
-    the pre-index calls are kept few and the post-index calls many, letting the fast calls
-    dominate the cumulative mean by enough to clear `RELATIVE_CHANGE_THRESHOLD` regardless.
+    `pg_stat_statements` still stays cumulative *within* this test — the fixture's reset runs
+    before the before-run's calls, not between the two halves — so the after window contains
+    the before window's five slow executions as well as the five hundred fast ones. That is
+    the ordinary Postgres path, and the improvement survives it by a factor of sixty; see the
+    fixture's docstring for the measured distribution and for why the reset is needed at all.
 
-    This also means `window_facts`'s `stats_reset_at` (`pg_stat_database.stats_reset`, a
-    *different* counter from `pg_stat_statements_reset()`) stays SQL `NULL` throughout —
-    no test in this suite calls `pg_stat_reset()` — so the window classifies
-    `INCOMPARABLE`, not `NESTED`: both sides being null is missing information about
-    whether the counters were ever baselined, not evidence they were and never reset
-    since. `Confidence.LOW` is the correct ceiling for that, asserted below.
+    `window_facts`'s `stats_reset_at` (`pg_stat_database.stats_reset`, a *different* counter
+    from `pg_stat_statements_reset()`) stays SQL `NULL` throughout — no test in this suite
+    calls `pg_stat_reset()` — so the window classifies `INCOMPARABLE`, not `NESTED`: both
+    sides being null is missing information about whether the counters were ever baselined,
+    not evidence they were and never reset since. `Confidence.LOW` is the correct ceiling for
+    that, asserted below.
     """
     dsn = headline_schema
 
@@ -126,6 +153,16 @@ def test_the_headline_case_end_to_end_against_a_real_server(headline_schema):
         f"{[(p['code'], p['evidence'].get('table')) for p in before['proposals']]}"
     )
     assert f"{_SCHEMA}.orders" in before["analyzed"]["tables"], before["analyzed"]
+    # The fixture's reset, asserted rather than assumed: the cited group holds exactly the
+    # five pre-index executions above and nothing carried over from an earlier run. Without
+    # this the test still passes on a fresh container and fails on the second run against the
+    # same one, for a reason no assertion would name.
+    cited = before_adv001["evidence"]["fingerprint_digests"]
+    before_groups = {g["digest"]: g for g in before["query_groups"]}
+    assert [before_groups[d]["calls"] for d in cited] == [5], (
+        "the before window does not hold exactly the 5 executions this test performed, so a "
+        f"previous run's calls are being averaged into mean_before: {before['query_groups']}"
+    )
 
     import psycopg
 
