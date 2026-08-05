@@ -1,13 +1,36 @@
-"""Matching layer for `sqlquality verify`: decide which proposal in one `advise --json`
-artifact is "the same recommendation" as which in another.
+"""`sqlquality verify`'s whole engine: match two `advise --json` artifacts' proposals to each
+other, decide how comparable the two runs' windows are, and grade each proposal in the earlier
+artifact against the later one.
 
-Deliberately dependency-free and fully offline: this module reads two already-parsed JSON
-payloads (plain `dict`/`list`/`str`/`float`/`None` values, exactly what `json.load` returns)
-and touches nothing else — no `psycopg` import, no network, no filesystem beyond what the
-caller already handed it. Everything downstream (the diff itself, in a later task) depends
-on the keys produced here being right: a mis-key makes `verify` confidently report a live
-finding as `disappeared` while it sits in both artifacts, or collapse two genuinely
-different recommendations into one.
+Read in this order, which is the order the code is laid out in:
+
+1. **Matching** — `proposal_key`, `index_proposals`/`ProposalIndex`, `group_index`. Which
+   proposal in one artifact is "the same recommendation" as which in the other, and which
+   query group is which. A mis-key here makes `verify` confidently report a live finding as
+   `disappeared` while it sits in both artifacts, or collapse two genuinely different
+   recommendations into one.
+2. **Window comparability** — `WindowRelation`, `classify_windows`, `confidence_for`,
+   `WindowLimits`/`window_limits`. How much any verdict built from this pair may claim, and
+   what a *missing* query group is allowed to mean.
+3. **Pair-level incommensurability** — `ArtifactMismatch`, `Incomparability`,
+   `artifact_incomparabilities`. Two artifacts that share no coordinate system at all, as
+   against two whose comparison is merely weak.
+4. **Applied detection** — the `_applied_*` family, dispatched by rule code in
+   `_detect_applied`. Read from each run's recorded `physical_state`, never declared.
+5. **Absence gating** — `Absence`, `_ABSENCE_DEPENDENCIES`, `_absence_disclosure`, and the
+   public `new_proposal_disclosure`. **Read this before adding any conclusion drawn from
+   something not being present**, on either side, in this module or in `report.py`: it is the
+   single defect class that has recurred five times in this feature.
+6. **The verdict** — `VerifyOutcome`, `ProposalVerdict`, `_grade`, `verdicts`.
+
+Rendering lives in `report.py` (`verify_context` and the `verify_*` helpers) and the command in
+`cli.py`; both consume this module and neither re-derives anything it decides.
+
+Deliberately dependency-free and fully offline: every entry point reads already-parsed JSON
+payloads (plain `dict`/`list`/`str`/`float`/`None` values, exactly what `json.load` returns) and
+touches nothing else — no `psycopg` import, no network, no filesystem beyond what the caller
+already handed it. Nothing here raises on a payload of unexpected shape either: malformed input
+degrades to "unknown" rather than earning a grade it did not demonstrate.
 """
 
 from __future__ import annotations
@@ -269,9 +292,10 @@ class WindowRelation(str, Enum):
     """How comparable two `advise --json` payloads' `"window"` objects are — and
     therefore what confidence, if any, a verdict built from them may claim.
 
-    Every field the `"window"` object carries (`engine`, `stats_reset_at`, `since`,
-    `since_duration_seconds`, `limit`) is *present-but-null* rather than absent when the
-    engine cannot supply it (see `report.py`'s `advise_report_payload`): `null` means
+    Every field the `"window"` object carries (`description`, `engine`, `stats_reset_at`,
+    `since`, `since_duration_seconds`, `limit` — the same six `cli._VERIFY_REQUIRED_WINDOW_KEYS`
+    demands) is *present-but-null* rather than absent when the engine cannot supply it (see
+    `report.py`'s `advise_payload`): `null` means
     "this engine cannot tell you," not a value comparable to anything — including another
     `null`. Every rule below exists to keep that distinction intact; see
     `classify_windows` for the exact decision order and the rulings each guards against.
@@ -1178,6 +1202,17 @@ class Absence(str, Enum):
       rather than a `physical_state` delta (see `_applied_advisor`), so it is the one code
       for which a missing proposal is a claim about the database rather than about the
       artifact.
+    * `BEFORE_COUNTERPART` — "a proposal matched in `after` has no counterpart in `before`'s
+      `proposals`", which `report.py`'s `new_in_after` reads as **"a finding with no
+      counterpart to compare against is new rather than changed"**. Read on the `before`
+      side, and the only member that is: see `new_proposal_disclosure`. **This member is
+      instance five of the defect class, and it arrived the way instance five was predicted
+      to: as a new *reader* of an existing absence, built outside this module.** The bullet
+      that used to sit in the list below said "Ruling 10 keeps 'new in `after`' out of this
+      module entirely" — true of this module, and the conclusion was then drawn in
+      `report.py`, where no gate could see it. Whatever is added next, add its member here
+      *first*: the registry is what the completeness tests can see, and a reader with no
+      member is a reader with no gate.
 
     **Absences deliberately not members, each checked rather than assumed:**
 
@@ -1202,12 +1237,14 @@ class Absence(str, Enum):
     * *`cost_share_after` being `None`.* Ruling 4: `None` there already means "could not be
       read off unambiguously", identical for an absent and an ambiguous key.
     * *A proposal absent from `after` for any code other than ADV105.* `verdicts` derives
-      `applied` for every other code from `physical_state` alone, and Ruling 10 keeps
-      "new in `after`" out of this module entirely.
+      `applied` for every other code from `physical_state` alone, and Ruling 10 keeps a
+      *verdict* for an after-only proposal out of this module entirely. The **claim** about
+      such a proposal is `BEFORE_COUNTERPART` above, which is a member.
     """
 
     CITED_QUERY_GROUP = "cited_query_group"
     ADVISOR_RECOMMENDATION = "advisor_recommendation"
+    BEFORE_COUNTERPART = "before_counterpart"
 
 
 #: Which degradations can produce each `Absence` **without the database having changed** —
@@ -1255,11 +1292,39 @@ class Absence(str, Enum):
 #:   ADV101/ADV102/ADV103 proposals, whose applied signal is `physical_state`, never a
 #:   proposal's absence; ADV105's own row fetch is unaffected by it. Fabricates neither
 #:   absence.
+#:
+#: **`BEFORE_COUNTERPART`'s set is the complement of two capabilities rather than a list of
+#: demonstrated suppressions, and that is deliberate.** The other two members ask "what could
+#: empty *this one* payload key"; this one asks "what could stop *any* of sixteen rules, on
+#: either engine, from emitting a proposal it would otherwise emit" — a much wider question,
+#: and the honest answer is bounded from the other side. Measured against the real `advise`
+#: path (only `connect` stubbed): a denied `workload` read leaves `proposals: []`; a denied
+#: `schema` read likewise, since the aggregator can qualify nothing; a denied `indexes` read
+#: removes ADV002/ADV003, whose entire evidence is the index list. `advisor` removes ADV105
+#: (`_advisor_rows` returns `[]`), `physical_facts_gap` removes ADV101/ADV102/ADV103 (`propose`
+#: declines to grade a relation it has no facts for), and `table_facts` removes those same
+#: three on Redshift by emptying `physical_facts`.
+#:
+#: `ndv` is included **without** a demonstrated suppression, and the measurement is recorded
+#: here rather than hidden: denying `pg_stats` did not remove an ADV001 proposal in either
+#: direction tried (a selective column keeps it; a non-selective one that grades `LOW` with
+#: NDV known grades `MEDIUM` with NDV denied — the denial *relaxes* the rule). What could not
+#: be established is that no other rule of the sixteen withholds on a missing NDV, and this
+#: module's standing posture is that an unproven premise is disclosed, not assumed — the same
+#: reasoning by which `WindowLimits` treats an *unknown* limit exactly like a demonstrated
+#: mismatch. The cost of including it is one softer sentence in a caveat; the cost of omitting
+#: it wrongly is telling a user a finding is new when their own missing grant is why the
+#: earlier run never made it.
+#:
+#: Only `read_only` and `stats_reset` are excluded, and both exclusions are already established
+#: above: `read_only` reads no data at all, and `stats_reset` reaches only the `window` object.
+#: Neither can change which proposals a run emits.
 _ABSENCE_DEPENDENCIES: Final[dict[Absence, frozenset[str]]] = {
     Absence.CITED_QUERY_GROUP: frozenset({_CAP_WORKLOAD}),
     Absence.ADVISOR_RECOMMENDATION: frozenset(
         {_CAP_ADVISOR, _CAP_WORKLOAD, _CAP_SCHEMA, _CAP_TABLE_FACTS}
     ),
+    Absence.BEFORE_COUNTERPART: KNOWN_DEGRADATIONS - {_DEGRADATION_READ_ONLY, _CAP_STATS_RESET},
 }
 
 #: How to name each absence inside `_absence_disclosure`'s sentence. Separate from the enum
@@ -1267,6 +1332,9 @@ _ABSENCE_DEPENDENCIES: Final[dict[Absence, frozenset[str]]] = {
 _ABSENCE_SUBJECTS: Final[dict[Absence, str]] = {
     Absence.CITED_QUERY_GROUP: "a cited query group's absence from that run's query_groups",
     Absence.ADVISOR_RECOMMENDATION: "this recommendation's absence from that run's proposals",
+    Absence.BEFORE_COUNTERPART: (
+        "an after-run proposal's absence from that run's own proposal list"
+    ),
 }
 
 
@@ -1334,6 +1402,60 @@ def _absence_disclosure(payload: dict[str, object], absence: Absence, side: str)
         f"that could not run produces the same emptiness a real change would, so "
         f"{_ABSENCE_SUBJECTS[absence]} is not evidence here."
     )
+
+
+def new_proposal_disclosure(before: dict[str, object], after: dict[str, object]) -> str | None:
+    """Why a proposal present only in `after` might **not** be a new finding — or `None` when
+    `before`'s own coverage does rule that out.
+
+    **The one absence this module reads on the `before` side, and the fix for instance five of
+    this feature's dominant defect class.** `report.py`'s `new_in_after` announced every
+    after-only proposal as "new rather than changed", which is a claim about the user's
+    database inferred purely from the proposal's absence in `before` — and it was built in
+    `report.py`, outside the gate this module had already built for exactly that reasoning.
+    Reproduced twice from real `advise` runs during whole-branch review: a `before` run whose
+    `workload` capability was denied (so `proposals` was empty and *both* runs recorded the
+    same `limit`, leaving `may_be_sampling_artifact` `False` and nothing else able to catch
+    it), and a `before` run taken at `--limit 1`.
+
+    The self-contradiction that made it Critical rather than Minor: `verify_caveats` prints,
+    one bullet above, "a read that could not run produces the same emptiness a real change
+    would, so **any verdict resting on something being absent from that run says so**". The
+    "new" claim rested on exactly that emptiness and did not say so.
+
+    **The asymmetry was the tell.** `DISAPPEARED` — the mirror claim, absence from `after` —
+    has always been forbidden under a degraded read or a `--limit` mismatch, downgraded to
+    `UNOBSERVABLE`/`LOW` with the reason stated. Its twin had no gate at all. Any future claim
+    drawn from an absence on *either* side belongs behind this function or `_absence_disclosure`,
+    and behind an `Absence` member first — see `Absence`'s docstring.
+
+    Two independent arms, both reported when both apply:
+
+    * **`before` declares a degradation that can suppress a proposal** —
+      `_absence_disclosure(before, Absence.BEFORE_COUNTERPART, "before")`, whose dependency set
+      is deliberately wide (see `_ABSENCE_DEPENDENCIES`).
+    * **`WindowLimits.may_be_sampling_artifact`** — a `before` run that sampled fewer (or an
+      unknown number of) query groups may simply never have had the evidence to make the
+      proposal. Read through the same predicate `verdicts` uses for `DISAPPEARED`, rather than
+      `before < after`, so the symmetry is exact and an *unknown* limit counts, which is the
+      inversion `WindowLimits`' own docstring exists to make unreachable.
+
+    Returns a complete sentence (or sentences) for the caveat to render; the caller keeps
+    listing the keys either way, because suppressing the list would hide a genuinely new
+    finding — this gates the *claim*, never the disclosure.
+    """
+    reasons: list[str] = []
+    withheld = _absence_disclosure(before, Absence.BEFORE_COUNTERPART, "before")
+    if withheld is not None:
+        reasons.append(withheld)
+    limits = window_limits(before, after)
+    if limits.may_be_sampling_artifact:
+        reasons.append(
+            "The two runs sampled different (or unknown) numbers of query groups (--limit "
+            f"before={limits.before}, after={limits.after}), so the before run may never have "
+            "held the evidence this proposal rests on, rather than the finding being new."
+        )
+    return " ".join(reasons) if reasons else None
 
 
 def _applied_advisor(

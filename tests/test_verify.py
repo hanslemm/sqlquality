@@ -2090,6 +2090,62 @@ def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
     assert verdict.applied is True
 
 
+def test_applied_maintenance_is_false_when_unsorted_did_not_move_at_all():
+    """F6 of the whole-branch review: `_applied_maintenance`'s `after_value < baseline`
+    survived mutation to `<=` against all 1199 tests.
+
+    The boundary is the whole meaning of the comparison. An `unsorted` (or `stats_off`) that
+    is *exactly* what it was at proposal time is a measurement that the VACUUM did not run —
+    `applied=False`, and `NOT_APPLIED` downstream. Under `<=` it would read `applied=True` and
+    the user would be told "the work was done" about work nobody did, with the mean-based
+    outcome then credited to it.
+
+    Unpinned until now because this is ADV104, i.e. Redshift, i.e. the engine no live test in
+    this project can reach — the one place the standing "never run against a live cluster"
+    limitation actually bites, so a unit assertion is the only guard available.
+    """
+    window = {
+        "description": "d",
+        "engine": "redshift",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": 500,
+    }
+    for field, baseline in (("unsorted", 30.0), ("stats_off", 40.0)):
+        before = {
+            "proposals": [
+                {
+                    "code": "ADV104",
+                    "evidence": {"schema": "public", "table": "orders", field: baseline},
+                    "ddl": f"VACUUM public.orders; -- {field}",
+                }
+            ],
+            "redacted": True,
+            "physical_state": {"public.orders": {"is_ordinary_table": True, field: baseline}},
+            "query_groups": [],
+            "window": window,
+        }
+        after = {
+            "proposals": [],
+            "redacted": True,
+            "physical_state": {"public.orders": {"is_ordinary_table": True, field: baseline}},
+            "query_groups": [],
+            "window": window,
+        }
+        [verdict] = verdicts(before, after)
+        assert verdict.applied is False, f"{field} unchanged must read as not applied"
+        assert verdict.outcome is VerifyOutcome.NOT_APPLIED, field
+        # And the neighbouring value in the other direction is still a real application, so
+        # this test cannot be satisfied by making the helper simply never return True.
+        moved = dict(after)
+        moved["physical_state"] = {
+            "public.orders": {"is_ordinary_table": True, field: baseline - 0.5}
+        }
+        [moved_verdict] = verdicts(before, moved)
+        assert moved_verdict.applied is True, field
+
+
 def test_finding_5_applied_maintenance_numeric_guard_is_pinned():
     """F5 (fix round 3): `_applied_maintenance`'s Ruling 7 numeric guard on `after_value`
     could be deleted with the whole suite green. `after`'s `unsorted` is `null` even
@@ -2689,10 +2745,22 @@ def test_every_absence_verify_reads_as_evidence_is_classified():
     pattern: a third `Absence` member added without a dependency set must not silently earn
     "nothing can fabricate this". Also checks the table names no degradation the adapters
     cannot produce, which would be a dead entry giving false assurance."""
-    from sqlquality.verify import _ABSENCE_DEPENDENCIES, Absence, KNOWN_DEGRADATIONS
+    from sqlquality.verify import (
+        _ABSENCE_DEPENDENCIES,
+        _ABSENCE_SUBJECTS,
+        Absence,
+        KNOWN_DEGRADATIONS,
+    )
 
     assert set(Absence) == set(_ABSENCE_DEPENDENCIES), (
         f"unclassified: {sorted(a.value for a in set(Absence) - set(_ABSENCE_DEPENDENCIES))}"
+    )
+    # `_ABSENCE_SUBJECTS` was unpinned until the whole-branch review's F1 added a third member:
+    # a member missing from it raises `KeyError` inside `_absence_disclosure` — at the exact
+    # moment a disclosure was about to be made, i.e. in the one code path where failing loudly
+    # is least acceptable. Same lookup, same guard.
+    assert set(Absence) == set(_ABSENCE_SUBJECTS), (
+        f"no disclosure wording: {sorted(a.value for a in set(Absence) - set(_ABSENCE_SUBJECTS))}"
     )
     for absence, dependencies in _ABSENCE_DEPENDENCIES.items():
         assert dependencies, f"{absence.value} claims nothing can fabricate it"
@@ -2700,6 +2768,100 @@ def test_every_absence_verify_reads_as_evidence_is_classified():
             f"{absence.value} depends on names no adapter records: "
             f"{sorted(dependencies - KNOWN_DEGRADATIONS)}"
         )
+
+
+def test_new_proposal_disclosure_withholds_on_a_degraded_before_and_on_a_limit_mismatch():
+    """`new_proposal_disclosure`'s two arms and its `None` case, at the unit level.
+
+    The `None` case is the one that makes the other two mean anything: without it, a gate that
+    withheld unconditionally would satisfy every other assertion here and silently delete a
+    real "new finding" disclosure.
+    """
+    from sqlquality.verify import new_proposal_disclosure
+
+    def payload(*, limit: int | None = 500, degraded: Sequence[dict[str, object]] = ()) -> dict:
+        return {
+            "degraded": list(degraded),
+            "window": {
+                "description": "d",
+                "engine": "postgres",
+                "stats_reset_at": "2026-08-01T00:00:00",
+                "since": None,
+                "since_duration_seconds": None,
+                "limit": limit,
+            },
+        }
+
+    assert new_proposal_disclosure(payload(), payload()) is None
+
+    workload_denied = payload(degraded=[{"capability": "workload", "reason": "denied"}])
+    degraded_text = new_proposal_disclosure(workload_denied, payload())
+    assert degraded_text is not None
+    assert "before run" in degraded_text and "workload" in degraded_text
+
+    truncated = new_proposal_disclosure(payload(limit=1), payload(limit=500))
+    assert truncated is not None
+    assert "--limit before=1, after=500" in truncated
+
+    # An *unknown* limit counts exactly like a demonstrated mismatch — the inversion
+    # `WindowLimits.may_be_sampling_artifact` exists to make unreachable.
+    assert new_proposal_disclosure(payload(limit=None), payload(limit=None)) is not None
+
+    # Both arms report, neither shadows the other.
+    both = new_proposal_disclosure(
+        payload(limit=1, degraded=[{"capability": "workload", "reason": "denied"}]),
+        payload(limit=500),
+    )
+    assert both is not None and "workload" in both and "--limit" in both
+
+    # A degradation that cannot suppress a proposal must not withhold: `read_only` reads no
+    # data at all, so an after-only proposal really is new despite it.
+    read_only = payload(degraded=[{"capability": "read_only", "reason": "could not pin"}])
+    assert new_proposal_disclosure(read_only, payload()) is None
+
+
+def test_every_absence_member_is_consulted_by_a_gate_somewhere():
+    """The registry is only worth what its *use* is worth: a member classified in
+    `_ABSENCE_DEPENDENCIES` and never passed to `_absence_disclosure` is a gate nobody opens.
+
+    Read from the AST rather than from a hand-written list of call sites, and scoped to
+    `Absence.X` references that occur **inside a function body** — the two module-level tables
+    mention every member by construction, so a naive "is the name mentioned anywhere" check
+    would pass vacuously for a member that is classified and then never consulted.
+
+    **What this does not catch, stated plainly because the gap is the reason F1 happened.**
+    It catches a member with no reader. It cannot catch the inverse — a *reader* built with no
+    member — which is exactly how `report.py`'s `new_in_after` became instance five of this
+    defect class: the conclusion was drawn outside `verify.py`, so no enum member, no
+    dependency set, and both completeness tests passed. Nothing static can recognise "this new
+    sentence asserts something about the user's database from an emptiness"; the only defences
+    are `Absence`'s docstring, which now instructs the next author to add the member first, and
+    the paired behavioural tests in `tests/test_verify_cli.py` that pin both mirror claims.
+    """
+    import ast
+    import inspect
+
+    from sqlquality import verify as verify_module
+    from sqlquality.verify import Absence
+
+    tree = ast.parse(inspect.getsource(verify_module))
+    consulted: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Attribute)
+                and isinstance(inner.value, ast.Name)
+                and inner.value.id == "Absence"
+            ):
+                consulted.add(inner.attr)
+    assert consulted, "collected no Absence references — this test would pass vacuously"
+    missing = {member.name for member in Absence} - consulted
+    assert not missing, (
+        f"classified but never consulted inside any function: {sorted(missing)} — a member with "
+        "no reader is a gate nobody opens"
+    )
 
 
 # --- Finding B, fix round 5: two artifacts can fail to share a coordinate system ---------
