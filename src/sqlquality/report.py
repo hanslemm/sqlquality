@@ -211,9 +211,10 @@ def advise_payload(
     lives under `"analyzed"`, the other at the payload's root), and renaming the older,
     already-shipped `analyzed.query_groups` to make room would be a breaking payload change
     for existing consumers, which is outside what this feature set is here to do. Like
-    `physical_state`, this key is **always present** (`[]` when no proposal cites any query
-    group) rather than omitted-when-empty: `verify` (a later task) uses an absent key, not
-    an empty list, to recognize an artifact from a version that predates this feature.
+    `physical_state`, this key is **always present** (`[]` when the run analysed no query
+    groups at all — not when no proposal cites one) rather than omitted-when-empty:
+    `verify` (a later task) uses an absent key, not an empty list, to recognize an artifact
+    from a version that predates this feature.
     """
     window_facts = dict(window_facts or {})
     payload = {
