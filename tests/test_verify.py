@@ -910,6 +910,31 @@ def test_a_non_finite_since_duration_does_not_earn_comparable():
     )
 
 
+def test_a_boolean_since_duration_does_not_earn_comparable():
+    """Round-2 review: Minor, same shape as Minor 7 for `window_limits`.
+    `isinstance(True, int)` is `True` in Python, so without the explicit `bool` exclusion
+    in `_window_duration_seconds`, a stray `since_duration_seconds: true` would be read as
+    a duration of `1.0` second and — paired with an equal numeric duration on the other
+    side — earn `COMPARABLE`/`HIGH`. Two shapes pinned in one test: `True` matched against
+    `True`, and `True` matched against the numeric `1.0` it would coerce to."""
+    true_window = {
+        "engine": "redshift",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": True,
+        "limit": 500,
+    }
+    assert classify_windows({"window": dict(true_window)}, {"window": dict(true_window)}) is (
+        WindowRelation.INCOMPARABLE
+    )
+
+    numeric_window = dict(true_window, since_duration_seconds=1.0)
+    assert (
+        classify_windows({"window": dict(true_window)}, {"window": dict(numeric_window)})
+        is WindowRelation.INCOMPARABLE
+    )
+
+
 def test_confidence_for_grades_every_relation_per_the_spec():
     """A classifier where three of four rungs are pinned and one is only implied is
     precisely the defect this checks against: every member of `WindowRelation` is
