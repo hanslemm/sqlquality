@@ -1430,6 +1430,17 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         self._stats_reset_at: str | None = None
         #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
         self._window_limit: int | None = None
+        #: Relations that appeared in the last `fetch_table_facts` (CAP_TABLE_FACTS) result
+        #: — an ordinary table, since that statement filters `WHERE c.relkind = 'r'`. A
+        #: relation absent here is not an ordinary table (a view, a foreign table, or a
+        #: partitioned parent) — the same signal `physical_state` reports as
+        #: `is_ordinary_table`. Populated as a side effect of `fetch_table_facts` so
+        #: `physical_state` can read it back without a second catalog round trip.
+        self._ordinary_tables: set[Relation] = set()
+        #: Existing indexes per relation, from the last `fetch_indexes` (CAP_INDEXES) call
+        #: — kept for the identical reason: `physical_state` reads this instead of
+        #: re-querying `pg_index` for a payload field.
+        self._indexes_cache: dict[Relation, tuple[PgIndex, ...]] = {}
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1582,6 +1593,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             )
             for schema_name, name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
         }
+        # `sizes`'s keys are exactly the relations CAP_TABLE_FACTS returned a row for —
+        # i.e. an ordinary table, since that statement filters `relkind = 'r'`. Recorded
+        # for `physical_state` to read back rather than re-querying; see `_ordinary_tables`.
+        self._ordinary_tables.update(sizes)
         columns: dict[Relation, list[str]] = {}
         for schema_name, table, column, _type in self._schema_rows(schemas):
             relation = Relation(schema=str(schema_name), table=str(table))
@@ -1694,7 +1709,45 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     definition=entry.definition,
                 )
             )
-        return {relation: tuple(indexes) for relation, indexes in result.items()}
+        built = {relation: tuple(indexes) for relation, indexes in result.items()}
+        # Recorded for `physical_state` to read back rather than re-querying `pg_index`;
+        # see `_indexes_cache`.
+        self._indexes_cache.update(built)
+        return built
+
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict]:
+        """See `WorkloadAdapter.physical_state`. Reads `_ordinary_tables` and
+        `_indexes_cache`, both populated as a side effect of `fetch_table_facts` and
+        `fetch_indexes` during `propose()` — no statement is issued here.
+
+        `is_ordinary_table` is `relation in self._ordinary_tables` — see that attribute's
+        docstring: `False` means the relation is a view, a foreign table, or a partitioned
+        parent, exactly the ADV301 "the relation became a table" signal `verify` needs,
+        with no new catalog query. A relation this run never fetched facts for at all
+        (because the analysis never needed them) reads the same way: absent from the
+        cache, hence `False` — an honest "nothing fetched" rather than a guess.
+
+        Each index's `columns` is its `PgIndex.columns` tuple exactly as read elsewhere in
+        this module (`_covered`, ADV002, ADV003) — for an expression index this
+        understates it, since an expression position contributes no column name (see
+        `PgIndex.has_expressions`'s docstring), and is recorded as-is here rather than
+        inventing a second, unused-elsewhere convention for it.
+        """
+        state: dict[str, dict] = {}
+        for relation in sorted(relations):
+            state[str(relation)] = {
+                "is_ordinary_table": relation in self._ordinary_tables,
+                "indexes": [
+                    {
+                        "name": index.name,
+                        "columns": list(index.columns),
+                        "is_partial": index.is_partial,
+                        "is_unique": index.is_unique,
+                    }
+                    for index in self._indexes_cache.get(relation, ())
+                ],
+            }
+        return state
 
     #: Which rule's rationale to keep when two rules propose byte-identical DDL at equal
     #: confidence. Lower wins. The order is by how directly the evidence supports *this*

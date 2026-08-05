@@ -32,6 +32,7 @@ from sqlquality.models import (
     Workload,
     analyzed_query_groups,
     cost_share_of,
+    proposal_relations,
 )
 from sqlquality.report import (
     advise_payload,
@@ -920,6 +921,7 @@ def advise(
         degraded=adapter.degraded,
         dbt=dbt_payload,
         window_facts=adapter.window_facts(),
+        physical_state=adapter.physical_state(proposal_relations(proposals)),
     )
     # Both writes happen after the whole analysis, so an unwritable path would otherwise
     # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate

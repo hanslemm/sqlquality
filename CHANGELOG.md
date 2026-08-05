@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
+  relation a proposal targets: Postgres records `is_ordinary_table` and each existing
+  index's `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
+  `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence the
+  upcoming `sqlquality verify` command diffs between two artifacts to tell whether a
+  proposal was actually applied — observed from what the run's own catalog reads already
+  returned, never a second round trip. Always present, even when empty: an *absent* key
+  (an artifact from before this feature) and an *empty* one (this run found nothing
+  physical to report) are different facts, and `verify` needs to tell them apart.
+
 ### Changed
 
 - **Breaking:** `advise --json`'s `"window"` key is now an object —

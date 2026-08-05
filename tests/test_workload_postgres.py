@@ -341,6 +341,125 @@ def test_postgres_window_facts_are_null_before_any_fetch():
     assert facts == {"stats_reset_at": None, "since": None, "limit": None}
 
 
+def test_physical_state_is_keyed_by_a_json_serializable_string():
+    """A `Relation` is not JSON-serializable, and a `TypeError` here would fire only after
+    the whole analysis has already run — this project has shipped exactly that bug once
+    before."""
+    import json
+
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned({CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)]})
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert list(state) == ["public.orders"]
+    json.dumps(state)  # must not raise
+
+
+def test_physical_state_records_the_indexes_verify_needs_to_detect_application():
+    """ "Was the proposed index created?" is answered by comparing two artifacts' index
+    lists. Without `columns` the question is unanswerable, and without `is_partial` an
+    ADV004 partial index is indistinguishable from a plain one leading with the same
+    column."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ]
+            }
+        )
+    )
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    [index] = state["public.orders"]["indexes"]
+    assert index["name"] == "idx_status"
+    assert index["columns"] == ["status"]
+    assert index["is_partial"] is False
+    assert index["is_unique"] is False
+
+
+def test_a_relation_absent_from_table_facts_is_recorded_as_not_an_ordinary_table():
+    """Postgres's `CAP_TABLE_FACTS` filters `relkind = 'r'`, so a view never appears. That
+    absence is how `verify` detects ADV301's application — the relation becoming a table —
+    without any new catalog query."""
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_TABLE_FACTS: []}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "stg_orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "stg_orders")}))
+    assert state["public.stg_orders"]["is_ordinary_table"] is False
+
+
+def test_only_the_relations_asked_about_are_recorded():
+    """Payload size must scale with findings, not with schema size."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [
+                    ("public", "orders", 50_000, 1024),
+                    ("public", "customers", 10_000, 512),
+                ]
+            }
+        )
+    )
+    adapter.fetch_table_facts(
+        ("public",),
+        frozenset({Relation("public", "orders"), Relation("public", "customers")}),
+    )
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert list(state) == ["public.orders"]
+
+
+def test_postgres_physical_state_does_not_issue_sql():
+    """See `window_facts()`'s identical test docstring: a raising stub does not work here
+    either, since `_run` swallows any exception into `degraded` and returns `[]` — this
+    test would pass whether or not `physical_state` queried. Count calls instead.
+    """
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)],
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ],
+            }
+        )
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert calls == [], "physical_state() must not issue any SQL"
+
+
 def test_a_null_stats_reset_reads_as_an_unknown_time_not_as_None():
     """`stats_reset` is SQL NULL until someone resets statistics — the *default* state.
 
