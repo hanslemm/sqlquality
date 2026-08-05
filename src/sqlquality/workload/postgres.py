@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -34,7 +33,12 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
-from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
+from sqlquality.workload.fingerprint import (
+    FLAG_LEADING_WILDCARD_LIKE,
+    FLAG_SELECT_STAR,
+    fingerprint_digests,
+    fingerprint_id,
+)
 from sqlquality.workload.secrets import secrets_for
 from sqlquality.workload.session import (
     LIBPQ_FIELD_MAP,
@@ -75,25 +79,6 @@ _HINTS = {
     ),
     CAP_INDEXES: "reads pg_index and pg_stat_user_indexes; world-readable unless revoked",
 }
-
-#: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
-#: apart the few hundred query groups one run reads, and short enough to sit in a table cell.
-_FINGERPRINT_ID_LEN = 12
-
-
-def _fingerprint_id(fingerprint: str) -> str:
-    """A short, stable identity for a query group.
-
-    `QueryStat.fingerprint` is the *entire* canonical SQL, so emitting it as evidence
-    printed the whole statement a second time next to `sql` — for a long query, most of the
-    proposal's evidence block, duplicated. What the field is for is identity: telling two
-    query groups apart and correlating a proposal with a later run. A digest does that in
-    twelve characters. The readable text stays in `sql`.
-
-    Not a security boundary — the fingerprint is already redacted — so a fast digest is
-    fine; sha256 is used because it is the unsurprising choice.
-    """
-    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:_FINGERPRINT_ID_LEN]
 
 
 def _as_int(value: object) -> int:
@@ -459,6 +444,13 @@ def propose_indexes(
                     #: `k=v` pair next to the joint one can only read as support that is not
                     #: there.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested (not the whole
+                    #: canonical SQL `shared` actually holds — `ColumnUsage.fingerprint_ids`'
+                    #: name is a known wart, see `fingerprint_digests`'s own docstring) and
+                    #: sorted, so `sqlquality verify` (a later task) can name which groups
+                    #: back this proposal and diff two runs' evidence without reordering
+                    #: noise.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     "row_estimate": rows,
                     "leading_ndv": leading_ndv,
                     "partial_indexes_skipped": partial_skipped,
@@ -592,6 +584,9 @@ def propose_join_keys(
                         "cost_share": item.cost_share,
                         "calls": item.calls,
                         "fingerprints": item.fingerprints,
+                        #: The query groups behind `fingerprints`, digested and sorted —
+                        #: see ADV001's identical field for why.
+                        "fingerprint_digests": fingerprint_digests(item.fingerprint_ids),
                         "row_estimate": rows,
                         "leading_ndv": column_ndv,
                         "partial_indexes_skipped": partial_skipped,
@@ -755,6 +750,9 @@ def propose_grouping_indexes(
                     #: renders evidence as bare `k=v` pairs, with no per-rule text, would
                     #: read as more support than actually exists.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     "row_estimate": rows,
                     "partial_indexes_skipped": partial_skipped,
                     "expression_indexes": expression_indexes,
@@ -780,6 +778,13 @@ def propose_unused_indexes(
 
     Confidence is capped at MEDIUM: idx_scan accumulates only since the last statistics
     reset, so zero scans cannot prove an index is unused across a full business cycle.
+
+    No `fingerprint_digests` in this proposal's evidence, deliberately: its evidence is
+    `idx_scan`, a catalog measurement of the index itself, not a claim about which query
+    groups use (or fail to use) it — there is no workload query group to name. Omitted
+    entirely rather than emitted as `[]`, matching Redshift's ADV104/ADV105: an empty list
+    would read as "zero query groups back this", which is a different and false claim from
+    "this rule is not workload-derived".
     """
     proposals: list[Proposal] = []
     for relation in sorted(hot_tables):
@@ -833,6 +838,11 @@ def propose_redundant_indexes(
     provable from the catalog alone, so the advice was not *wrong* — but arbitrary scope for
     a rule that emits `DROP` is not a scope, and this rule should be able to say which
     workload its recommendation came from.
+
+    No `fingerprint_digests` in this proposal's evidence, for the same reason ADV002 has
+    none: prefix redundancy is proven from two `PgIndex` column lists, a catalog fact, not
+    from any query group. See ADV002's docstring for why the key is omitted rather than
+    emitted empty.
     """
     proposals: list[Proposal] = []
     for relation in sorted(hot_tables):
@@ -1054,6 +1064,9 @@ def propose_partial_indexes(
                     #: How many query groups filter on both columns together. This is what
                     #: makes the proposal supported rather than a guess.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     #: Named `partial_indexes_not_compared`, not ADV001's
                     #: `partial_indexes_skipped`: there the partial index is known not to
                     #: cover an unfiltered lookup, here it may be this exact proposal already
@@ -1103,6 +1116,9 @@ def propose_sargability(
                     "cost_share": item.cost_share,
                     "calls": item.calls,
                     "fingerprints": item.fingerprints,
+                    #: The query groups behind `fingerprints`, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(item.fingerprint_ids),
                 },
                 confidence=Confidence.HIGH,
                 ddl=None,
@@ -1126,10 +1142,16 @@ def propose_sargability(
                     "so the specific column is not attributed here."
                 ),
                 evidence={
-                    "fingerprint": _fingerprint_id(stat.fingerprint),
+                    "fingerprint": fingerprint_id(stat.fingerprint),
                     "sql": stat.sql,
                     "cost_share": share,
                     "calls": stat.calls,
+                    #: Additional to the singular `fingerprint` above, not a replacement for
+                    #: it: this proposal is backed by exactly one query group — itself — so
+                    #: the list holds that one digest. Same key, same meaning, as every other
+                    #: rule's `fingerprint_digests`, which is what lets `report.py` derive
+                    #: `query_groups` uniformly across every proposal code.
+                    "fingerprint_digests": (fingerprint_id(stat.fingerprint),),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=None,
@@ -1236,11 +1258,14 @@ def propose_select_star(
                     },
                     "cost_share": share,
                     "calls": stat.calls,
-                    "fingerprint": _fingerprint_id(stat.fingerprint),
+                    "fingerprint": fingerprint_id(stat.fingerprint),
                     # The identity above is a digest, so the readable text has to be
                     # carried explicitly — ADV005 already does this. Redacted by
                     # default, like every other query text in the report.
                     "sql": stat.sql,
+                    # Additional to the singular `fingerprint` above, not a replacement —
+                    # see ADV005's identical comment.
+                    "fingerprint_digests": (fingerprint_id(stat.fingerprint),),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=None,
@@ -1422,6 +1447,38 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         #: appended two identical entries to `degraded` when it was denied, telling the user
         #: about one missing grant twice.
         self._schema_cache: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
+        #: Recorded by `fetch_workload` for `window_facts()` to report without re-querying —
+        #: `window_facts()` must not issue SQL, since it is read for the payload after the
+        #: whole analysis (including `--dry-run`) has already run. `None` until
+        #: `fetch_workload` runs, or if `pg_stat_database.stats_reset` came back SQL NULL or
+        #: denied — both indistinguishable from "unknown" here.
+        self._stats_reset_at: str | None = None
+        #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
+        self._window_limit: int | None = None
+        #: Relations that appeared in the last `fetch_table_facts` (CAP_TABLE_FACTS) result
+        #: — an ordinary table, since that statement filters `WHERE c.relkind = 'r'`. A
+        #: relation absent here is not an ordinary table (a view, a foreign table, or a
+        #: partitioned parent) — the same signal `physical_state` reports as
+        #: `is_ordinary_table`. Populated as a side effect of `fetch_table_facts` so
+        #: `physical_state` can read it back without a second catalog round trip.
+        self._ordinary_tables: set[Relation] = set()
+        #: Existing indexes per relation, from the last `fetch_indexes` (CAP_INDEXES) call
+        #: — kept for the identical reason: `physical_state` reads this instead of
+        #: re-querying `pg_index` for a payload field.
+        self._indexes_cache: dict[Relation, tuple[PgIndex, ...]] = {}
+        #: Every relation ever *asked about* in a `fetch_table_facts` call — the full
+        #: `relations` argument, not merely the ones `CAP_TABLE_FACTS` returned a row for.
+        #: `_ordinary_tables` alone cannot tell "asked, and it is not an ordinary table"
+        #: apart from "never asked at all" — both leave the relation absent from it — and
+        #: conflating the two is exactly how `physical_state` used to report a relation
+        #: outside `aggregation.tables` (e.g. a dbt-enriched ADV303 proposal) as a hard
+        #: `is_ordinary_table: False` when the truth is "this run never looked."
+        self._table_facts_requested: set[Relation] = set()
+        #: The same tracking for `fetch_indexes`, for the identical reason applied to
+        #: `_indexes_cache`: that cache only ever receives relations `CAP_INDEXES`
+        #: returned at least one row for, so "genuinely has no indexes" and "never asked"
+        #: are otherwise indistinguishable.
+        self._indexes_requested: set[Relation] = set()
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1494,15 +1551,22 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # `pg_stat_database.stats_reset` for any database whose statistics have never been
         # reset. The row is then `(None,)`: non-empty, hence truthy, so testing the row's
         # emptiness printed "since stats reset at None". The value's nullness is what matters.
-        reset_at: object = "an unknown time"
+        reset_value: object | None = None
         if reset and reset[0] and reset[0][0] is not None:
-            reset_at = reset[0][0]
+            reset_value = reset[0][0]
+        reset_at: object = "an unknown time" if reset_value is None else reset_value
         # pg_stat_statements is cumulative since reset and carries no per-statement
         # timestamps before PG 17, so --since cannot be honored. Say so rather than
         # implying the requested window was applied.
         window = f"since stats reset at {reset_at}"
         if since is not None:
             window += " (--since is not supported by pg_stat_statements)"
+        # Recorded for `window_facts()`, which must not issue SQL of its own — see that
+        # method's docstring. `since` is deliberately not recorded here at all: Postgres
+        # never honors it, and `window_facts()` reports `None` unconditionally rather than
+        # echoing back what the caller asked for.
+        self._stats_reset_at = str(reset_value) if reset_value is not None else None
+        self._window_limit = limit
         return WorkloadFetch(
             rows=tuple(
                 RawQueryRow(sql=str(sql), calls=_as_int(calls), total_time_ms=_as_float(total_ms))
@@ -1510,6 +1574,28 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             ),
             window_description=window,
         )
+
+    def window_facts(self) -> dict[str, object]:
+        """What `fetch_workload` already read, recorded rather than re-queried.
+
+        `since` is always `None`: `pg_stat_statements` carries no per-statement
+        timestamps, so `--since` is never actually applied here, whatever the caller
+        passed. Echoing it back would make a baseline/verification pair that is really
+        *nested* — the follow-up's cumulative counters contain the baseline's — look
+        *comparable*, which is worse than reporting nothing.
+
+        `since_duration_seconds` is always `None` for the identical reason: even the bare
+        *requested duration* (with no cutoff actually bound to it) must not be echoed,
+        since `sqlquality verify` grades two windows `COMPARABLE` on equal
+        `since_duration_seconds` alone, and reporting a duration here would claim a
+        filter this adapter never actually applied.
+        """
+        return {
+            "stats_reset_at": self._stats_reset_at,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": self._window_limit,
+        }
 
     def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
         """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""
@@ -1544,6 +1630,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # only `sales.orders` still returns `staging.orders`, because the bare-name filter
         # cannot distinguish the two. That row's relation key then simply has no consumer,
         # since only the relations in `relations` are ever assembled into the result below.
+        # Recorded before the statement even runs: `physical_state` must be able to tell
+        # "asked about, and CAP_TABLE_FACTS said no" apart from "never asked" — see
+        # `_table_facts_requested`'s docstring — and that distinction is about what this
+        # method was *called with*, not about what came back.
+        self._table_facts_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         sizes = {
             Relation(schema=str(schema_name), table=str(name)): (
@@ -1552,6 +1643,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             )
             for schema_name, name, rows, size in self._run(CAP_TABLE_FACTS, (list(schemas), wanted))
         }
+        # `sizes`'s keys are exactly the relations CAP_TABLE_FACTS returned a row for —
+        # i.e. an ordinary table, since that statement filters `relkind = 'r'`. Recorded
+        # for `physical_state` to read back rather than re-querying; see `_ordinary_tables`.
+        self._ordinary_tables.update(sizes)
         columns: dict[Relation, list[str]] = {}
         for schema_name, table, column, _type in self._schema_rows(schemas):
             relation = Relation(schema=str(schema_name), table=str(table))
@@ -1607,6 +1702,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # earlier version of this comment claimed the over-fetched rows had "no consumer",
         # and ADV003 was that consumer, emitting `DROP INDEX` for relations the workload
         # never touched whenever a bare name collided across two requested schemas.
+        #
+        # Recorded before the statement runs, same reasoning as `fetch_table_facts`'s
+        # identical line: `physical_state` needs to know this relation was asked about at
+        # all, distinct from whatever `_indexes_cache` ends up holding for it — see
+        # `_indexes_requested`'s docstring.
+        self._indexes_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         grouped: dict[tuple[Relation, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), wanted)):
@@ -1664,7 +1765,66 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                     definition=entry.definition,
                 )
             )
-        return {relation: tuple(indexes) for relation, indexes in result.items()}
+        built = {relation: tuple(indexes) for relation, indexes in result.items()}
+        # Recorded for `physical_state` to read back rather than re-querying `pg_index`;
+        # see `_indexes_cache`.
+        self._indexes_cache.update(built)
+        return built
+
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict[str, object]]:
+        """See `WorkloadAdapter.physical_state`. Reads `_ordinary_tables`,
+        `_indexes_cache`, `_table_facts_requested` and `_indexes_requested` — all
+        populated as a side effect of `fetch_table_facts` and `fetch_indexes` during
+        `propose()` — no statement is issued here.
+
+        `is_ordinary_table` is `relation in self._ordinary_tables` **only when this run
+        actually asked CAP_TABLE_FACTS about `relation` and that capability was not
+        denied** — `relation in self._table_facts_requested and CAP_TABLE_FACTS not in
+        self.degraded`. Under that condition, `False` means the relation is a view, a
+        foreign table, or a partitioned parent — exactly the ADV301 "the relation became
+        a table" signal `verify` needs, with no new catalog query. Otherwise the field is
+        `None`: a relation this run never fetched facts for at all (e.g. a dbt-enriched
+        ADV303 proposal for a relation outside `aggregation.tables`, which
+        `fetch_table_facts` is simply never called with) and a relation whose
+        `CAP_TABLE_FACTS` read was denied both leave `_ordinary_tables` looking identical
+        — empty for that relation — so only tracking "was it asked about, and did the
+        capability survive" tells them apart from a genuine "asked, and it is not an
+        ordinary table." Reporting `False` for either would read to `verify` as a
+        measurement, not as "this run could not tell you," and a later run that *does*
+        observe the relation would then look like the relation was just created.
+
+        `indexes` follows the identical discipline against `_indexes_requested` and
+        `CAP_INDEXES`: `None` unless this run asked about `relation` and the read
+        succeeded, in which case it is the real (possibly empty) list — `[]` is a
+        measurement ("fetched, and it genuinely has none"), never a stand-in for "did not
+        look." Each index's `columns` is its `PgIndex.columns` tuple exactly as read
+        elsewhere in this module (`_covered`, ADV002, ADV003) — for an expression index
+        this understates it, since an expression position contributes no column name (see
+        `PgIndex.has_expressions`'s docstring), and is recorded as-is here rather than
+        inventing a second, unused-elsewhere convention for it.
+        """
+        facts_degraded = any(cap == CAP_TABLE_FACTS for cap, _ in self.degraded)
+        indexes_degraded = any(cap == CAP_INDEXES for cap, _ in self.degraded)
+        state: dict[str, dict[str, object]] = {}
+        for relation in sorted(relations):
+            have_facts = relation in self._table_facts_requested and not facts_degraded
+            have_indexes = relation in self._indexes_requested and not indexes_degraded
+            indexes: list[dict[str, object]] | None = None
+            if have_indexes:
+                indexes = [
+                    {
+                        "name": index.name,
+                        "columns": list(index.columns),
+                        "is_partial": index.is_partial,
+                        "is_unique": index.is_unique,
+                    }
+                    for index in self._indexes_cache.get(relation, ())
+                ]
+            state[str(relation)] = {
+                "is_ordinary_table": (relation in self._ordinary_tables) if have_facts else None,
+                "indexes": indexes,
+            }
+        return state
 
     #: Which rule's rationale to keep when two rules propose byte-identical DDL at equal
     #: confidence. Lower wins. The order is by how directly the evidence supports *this*
@@ -1887,6 +2047,18 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
 
         Only within one relation: a prefix relationship across two different tables is
         meaningless. Only plain proposals participate — see `_index_creation_columns`.
+
+        **An absorbed proposal's `evidence` — including its own `fingerprint_digests` — is
+        discarded along with it, not merged into the survivor's.** `_fold_discarded` carries
+        forward the absorbed proposal's distinguishing *rationale* sentences, but nothing
+        merges the two proposals' `evidence` dicts, so the survivor's `fingerprint_digests`
+        stays exactly what it already was — the query groups that motivated *it*, not the
+        union of both. This is pre-existing behaviour (`_dedupe_by_ddl` throws evidence away
+        identically), not a regression, and it produces no dangling reference: every digest
+        the survivor cites still resolves to a real query group. But it does mean a
+        surviving proposal's `fingerprint_digests` can be a strict subset of every query
+        group that actually motivated *some* proposal now folded into it — worth knowing for
+        whoever builds `sqlquality verify`'s "did this proposal's evidence hold up" check.
         """
         eligible: dict[int, tuple[Relation, tuple[str, ...]]] = {}
         for i, proposal in enumerate(proposals):

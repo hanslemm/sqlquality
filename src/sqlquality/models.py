@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -279,6 +279,39 @@ def cost_share_of(evidence: Mapping[str, object]) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def proposal_relations(proposals: Sequence[Proposal]) -> frozenset[Relation]:
+    """The relations these proposals target, recovered from each proposal's own evidence.
+
+    ``Proposal`` carries no ``Relation`` field of its own — its ``evidence`` is a plain
+    ``dict[str, object]`` so the whole proposal stays JSON-serializable — so this is the
+    one place that reconstitutes it, from the ``schema``/``table`` strings every
+    relation-scoped proposal already carries (see ``propose_indexes`` et al. in
+    ``workload/postgres.py``, and ``propose_sortkey`` et al. in ``workload/redshift.py``).
+    Not every proposal is about exactly one relation — ADV005's leading-wildcard-LIKE
+    finding carries only ``fingerprint``/``sql`` in its evidence, no ``schema``/``table``
+    at all — so a proposal missing either key is simply excluded rather than reconstructed
+    from a placeholder.
+
+    Feeds ``WorkloadAdapter.physical_state`` — never re-derived by parsing ``ddl``, which
+    is free-form SQL text and not every proposal even carries one (``ADV005`` has no
+    ``ddl`` at all). The caller (``cli.advise``) unions this with ``aggregation.tables``
+    before calling ``physical_state``, rather than passing this set alone: a relation
+    whose proposal got resolved between two ``advise`` runs (the recommended index now
+    exists, so the rule stops firing) would otherwise carry no ``physical_state`` entry at
+    all in the run where it stopped being a finding — the one run ``sqlquality verify``
+    needs it in, to confirm the fix landed. See ``cli.py``'s call site for the full
+    reasoning; this function's own contract (recover a proposal's relations from its
+    evidence) is unchanged.
+    """
+    relations: set[Relation] = set()
+    for proposal in proposals:
+        schema = proposal.evidence.get("schema")
+        table = proposal.evidence.get("table")
+        if isinstance(schema, str) and isinstance(table, str):
+            relations.add(Relation(schema=schema, table=table))
+    return frozenset(relations)
 
 
 @dataclass(frozen=True)

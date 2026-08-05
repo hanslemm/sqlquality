@@ -135,3 +135,62 @@ class WorkloadAdapter(ABC):
     @abstractmethod
     def render_ddl(self, proposals: list[Proposal]) -> str:
         """A reviewable DDL script for the proposals that carry DDL. Never executed."""
+
+    def window_facts(self) -> dict[str, object]:
+        """Structured facts about the window `fetch_workload` just read, for the payload.
+
+        Not abstract, and returns `{}` by default, because an adapter that knows none of
+        these is a legitimate state rather than an unfinished one — the payload fills the
+        gaps with `None`. What each field is for: `stats_reset_at` tells a later
+        comparison whether cumulative counters were cleared between two runs (the
+        difference between two independent samples and one containing the other), `since`
+        whether a duration filter was genuinely applied, and `limit` whether the window
+        was truncated. Reporting a `since` an engine did not apply would make an
+        incomparable pair look comparable, which is worse than reporting nothing.
+        """
+        return {}
+
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict[str, object]]:
+        """Physical-design facts behind each of `relations`, for the payload.
+
+        Not abstract, and returns `{}` by default, because an adapter with no physical
+        levers to report — or a caller asking about no relations at all — is a legitimate
+        state rather than an unfinished one. `sqlquality verify` (a later task) diffs this
+        field between two `advise --json` artifacts to *observe* whether a proposal was
+        applied, rather than trust the assertion, so what is recorded here must be the
+        physical facts a later run can compare against, not a restatement of the proposal.
+
+        Keyed by `str(relation)` (`"schema.table"`), never by `Relation` itself: a
+        `Relation` is not JSON-serializable, and this dict flows straight into the
+        `--json` payload — a `TypeError` raised here would fire only after the whole
+        analysis has already run, which this project has shipped once before.
+
+        Must not issue any SQL of its own. This is called after `propose()` has already
+        fetched everything the run needed, so an implementation reads back what that
+        fetch cached on the instance rather than querying the catalog a second time for a
+        payload field.
+
+        **A relation's key is always present when asked about, but its fields must be
+        `None` — present-but-null, the same idiom `window_facts()` uses — for either of
+        two distinct reasons a fetch left no evidence, both of which mean "this run could
+        not tell you," never a measurement:**
+
+        * the relation's facts were simply never fetched at all, because the analysis
+          never needed them (e.g. a dbt-enriched proposal for a relation outside
+          `aggregation.tables`, which `fetch_table_facts`/`fetch_indexes` were never asked
+          about); or
+        * the relevant capability is in `self.degraded` (a denied grant), so whatever the
+          cache holds for this run is empty regardless of which relations were asked
+          about.
+
+        Neither case may report `False` or `[]` — a **measurement** that the relation is
+        not an ordinary table, or genuinely has no indexes — because a later run that
+        *does* observe the relation would then read a manufactured transition
+        (`None → False` reads as nothing happened, but `False → True` or `[] → [...]`
+        reads as a table or its indexes having just been created) where nothing physical
+        actually changed. An implementation must therefore track, per relation, both
+        "was this genuinely looked up this run" and "did the lookup's capability
+        degrade" — not merely whether a cache happens to hold an entry, since an empty
+        cache is what *both* an unfetched relation and a degraded one look like.
+        """
+        return {}

@@ -78,6 +78,7 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
+from sqlquality.workload.fingerprint import fingerprint_digests
 from sqlquality.workload.postgres import (
     _by_relation,
     _comment_lines,
@@ -436,6 +437,10 @@ def propose_sortkey(
                     "calls": best.calls,
                     "current_sortkey1": phys.sortkey1,
                     "stats_off": phys.stats_off,
+                    #: The query group(s) behind `best`, digested and sorted — same key,
+                    #: same meaning, as `postgres.py`'s index rules, letting `report.py`
+                    #: derive `query_groups` uniformly across engines.
+                    "fingerprint_digests": fingerprint_digests(best.fingerprint_ids),
                 },
                 confidence=confidence,
                 ddl=(
@@ -562,6 +567,8 @@ def propose_distkey(
                     "current_diststyle": diststyle,
                     "skew_rows": phys.skew_rows,
                     "stats_off": phys.stats_off,
+                    #: See ADV101's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(best.fingerprint_ids),
                 },
                 confidence=confidence,
                 ddl=(
@@ -696,6 +703,13 @@ def propose_diststyle_all(
                     "row_estimate": rows,
                     "current_diststyle": diststyle,
                     "stats_off": phys.stats_off,
+                    #: The union across every join column that supports this proposal, not
+                    #: an intersection: unlike ADV001/ADV004/ADV008, this rule's claim is
+                    #: not "these columns co-occur" but "this table is joined enough to be
+                    #: worth replicating", supported by *any* of its hot join columns.
+                    "fingerprint_digests": fingerprint_digests(
+                        fp for i in joins for fp in i.fingerprint_ids
+                    ),
                 },
                 confidence=confidence,
                 ddl=(
@@ -749,6 +763,13 @@ def propose_maintenance(
     proposal for that specific check: there is no measurement to disclose a gap about, and
     "maybe you should VACUUM" without one would be exactly the confident-but-wrong claim
     this whole rule set exists to avoid making about something else.
+
+    No `fingerprint_digests` key in either proposal's evidence, and deliberately not an
+    empty `[]` either: `unsorted`/`stats_off` are a direct catalog measurement of the
+    table's own physical state (see this docstring's "No cost-share gating" paragraph
+    above), not a claim about which query groups justify the proposal — there is no
+    workload query group backing this rule at all. `[]` would read as "zero groups back
+    this", which is a different, false claim from "this rule is not workload-derived".
     """
     proposals: list[Proposal] = []
     for relation in sorted(physical):
@@ -858,6 +879,12 @@ def propose_advisor(rows: Sequence[RedshiftAdvisorRow]) -> list[Proposal]:
     `_disclose_advisor_agreement`, which appends a sentence to a *matching* proposal's
     rationale instead of merging the two into one object, so a reader can always tell which
     conclusion is ours and which is Advisor's.
+
+    No `fingerprint_digests` key in this proposal's evidence, and deliberately not an empty
+    `[]`: this is a verbatim relay of Advisor's own recommendation, which comes from
+    Redshift's own analysis of the cluster, not from any query group sqlquality itself
+    identified — there is nothing workload-derived to name. See ADV104's identical omission
+    for the same reasoning.
     """
     proposals: list[Proposal] = []
     for row in sorted(rows, key=lambda r: (r.relation.schema, r.relation.table, r.rec_type)):
@@ -1162,6 +1189,27 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         #: second introspection round trip, since one CAP_TABLE_FACTS query already carries
         #: both the engine-neutral and the Redshift-specific columns.
         self.physical_facts: dict[Relation, RedshiftTableFacts] = {}
+        #: Every relation ever *asked about* in a `fetch_table_facts` call — the full
+        #: `relations` argument, not merely the ones CAP_TABLE_FACTS returned a row for.
+        #: `physical_facts` alone cannot tell "asked, and it is absent from
+        #: svv_table_info" apart from "never asked at all" — both leave the relation
+        #: absent from it — which is exactly how `physical_state` used to report a
+        #: relation outside `aggregation.tables` (e.g. a dbt-enriched ADV303 proposal) as
+        #: a hard `is_ordinary_table: False` when the truth is "this run never looked."
+        self._table_facts_requested: set[Relation] = set()
+        #: Recorded by `fetch_workload` for `window_facts()` to report without re-querying
+        #: — see that method's docstring on `PostgresWorkloadAdapter` for why it must not
+        #: issue SQL. `None` until `fetch_workload` runs, or when it ran with no `--since`.
+        self._since_cutoff: str | None = None
+        #: The *requested duration* itself (`since.total_seconds()`), alongside the
+        #: absolute cutoff above. `sqlquality verify` grades two windows `COMPARABLE` on
+        #: this field, not on `_since_cutoff`: two runs a week apart with the identical
+        #: `--since 7d` bind two different absolute cutoffs but request the same
+        #: duration, and it is the duration, not the cutoff, that makes them comparable
+        #: "by construction." `None` exactly when `_since_cutoff` is `None`.
+        self._since_duration_seconds: float | None = None
+        #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
+        self._window_limit: int | None = None
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1296,6 +1344,16 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
                 f"the {limit} most expensive successful queries recorded in "
                 "sys_query_history (no --since filter applied)"
             )
+        # Recorded for `window_facts()`, which must not issue SQL of its own — see
+        # `PostgresWorkloadAdapter.window_facts`'s docstring for why. Unlike Postgres,
+        # `since` genuinely is honoured here, so the cutoff actually bound is what gets
+        # reported — not merely echoing the caller's request back. The requested
+        # duration itself is recorded alongside it, from `since` (the timedelta
+        # argument), not derived back out of `cutoff` — see `_since_duration_seconds`'s
+        # own comment for why `verify` needs the duration rather than the cutoff.
+        self._since_cutoff = cutoff.isoformat() if cutoff is not None else None
+        self._since_duration_seconds = since.total_seconds() if since is not None else None
+        self._window_limit = limit
         return WorkloadFetch(
             rows=tuple(
                 RawQueryRow(
@@ -1317,6 +1375,27 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             ),
             window_description=window,
         )
+
+    def window_facts(self) -> dict[str, object]:
+        """What `fetch_workload` already read, recorded rather than re-queried.
+
+        `stats_reset_at` is always `None`: Redshift has no cumulative-counter reset the
+        way Postgres does, so there is nothing to report there. `since` is the actual
+        cutoff `fetch_workload` bound into the statement — see its docstring — not merely
+        the caller's request, since `sys_query_history` genuinely lets `--since` be
+        honoured. `since_duration_seconds` is the *requested duration* underlying that
+        same cutoff (`since.total_seconds()`), reported alongside it rather than instead
+        of it: `sqlquality verify` classifies two windows `COMPARABLE` on this field, since
+        two runs a week apart with the identical `--since 7d` bind different absolute
+        cutoffs but request the same duration, and grading on the cutoff alone made
+        `COMPARABLE` unreachable from any real Redshift pair.
+        """
+        return {
+            "stats_reset_at": None,
+            "since": self._since_cutoff,
+            "since_duration_seconds": self._since_duration_seconds,
+            "limit": self._window_limit,
+        }
 
     def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
         """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""
@@ -1366,6 +1445,11 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         apart; see `RedshiftTableFacts`'s docstring. Recorded as a carry-forward, not
         solved here.
         """
+        # Recorded before the statement even runs: `physical_state` must be able to tell
+        # "asked about, and svv_table_info said nothing" apart from "never asked" — see
+        # `_table_facts_requested`'s docstring — and that distinction is about what this
+        # method was *called with*, not about what came back.
+        self._table_facts_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         columns: dict[Relation, list[str]] = {}
         for schema_name, table, column, _type in self._schema_rows(schemas):
@@ -1407,6 +1491,64 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
             )
         self.physical_facts = physical
         return facts
+
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict[str, object]]:
+        """See `WorkloadAdapter.physical_state`. Reads `self.physical_facts` and
+        `_table_facts_requested`, both populated as a side effect of `fetch_table_facts`
+        during `propose()` — no statement is issued here.
+
+        All five fields are `None` unless this run actually asked `CAP_TABLE_FACTS` about
+        `relation` **and** that capability was not denied — `relation in
+        self._table_facts_requested and CAP_TABLE_FACTS not in self.degraded`. A relation
+        this run never fetched facts for at all (e.g. a dbt-enriched ADV303 proposal for a
+        relation outside `aggregation.tables`, which `fetch_table_facts` is simply never
+        called with) and a relation whose `CAP_TABLE_FACTS` read was denied both leave
+        `physical_facts` looking identical — absent for that relation — so only tracking
+        "was it asked about, and did the capability survive" tells "never looked" apart
+        from a genuine "looked, and svv_table_info had nothing." Reporting `False`/`None`
+        for either would read to `verify` as a measurement rather than "this run could not
+        tell you," and a later run that *does* observe the relation would then look like
+        the table and its physical levers had just appeared.
+
+        Once that condition holds, `is_ordinary_table` is `relation in
+        self.physical_facts` — presence in the CAP_TABLE_FACTS (`svv_table_info`) result.
+        **This is weaker evidence than Postgres's identically-named field even when both
+        conditions hold.** Postgres's `CAP_TABLE_FACTS` filters `WHERE c.relkind = 'r'`,
+        so `False` there unambiguously means "not an ordinary table" — a view, a foreign
+        table, or a partitioned parent. `svv_table_info` instead omits *both* external
+        (Spectrum) tables — which cannot carry a SORTKEY, DISTKEY or DISTSTYLE at all —
+        and genuinely empty local tables, which can; nothing available to this adapter
+        distinguishes the two (see `RedshiftTableFacts`'s docstring), so a genuine `False`
+        here conflates "not a table" with "a table nobody has written to yet".
+
+        **`sortkey1`, `diststyle`, `unsorted` and `stats_off` are themselves ambiguous
+        `None`s and must not be read on their own** — unlike `indexes` on the Postgres
+        side, none of the four carries an unambiguous "measured, and it is empty" value
+        the way `[]` does, so a consumer cannot tell "never looked" apart from "looked,
+        and the relation is genuinely absent from `svv_table_info`" by inspecting any of
+        them directly: both conditions leave `phys` as `None`, hence all four `None`, for
+        entirely different reasons. `is_ordinary_table` is the one field that disambiguates
+        — `None` means "this run could not tell you" (never requested, or the capability
+        degraded), while `False` means "requested, succeeded, and the relation is not in
+        `svv_table_info`" (which is itself, per the paragraph above, a genuine but weaker-
+        than-Postgres measurement, not a further unknown). A consumer must therefore gate
+        on `is_ordinary_table` before drawing any conclusion from the other four — reading
+        `sortkey1 is None` in isolation cannot tell you which of the two very different
+        situations it is in.
+        """
+        facts_degraded = any(cap == CAP_TABLE_FACTS for cap, _ in self.degraded)
+        state: dict[str, dict[str, object]] = {}
+        for relation in sorted(relations):
+            have_facts = relation in self._table_facts_requested and not facts_degraded
+            phys = self.physical_facts.get(relation) if have_facts else None
+            state[str(relation)] = {
+                "is_ordinary_table": (phys is not None) if have_facts else None,
+                "sortkey1": phys.sortkey1 if phys is not None else None,
+                "diststyle": phys.diststyle if phys is not None else None,
+                "unsorted": phys.unsorted if phys is not None else None,
+                "stats_off": phys.stats_off if phys is not None else None,
+            }
+        return state
 
     def _advisor_rows(
         self, schemas: tuple[str, ...], relations: frozenset[Relation]

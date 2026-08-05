@@ -24,6 +24,7 @@ from sqlquality.models import (
     Workload,
 )
 from sqlquality.workload.dbt import DbtContext, enrich_proposals
+from sqlquality.workload.fingerprint import fingerprint_id
 from sqlquality.workload.redshift import (
     CAP_ADVISOR,
     DEGRADATION_PHYSICAL_FACTS_GAP,
@@ -64,6 +65,7 @@ def _usage(
     cost_ms: float = 100.0,
     cost_share: float = 0.5,
     calls: int = 10,
+    fps: tuple[str, ...] = ("fp1",),
 ) -> ColumnUsage:
     return ColumnUsage(
         relation=relation,
@@ -72,6 +74,7 @@ def _usage(
         calls=calls,
         cost_ms=cost_ms,
         cost_share=cost_share,
+        fingerprint_ids=frozenset(fps),
     )
 
 
@@ -208,6 +211,18 @@ def test_sortkey_note_discloses_the_full_table_rewrite():
     assert "CONCURRENTLY" in note
 
 
+def test_sortkey_evidence_carries_digests_not_query_text():
+    """Same guard as `postgres.py`'s ADV001: `ColumnUsage.fingerprint_ids` holds whole
+    canonical SQL despite its name, so it must be digested before it reaches evidence."""
+    canonical = 'SELECT "created_at" FROM "orders" WHERE "created_at" > %s'
+    usage = [_usage(R, "created_at", ColumnRole.RANGE, cost_share=0.5, fps=(canonical,))]
+    physical = {R: _phys(sortkey1="status")}
+    proposals = propose_sortkey(usage, _facts(R), physical, min_cost_share=0.1)
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id(canonical),)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
+
+
 # ---------------------------------------------------------------------------
 # ADV102 — propose_distkey
 # ---------------------------------------------------------------------------
@@ -334,6 +349,16 @@ def test_distkey_omits_stats_off_caveat_when_it_is_zero():
     physical = {R: _phys(diststyle="EVEN", stats_off=0.0)}
     proposals = propose_distkey(usage, _facts(R), physical, min_cost_share=0.1)
     assert "stats_off" not in proposals[0].rationale
+
+
+def test_distkey_evidence_carries_digests_not_query_text():
+    canonical = 'SELECT "customer_id" FROM "orders" WHERE "customer_id" = %s'
+    usage = [_usage(R, "customer_id", ColumnRole.JOIN, cost_share=0.5, fps=(canonical,))]
+    physical = {R: _phys(diststyle="EVEN")}
+    proposals = propose_distkey(usage, _facts(R), physical, min_cost_share=0.1)
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id(canonical),)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +533,25 @@ def test_diststyle_all_omits_stats_off_caveat_when_it_is_zero():
     assert "stats_off" not in proposals[0].rationale
 
 
+def test_diststyle_all_evidence_carries_the_union_of_every_joins_digests():
+    """Unlike ADV001/ADV004/ADV008's running *intersection*, this rule's claim is "this
+    table is joined enough to be worth replicating" — supported by any one of its hot join
+    columns, not by all of them co-occurring in a single query. So the evidence must union
+    every join column's digests, not just the seed's."""
+    fp_a = 'SELECT "id" FROM "customers" JOIN "orders" ON "orders"."customer_id" = %s'
+    fp_b = 'SELECT "id" FROM "customers" JOIN "payments" ON "payments"."customer_id" = %s'
+    usage = [
+        _usage(R2, "customer_id_a", ColumnRole.JOIN, cost_share=0.5, cost_ms=200.0, fps=(fp_a,)),
+        _usage(R2, "customer_id_b", ColumnRole.JOIN, cost_share=0.3, cost_ms=100.0, fps=(fp_b,)),
+    ]
+    physical = {R2: _phys(diststyle="EVEN")}
+    proposals = propose_diststyle_all(
+        usage, _facts(R2, row_estimate=1_000), physical, min_cost_share=0.1
+    )
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == tuple(sorted({fingerprint_id(fp_a), fingerprint_id(fp_b)}))
+
+
 # ---------------------------------------------------------------------------
 # ADV104 — propose_maintenance
 # ---------------------------------------------------------------------------
@@ -567,6 +611,19 @@ def test_maintenance_proposes_both_independently_for_the_same_relation():
 def test_maintenance_ignores_relations_with_neither_measurement_stale():
     physical = {R: _phys(unsorted=1.0, stats_off=1.0)}
     assert propose_maintenance(physical, _facts(R)) == []
+
+
+def test_maintenance_evidence_omits_fingerprint_digests_entirely():
+    """ADV104's evidence is a direct catalog measurement (`unsorted`/`stats_off`), not a
+    claim about which query groups back it — there is no workload query group at all. The
+    key must be *absent*, not present as `[]`: an empty list would read as "zero query
+    groups back this", a different and false claim from "this rule is not workload-derived"
+    — Task 4's `verify` relies on `.get("fingerprint_digests", [])` to tell the two apart."""
+    physical = {R: _phys(unsorted=50.0, stats_off=60.0)}
+    proposals = propose_maintenance(physical, _facts(R))
+    assert len(proposals) == 2
+    for p in proposals:
+        assert "fingerprint_digests" not in p.evidence
 
 
 def test_maintenance_not_gated_by_cost_share_or_workload_usage():
@@ -650,6 +707,17 @@ def test_advisor_proposal_evidence_carries_a_machine_readable_source():
     )
     proposals = propose_advisor([row])
     assert proposals[0].evidence["source"] == "amazon_redshift_advisor"
+
+
+def test_advisor_proposal_evidence_omits_fingerprint_digests_entirely():
+    """This proposal is a verbatim relay of Advisor's own recommendation — it names no
+    query group sqlquality identified, so `fingerprint_digests` must be *absent*, not `[]`.
+    See ADV104's identical test for why the distinction matters to `verify`."""
+    row = RedshiftAdvisorRow(
+        relation=R, rec_type="sort key", current_ddl=None, recommended_ddl="ALTER TABLE x;"
+    )
+    proposals = propose_advisor([row])
+    assert "fingerprint_digests" not in proposals[0].evidence
 
 
 def test_advisor_proposal_handles_missing_current_and_recommended_ddl():
