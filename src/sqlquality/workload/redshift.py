@@ -78,6 +78,7 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
+from sqlquality.workload.fingerprint import fingerprint_digests
 from sqlquality.workload.postgres import (
     _by_relation,
     _comment_lines,
@@ -436,6 +437,10 @@ def propose_sortkey(
                     "calls": best.calls,
                     "current_sortkey1": phys.sortkey1,
                     "stats_off": phys.stats_off,
+                    #: The query group(s) behind `best`, digested and sorted — same key,
+                    #: same meaning, as `postgres.py`'s index rules, letting `report.py`
+                    #: derive `query_groups` uniformly across engines.
+                    "fingerprint_digests": fingerprint_digests(best.fingerprint_ids),
                 },
                 confidence=confidence,
                 ddl=(
@@ -562,6 +567,8 @@ def propose_distkey(
                     "current_diststyle": diststyle,
                     "skew_rows": phys.skew_rows,
                     "stats_off": phys.stats_off,
+                    #: See ADV101's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(best.fingerprint_ids),
                 },
                 confidence=confidence,
                 ddl=(
@@ -696,6 +703,13 @@ def propose_diststyle_all(
                     "row_estimate": rows,
                     "current_diststyle": diststyle,
                     "stats_off": phys.stats_off,
+                    #: The union across every join column that supports this proposal, not
+                    #: an intersection: unlike ADV001/ADV004/ADV008, this rule's claim is
+                    #: not "these columns co-occur" but "this table is joined enough to be
+                    #: worth replicating", supported by *any* of its hot join columns.
+                    "fingerprint_digests": fingerprint_digests(
+                        fp for i in joins for fp in i.fingerprint_ids
+                    ),
                 },
                 confidence=confidence,
                 ddl=(
@@ -749,6 +763,13 @@ def propose_maintenance(
     proposal for that specific check: there is no measurement to disclose a gap about, and
     "maybe you should VACUUM" without one would be exactly the confident-but-wrong claim
     this whole rule set exists to avoid making about something else.
+
+    No `fingerprint_digests` key in either proposal's evidence, and deliberately not an
+    empty `[]` either: `unsorted`/`stats_off` are a direct catalog measurement of the
+    table's own physical state (see this docstring's "No cost-share gating" paragraph
+    above), not a claim about which query groups justify the proposal — there is no
+    workload query group backing this rule at all. `[]` would read as "zero groups back
+    this", which is a different, false claim from "this rule is not workload-derived".
     """
     proposals: list[Proposal] = []
     for relation in sorted(physical):
@@ -858,6 +879,12 @@ def propose_advisor(rows: Sequence[RedshiftAdvisorRow]) -> list[Proposal]:
     `_disclose_advisor_agreement`, which appends a sentence to a *matching* proposal's
     rationale instead of merging the two into one object, so a reader can always tell which
     conclusion is ours and which is Advisor's.
+
+    No `fingerprint_digests` key in this proposal's evidence, and deliberately not an empty
+    `[]`: this is a verbatim relay of Advisor's own recommendation, which comes from
+    Redshift's own analysis of the cluster, not from any query group sqlquality itself
+    identified — there is nothing workload-derived to name. See ADV104's identical omission
+    for the same reasoning.
     """
     proposals: list[Proposal] = []
     for row in sorted(rows, key=lambda r: (r.relation.schema, r.relation.table, r.rec_type)):
