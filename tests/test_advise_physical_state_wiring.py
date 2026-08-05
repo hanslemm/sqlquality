@@ -110,6 +110,94 @@ def test_physical_state_reaches_the_payload_from_a_real_cli_run(monkeypatch):
     ]
 
 
+def test_physical_state_covers_a_relation_the_workload_touched_but_no_proposal_remains_for(
+    monkeypatch,
+):
+    """The Critical fix from Task 6's fix round 1. Before this fix, `physical_state` was
+    scoped to `proposal_relations(proposals)` alone — the relations *some proposal
+    targets* — so a relation the workload actually touched, but for which no rule fired
+    (because it is already well-covered, or too cold to clear `--min-cost-share`), carried
+    no `physical_state` entry at all. That is precisely the shape of "the recommended
+    index now exists, so the rule stopped firing": `sqlquality verify` would have been
+    structurally unable to confirm its own headline case. `physical_state` is now scoped
+    to `proposal_relations(proposals) | aggregation.tables`, so a workload-touched relation
+    is reported whether or not it still has a finding.
+
+    `public.customers` here is queried (so it reaches `aggregation.tables` via its `WHERE`
+    predicate) but at a cost share far below `--min-cost-share`'s default (1%) and with no
+    catalog index at all for ADV002/ADV003 to react to — so it produces zero proposals,
+    the exact "resolved" shape this fix exists for. Before the fix, `"public.customers"`
+    would be entirely absent from `payload["physical_state"]`.
+    """
+    _stub_adapter(
+        monkeypatch,
+        {
+            "pg_stat_statements": [
+                ("select id from orders where status = $1", 50, 500.0, 50),
+                ("select id from customers where region = $1", 1, 0.01, 1),
+            ],
+            "pg_stat_database": [("2026-07-01",)],
+            "information_schema.columns": [
+                ("public", "orders", "id", "integer"),
+                ("public", "orders", "status", "text"),
+                ("public", "customers", "id", "integer"),
+                ("public", "customers", "region", "text"),
+            ],
+            "pg_total_relation_size": [
+                ("public", "orders", 50_000, 1024),
+                ("public", "customers", 5_000, 2048),
+            ],
+            "pg_stats": [
+                ("public", "orders", "status", 5000.0),
+                ("public", "customers", "region", 500.0),
+            ],
+            "pg_index": [
+                (
+                    "public",
+                    "orders",
+                    "idx_status",
+                    "status",
+                    1,
+                    False,
+                    False,
+                    0,
+                    100,
+                    False,
+                    None,
+                    False,
+                    "...",
+                )
+            ],
+        },
+    )
+    result = runner.invoke(app, ["advise", "--dsn", "postgresql://u@h/db", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+
+    # The scenario must produce zero proposals for public.customers, or this test proves
+    # nothing about the scoping fix specifically (as opposed to some other proposal
+    # incidentally naming it).
+    customers_proposals = {
+        p["code"]
+        for p in payload["proposals"]
+        if p["evidence"].get("schema") == "public" and p["evidence"].get("table") == "customers"
+    }
+    assert customers_proposals == set(), (
+        f"the scenario must produce no proposal for public.customers: {customers_proposals}"
+    )
+    assert "public.customers" in payload["analyzed"]["tables"], (
+        "the scenario must actually reach aggregation.tables for this test to prove "
+        "anything about the widened scoping"
+    )
+    assert "public.customers" in payload["physical_state"], (
+        "physical_state omitted a relation the workload touched but no proposal remains "
+        "for — the union-with-aggregation.tables scoping fix is not wired in"
+    )
+    entry = payload["physical_state"]["public.customers"]
+    assert entry["is_ordinary_table"] is True
+    assert entry["indexes"] == []
+
+
 def test_physical_state_reports_a_never_fetched_adv303_relation_as_unknown(monkeypatch):
     """The exact ADV303 shape the review's Critical finding describes: `customer_orders`
     (in the fixture manifest's `main` schema) has no declared consumer, so `propose_unused_

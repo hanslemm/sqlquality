@@ -294,10 +294,16 @@ def proposal_relations(proposals: Sequence[Proposal]) -> frozenset[Relation]:
     at all — so a proposal missing either key is simply excluded rather than reconstructed
     from a placeholder.
 
-    Feeds ``WorkloadAdapter.physical_state``, which the caller scopes to exactly the
-    relations a proposal is about so the payload's size scales with findings, not with
-    schema size — never re-derived by parsing ``ddl``, which is free-form SQL text and not
-    every proposal even carries one (``ADV005`` has no ``ddl`` at all).
+    Feeds ``WorkloadAdapter.physical_state`` — never re-derived by parsing ``ddl``, which
+    is free-form SQL text and not every proposal even carries one (``ADV005`` has no
+    ``ddl`` at all). The caller (``cli.advise``) unions this with ``aggregation.tables``
+    before calling ``physical_state``, rather than passing this set alone: a relation
+    whose proposal got resolved between two ``advise`` runs (the recommended index now
+    exists, so the rule stops firing) would otherwise carry no ``physical_state`` entry at
+    all in the run where it stopped being a finding — the one run ``sqlquality verify``
+    needs it in, to confirm the fix landed. See ``cli.py``'s call site for the full
+    reasoning; this function's own contract (recover a proposal's relations from its
+    evidence) is unchanged.
     """
     relations: set[Relation] = set()
     for proposal in proposals:

@@ -76,7 +76,14 @@ Today's top-level keys are `analyzed`, `degraded`, `engine`, `proposals`, `redac
   - Postgres: each index's `name`, `columns`, `is_partial`, `is_unique`;
   - Redshift: `sortkey1`, `diststyle`, `unsorted`, `stats_off`.
 
-  **Only relations appearing in a proposal.**
+  **Every relation appearing in a proposal, plus every relation the run's workload
+  analysis touched (`aggregation.tables`)** — corrected during Task 6's fix round after
+  review found the narrower "only proposal relations" scoping left `verify` structurally
+  unable to confirm its own headline case: a relation whose proposal is resolved between
+  two runs (the recommended index now exists, so the rule stops firing) carried no
+  `physical_state` entry at all in the very run that mattered. Sizing against
+  `aggregation.tables` rather than the whole introspected schema keeps the original
+  intent (size scales with the workload, not schema size) while closing that gap.
 - **`window`** — promoted from a bare string to an object: `description` (the existing string, unchanged), `engine`, `stats_reset_at`, `since`, `limit`.
 
 That last one is the single **breaking** payload change. Acceptable because `advise` is hours old and, per its own CHANGELOG, has no previously-released behaviour — but it must be called out in the 0.4.0 notes rather than slipped in.
