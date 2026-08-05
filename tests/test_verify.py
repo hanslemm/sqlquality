@@ -2854,6 +2854,102 @@ def test_new_proposal_disclosure_withholds_on_a_degraded_before_and_on_a_limit_m
     assert unknown is not None and "cannot interpret" in unknown
 
 
+#: One case per member of `_ABSENCE_DEPENDENCIES[Absence.BEFORE_COUNTERPART]`, **written out
+#: rather than derived from that set**, and that is the whole point of the list existing.
+#:
+#: Re-review found the set narrowable from seven members to `{workload}` with all 1209 tests
+#: green: only the `workload` member was pinned, and a real `indexes` denial (demonstrated live by
+#: revoking `SELECT ON pg_index`) suppresses ADV002, so under that narrowing `verify` prints F1's
+#: exact false sentence on two real artifacts. A parametrization *derived* from the constant would
+#: not have caught it either — narrowing the set would simply have shrunk the case list — which is
+#: why these seven names are literal here. Each carries where its membership comes from:
+#:
+#: * `workload`, `schema` — measured on the real `advise` path: `proposals: []`, the rules' input
+#:   emptied. Also exercised end to end in `tests/test_verify_cli.py`.
+#: * `indexes` — measured: an unused index yields ADV002 when `pg_index` is readable and nothing
+#:   when it is denied. Exercised end to end too; this is the member the narrowing exposed.
+#: * `table_facts` — Redshift: empties `physical_facts`, so `propose` declines ADV101/102/103. On
+#:   Postgres it *relaxes* rather than suppresses (see `_PROPOSAL_RELAXING_DEGRADATIONS`), so no
+#:   Postgres suppression case exists to write.
+#: * `advisor`, `physical_facts_gap` — Redshift-only, and Redshift has never been run against a
+#:   live cluster, so the suppression is structural (`_advisor_rows` returns `[]`; `propose`
+#:   declines a relation with no facts) rather than measured.
+#: * `ndv` — **the one member whose suppression could not be demonstrated at all.** Six
+#:   `n_distinct` values (`1.0`, `1.5`, `2.0`, `0.5`, `-0.9`, `-0.02`) all still produced an
+#:   ADV001, so the withhold boundary was never crossed. It is a member on the
+#:   disclose-an-unproven-premise posture, and its case below pins what *is* observable: that the
+#:   gate consults it. Said here rather than faked with a case that would prove something else.
+_BEFORE_COUNTERPART_MEMBERS = (
+    "workload",
+    "schema",
+    "table_facts",
+    "ndv",
+    "indexes",
+    "advisor",
+    "physical_facts_gap",
+)
+
+
+@pytest.mark.parametrize("capability", _BEFORE_COUNTERPART_MEMBERS)
+def test_each_capability_that_can_suppress_a_proposal_gates_the_new_claim(capability):
+    """One behavioural case per member: a `before` run declaring this capability must withhold
+    the "new" claim, and the disclosure must name the capability.
+
+    Behavioural, not an identity check — it drives `new_proposal_disclosure` and asserts what it
+    returns, so **dropping any single member from the set reddens exactly this case**. Asserting
+    the constant against a hardcoded copy of itself would prove nothing; the coverage guard in the
+    companion test below is deliberately only a guard, with these seven cases doing the work.
+
+    The pair is otherwise clean — same known `--limit`, nothing degraded in `after` — so neither
+    of `new_proposal_disclosure`'s other two arms can be what fires.
+    """
+    from sqlquality.verify import new_proposal_disclosure
+
+    def payload(degraded: Sequence[dict[str, object]] = ()) -> dict:
+        return {
+            "degraded": list(degraded),
+            "window": {
+                "description": "d",
+                "engine": "postgres",
+                "stats_reset_at": "2026-08-01T00:00:00",
+                "since": None,
+                "since_duration_seconds": None,
+                "limit": 500,
+            },
+        }
+
+    before = payload([{"capability": capability, "reason": "permission denied"}])
+    withheld = new_proposal_disclosure(before, payload())
+    assert withheld is not None, (
+        f"a before run that declared {capability!r} does not withhold the 'new' claim — a "
+        "recommendation it never had the coverage to make would be reported as a new finding"
+    )
+    assert capability in withheld, withheld
+    assert "before run" in withheld, withheld
+    # The gate must be reading `before`, not merely reacting to any degradation anywhere: the
+    # same capability declared by `after` alone is a different mechanism with a different set.
+    assert new_proposal_disclosure(payload(), payload()) is None
+
+
+def test_the_before_counterpart_cases_cover_every_member_of_the_set():
+    """A coverage guard for the seven cases above, not the assertion doing the work.
+
+    On its own this proves nothing — it is a set compared against a written-out list. Its only job
+    is to make an eighth member added to `_ABSENCE_DEPENDENCIES[BEFORE_COUNTERPART]` redden until
+    someone has written the behavioural case for it, and to catch a narrowing from the other
+    direction as well. The seven cases are what actually pin the set.
+    """
+    from sqlquality.verify import _ABSENCE_DEPENDENCIES, Absence
+
+    assert set(_BEFORE_COUNTERPART_MEMBERS) == _ABSENCE_DEPENDENCIES[Absence.BEFORE_COUNTERPART], (
+        "uncased members: "
+        f"{sorted(_ABSENCE_DEPENDENCIES[Absence.BEFORE_COUNTERPART] - set(_BEFORE_COUNTERPART_MEMBERS))}; "
+        "cases for non-members: "
+        f"{sorted(set(_BEFORE_COUNTERPART_MEMBERS) - _ABSENCE_DEPENDENCIES[Absence.BEFORE_COUNTERPART])}"
+    )
+    assert len(_BEFORE_COUNTERPART_MEMBERS) == len(set(_BEFORE_COUNTERPART_MEMBERS))
+
+
 def test_every_proposal_relaxing_degradation_is_a_name_an_adapter_records():
     """`_PROPOSAL_RELAXING_DEGRADATIONS` gets the same guard every other hand-maintained table
     in this module carries, on the day it is introduced rather than three rounds later.
