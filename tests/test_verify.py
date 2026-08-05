@@ -1,6 +1,7 @@
 """Tests for `sqlquality.verify`'s matching layer: `proposal_key`, `index_proposals`,
-`group_index`; and its window-classification layer: `WindowRelation`, `classify_windows`,
-`confidence_for`, `window_limits`.
+`group_index`; its window-classification layer: `WindowRelation`, `classify_windows`,
+`confidence_for`, `window_limits`; and its verdict layer: `VerifyOutcome`,
+`ProposalVerdict`, `verdicts`.
 
 Every evidence shape used here is copied from the real rule that emits it (see
 `src/sqlquality/workload/postgres.py` and `src/sqlquality/workload/redshift.py`), not
@@ -13,9 +14,14 @@ all keys always present, values nullable) — see `postgres.py`'s and `redshift.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+import pytest
+
 from sqlquality.models import Confidence
 from sqlquality.verify import (
     ProposalIndex,
+    VerifyOutcome,
     WindowLimits,
     WindowRelation,
     classify_windows,
@@ -23,6 +29,7 @@ from sqlquality.verify import (
     group_index,
     index_proposals,
     proposal_key,
+    verdicts,
     window_limits,
 )
 
@@ -1035,3 +1042,625 @@ def test_a_differing_limit_does_not_change_the_window_relation_or_confidence():
     result = window_limits(before, after)
     assert result == WindowLimits(before=500, after=50)
     assert result.may_be_sampling_artifact is True
+
+
+# --- verdicts ---------------------------------------------------------------------------
+#
+# `_payload` builds a minimal, valid `advise --json`-shaped payload carrying exactly one
+# proposal, for `verdicts` tests. It is not a copy of a real `advise` payload the way the
+# fixtures above are — `verdicts` operates one level up, combining `proposals`,
+# `physical_state`, `query_groups` and `window` at once, so this synthesizes the smallest
+# coherent whole rather than reproducing any one rule's exact evidence shape.
+#
+# `indexes` defaults to a single index leading with `columns` (i.e. "applied" for a
+# create-index code, `_UNSET` sentinel so a test can still request `indexes=[]` — measured,
+# not applied — or `indexes=None` — this run could not tell, Ruling 1) because most outcome
+# tests care about the mean/cost_share comparison, not `applied` itself.
+
+_UNSET = object()
+
+
+def _payload(
+    *,
+    code: str = "ADV001",
+    schema: str = "public",
+    table: str = "orders",
+    columns: Sequence[str] = ("status",),
+    groups: Sequence[tuple[str, int, float]] = (),
+    cost_share: float | None = None,
+    indexes: object = _UNSET,
+    is_ordinary_table: object = _UNSET,
+    adv005: bool = False,
+    fingerprint: str = "fingerprint01",
+    engine: str = "postgres",
+    stats_reset_at: str | None = "2026-08-01T00:00:00",
+    since_duration_seconds: float | None = None,
+    limit: int | None = 500,
+) -> dict[str, object]:
+    relation_key = f"{schema}.{table}"
+    digests = [g[0] for g in groups]
+    evidence: dict[str, object] = {"fingerprint_digests": digests}
+    if cost_share is not None:
+        evidence["cost_share"] = cost_share
+
+    physical_state: dict[str, object] = {}
+    if adv005:
+        evidence["fingerprint"] = fingerprint
+        evidence["sql"] = "SELECT 1"
+        proposal_code = "ADV005"
+        ddl = None
+    else:
+        evidence["schema"] = schema
+        evidence["table"] = table
+        evidence["columns"] = list(columns)
+        proposal_code = code
+        ddl = f"CREATE INDEX ON {relation_key} ({', '.join(columns)});"
+        resolved_indexes: object = (
+            [
+                {
+                    "name": "idx_test",
+                    "columns": list(columns),
+                    "is_partial": False,
+                    "is_unique": False,
+                }
+            ]
+            if indexes is _UNSET
+            else indexes
+        )
+        resolved_ordinary: object = True if is_ordinary_table is _UNSET else is_ordinary_table
+        physical_state = {
+            relation_key: {"is_ordinary_table": resolved_ordinary, "indexes": resolved_indexes}
+        }
+
+    query_groups = [
+        {
+            "digest": digest,
+            "calls": calls,
+            "total_time_ms": total_time_ms,
+            "mean_ms": (total_time_ms / calls) if calls else None,
+        }
+        for digest, calls, total_time_ms in groups
+    ]
+
+    return {
+        "engine": engine,
+        "window": {
+            "description": "test window",
+            "engine": engine,
+            "stats_reset_at": stats_reset_at,
+            "since": None,
+            "since_duration_seconds": since_duration_seconds,
+            "limit": limit,
+        },
+        "proposals": [
+            {"code": proposal_code, "title": "test proposal", "evidence": evidence, "ddl": ddl}
+        ],
+        "physical_state": physical_state,
+        "query_groups": query_groups,
+    }
+
+
+# --- Step 1's mandated tests -------------------------------------------------------------
+
+
+def test_a_diluted_cost_share_with_an_unchanged_mean_is_not_an_improvement():
+    """The confound this whole design exists to survive. The workload grew, so every
+    `cost_share` fell — but this query takes exactly as long as it did. Reporting
+    `IMPROVED` here would credit the tool for someone else's traffic."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], cost_share=0.50)
+    after = _payload(groups=[("aaa", 10, 1000.0)], cost_share=0.05)  # mean identical
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.UNCHANGED
+    assert verdict.mean_before == verdict.mean_after == 100.0
+    assert verdict.cost_share_before == 0.50 and verdict.cost_share_after == 0.05
+
+
+def test_an_unapplied_change_is_never_credited_with_an_improvement():
+    """If the index was not created, something else made the query faster, and saying
+    otherwise is the confidently-wrong failure this rule set exists to avoid."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], indexes=[])
+    after = _payload(groups=[("aaa", 10, 100.0)], indexes=[])  # 10x faster, no index
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is False
+    assert verdict.outcome is VerifyOutcome.NOT_APPLIED
+
+
+def test_an_unobservable_proposal_reports_none_not_false_for_applied():
+    """`False` says "you did not do it". `None` says "we cannot tell". An ADV005 rewrite
+    has no catalog state, so only the second is true."""
+    [verdict] = verdicts(_payload(adv005=True), _payload(adv005=True))
+    assert verdict.applied is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+
+
+# --- one test per remaining outcome branch -----------------------------------------------
+
+
+def test_verdicts_grades_improved_when_the_mean_drops_beyond_the_threshold():
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 400.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.IMPROVED
+    assert verdict.mean_before == 100.0 and verdict.mean_after == 40.0
+
+
+def test_verdicts_grades_regressed_when_the_mean_rises_beyond_the_threshold():
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 2000.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.REGRESSED
+    assert verdict.mean_before == 100.0 and verdict.mean_after == 200.0
+
+
+def test_verdicts_grades_disappeared_when_the_cited_group_is_gone_and_limits_match():
+    before = _payload(groups=[("aaa", 10, 1000.0)], limit=500)
+    after = _payload(groups=(), limit=500)
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.DISAPPEARED
+    assert verdict.mean_before == 100.0
+    assert verdict.mean_after is None
+
+
+def test_applied_but_unchanged_is_stated_unmistakably_in_the_note():
+    """The single most valuable outcome, per the design spec: the work was done and did
+    not help. `applied=True` combined with `outcome=UNCHANGED` must not collapse into a
+    generic, unremarkable note."""
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 1000.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.UNCHANGED
+    assert "Applied but unchanged" in verdict.note
+
+
+# --- Ruling 1: a null physical_state field forbids applied=False, on either side ---------
+
+
+def test_ruling_1_a_null_indexes_on_either_side_yields_none_not_false():
+    """The most important behavior in this task, and a *different* route to `None` than
+    the ADV005/ADV006/ADV303 case above — both must work. `indexes: null` means "this run
+    could not tell you", never a measurement, on *either* side of the comparison."""
+    matching_after = _payload(
+        indexes=[{"name": "i", "columns": ["status"], "is_partial": False, "is_unique": False}]
+    )
+    null_before = _payload(indexes=None)
+    [verdict_null_before] = verdicts(null_before, matching_after)
+    assert verdict_null_before.applied is None
+    assert verdict_null_before.outcome is VerifyOutcome.UNOBSERVABLE
+
+    null_after = _payload(indexes=None)
+    measured_before = _payload(indexes=[])
+    [verdict_null_after] = verdicts(measured_before, null_after)
+    assert verdict_null_after.applied is None
+    assert verdict_null_after.outcome is VerifyOutcome.UNOBSERVABLE
+
+
+# --- Ruling 2: a limit mismatch forbids DISAPPEARED --------------------------------------
+
+
+def test_ruling_2_a_limit_mismatch_forbids_a_disappeared_verdict():
+    before = _payload(groups=[("aaa", 10, 1000.0)], limit=500)
+    after = _payload(groups=(), limit=200)
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert "sampling artifact" in verdict.note
+    assert verdict.confidence is Confidence.LOW
+
+    # The identical shape, but with matching KNOWN limits, genuinely reaches DISAPPEARED.
+    before_matched = _payload(groups=[("aaa", 10, 1000.0)], limit=500)
+    after_matched = _payload(groups=(), limit=500)
+    [verdict_matched] = verdicts(before_matched, after_matched)
+    assert verdict_matched.outcome is VerifyOutcome.DISAPPEARED
+
+
+# --- Ruling 3: the window relation is a ceiling on every verdict's confidence -----------
+
+
+def test_ruling_3_confidence_never_exceeds_the_window_ceiling():
+    """A strong, genuine improvement must not out-claim the window comparison it rests
+    on: INCOMPARABLE caps at LOW, NESTED caps at MEDIUM, however dramatic the mean drop."""
+    before_incomparable = _payload(groups=[("aaa", 10, 1000.0)], engine="postgres")
+    after_incomparable = _payload(groups=[("aaa", 10, 100.0)], engine="redshift")
+    [verdict_incomparable] = verdicts(before_incomparable, after_incomparable)
+    assert verdict_incomparable.outcome is VerifyOutcome.IMPROVED
+    assert verdict_incomparable.confidence is Confidence.LOW
+
+    before_nested = _payload(groups=[("aaa", 10, 1000.0)])
+    after_nested = _payload(groups=[("aaa", 10, 100.0)])
+    [verdict_nested] = verdicts(before_nested, after_nested)
+    assert verdict_nested.outcome is VerifyOutcome.IMPROVED
+    assert verdict_nested.confidence is Confidence.MEDIUM
+
+
+# --- Ruling 4: a collided key must never be reported as DISAPPEARED or new --------------
+
+
+def test_ruling_4_a_before_side_key_collision_is_excluded_not_mis_graded():
+    colliding_a = {
+        "code": "ADV999",
+        "evidence": {"schema": "public", "table": "orders"},
+        "ddl": None,
+    }
+    colliding_b = {
+        "code": "ADV999",
+        "evidence": {"schema": "public", "table": "orders"},
+        "ddl": None,
+    }
+    normal = {
+        "code": "ADV002",
+        "evidence": {
+            "schema": "public",
+            "table": "customers",
+            "index": "idx_a",
+            "columns": ["id"],
+        },
+        "ddl": None,
+    }
+    window = {
+        "description": "d",
+        "engine": "postgres",
+        "stats_reset_at": "T",
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": 500,
+    }
+    before = {
+        "proposals": [colliding_a, colliding_b, normal],
+        "physical_state": {
+            "public.orders": {"is_ordinary_table": True, "indexes": []},
+            "public.customers": {"is_ordinary_table": True, "indexes": []},
+        },
+        "query_groups": [],
+        "window": window,
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.customers": {"is_ordinary_table": True, "indexes": []}},
+        "query_groups": [],
+        "window": window,
+    }
+    results = verdicts(before, after)
+    keys = {v.key for v in results}
+    assert ("ADV999", "public", "orders") not in keys
+    assert len(results) == 1
+    assert results[0].code == "ADV002"
+
+
+# --- Ruling 5: aggregate multiple cited groups by call-weighted mean --------------------
+
+
+def test_ruling_5_the_combined_mean_is_call_weighted_not_a_mean_of_means():
+    """A 10-call group and a 10,000-call group must not be averaged as equals — a naive
+    mean of each group's own `mean_ms` would let the rare, lightly-called group dominate
+    exactly as much as the one carrying almost all of the workload's cost."""
+    groups = [("light", 10, 100.0), ("heavy", 10_000, 500_000.0)]
+    before = _payload(groups=groups)
+    after = _payload(groups=groups)
+    [verdict] = verdicts(before, after)
+    weighted = (100.0 + 500_000.0) / (10 + 10_000)
+    naive_mean_of_means = ((100.0 / 10) + (500_000.0 / 10_000)) / 2
+    assert weighted != pytest.approx(naive_mean_of_means)
+    assert verdict.mean_before == pytest.approx(weighted)
+    assert verdict.mean_after == pytest.approx(weighted)
+    assert verdict.outcome is VerifyOutcome.UNCHANGED
+
+
+# --- Ruling 6: partial presence of cited groups in `after` ------------------------------
+
+
+def test_ruling_6_partial_presence_averages_only_the_groups_actually_found():
+    """Only one of two cited groups survives into `after`. The combined figure must
+    reflect only the group actually found — not silently average the missing one in as a
+    zero-cost, zero-call group — and the gap must be disclosed."""
+    groups_before = [("a", 10, 1000.0), ("b", 10, 2000.0)]
+    before = _payload(groups=groups_before)
+    after = _payload(groups=[("a", 10, 1000.0)])  # "b" absent from after
+    [verdict] = verdicts(before, after)
+    assert verdict.mean_before == pytest.approx(150.0)
+    assert verdict.mean_after == pytest.approx(100.0)
+    assert "1 of 2" in verdict.note
+    assert verdict.outcome is VerifyOutcome.IMPROVED
+
+
+# --- Ruling 7: mean_ms (and this aggregate) may legitimately be None --------------------
+
+
+def test_ruling_7_a_zero_call_group_yields_an_unobservable_mean_not_a_fabricated_one():
+    before = _payload(groups=[("z", 0, 0.0)])
+    after = _payload(groups=[("z", 0, 0.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.mean_before is None
+    assert verdict.mean_after is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+
+
+def test_ruling_7_a_group_that_goes_to_zero_calls_in_after_is_unobservable_not_regressed():
+    """The `before` side has a real mean; the identical group is still present in `after`
+    but its calls summed to zero there — the aggregate must not divide by that zero total
+    and report a fabricated mean or outcome."""
+    before = _payload(groups=[("z", 10, 100.0)])
+    after = _payload(groups=[("z", 0, 0.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.mean_before == pytest.approx(10.0)
+    assert verdict.mean_after is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+
+
+# --- Ruling 8: a proposal's citations may be incomplete, by design ----------------------
+
+
+def test_ruling_8_a_single_cited_group_is_graded_on_its_own_without_assuming_more():
+    """`_collapse_index_prefixes`/`_dedupe_by_ddl` can leave a surviving proposal citing
+    fewer groups than actually motivated it (Task 3). `verdicts` must grade whatever it is
+    actually handed, exactly as confidently, rather than treating a thin citation list as
+    weaker evidence or refusing to grade it."""
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 400.0)])
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.IMPROVED
+    assert verdict.mean_before == 100.0 and verdict.mean_after == 40.0
+
+
+# --- Ruling 9: ADV105's applied comes from Advisor's row presence, not physical_state ---
+
+
+def test_ruling_9_adv105_applied_comes_from_advisor_row_presence_in_after():
+    sort_rec = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": None,
+            "current_ddl": None,
+        },
+        "ddl": None,
+    }
+    window = {
+        "description": "d",
+        "engine": "redshift",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": 500,
+    }
+    before = {"proposals": [sort_rec], "physical_state": {}, "query_groups": [], "window": window}
+
+    # Advisor no longer recommends it -> the design spec's own applied signal for ADV105.
+    after_gone = {"proposals": [], "physical_state": {}, "query_groups": [], "window": window}
+    [verdict_gone] = verdicts(before, after_gone)
+    assert verdict_gone.applied is True
+
+    # Advisor still recommends the identical thing, unambiguously -> not applied.
+    after_same = {
+        "proposals": [dict(sort_rec)],
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+    }
+    [verdict_same] = verdicts(before, after_same)
+    assert verdict_same.applied is False
+
+    # The same key collides with another proposal in `after` -> cannot tell, disclosed.
+    after_collision = {
+        "proposals": [dict(sort_rec), dict(sort_rec)],
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+    }
+    [verdict_collision] = verdicts(before, after_collision)
+    assert verdict_collision.applied is None
+    assert "more than one" in verdict_collision.note
+
+
+# --- Ruling 10: a proposal present only in `after` has no verdict here ------------------
+
+
+def test_ruling_10_a_proposal_present_only_in_after_produces_no_verdict():
+    """`verdicts` is scoped to `before`'s own proposals (the design spec: "each proposal
+    in before.json yields..."); a genuinely new finding in `after` has no member of
+    `VerifyOutcome` to be — and, by this task's own explicit decision, no verdict at all.
+    Surfacing "N new findings" is left to the CLI, which can derive it directly from
+    `index_proposals(after)` against `index_proposals(before)`'s key set."""
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 1000.0)])
+    new_only_in_after = {
+        "code": "ADV002",
+        "evidence": {
+            "schema": "public",
+            "table": "customers",
+            "index": "idx_new",
+            "columns": ["id"],
+        },
+        "ddl": None,
+    }
+    after["proposals"].append(new_only_in_after)  # type: ignore[attr-defined]
+    after["physical_state"]["public.customers"] = {  # type: ignore[index]
+        "is_ordinary_table": True,
+        "indexes": [
+            {"name": "idx_new", "columns": ["id"], "is_partial": False, "is_unique": False}
+        ],
+    }
+    results = verdicts(before, after)
+    assert len(results) == 1
+    assert results[0].key[0] == "ADV001"
+
+
+# --- other applied-detection code families, each exercised at least once ---------------
+
+
+def test_applied_drop_index_true_when_the_named_index_is_gone():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV002",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "index": "orders_idx",
+                    "columns": ["status"],
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {
+            "public.orders": {
+                "is_ordinary_table": True,
+                "indexes": [
+                    {
+                        "name": "orders_idx",
+                        "columns": ["status"],
+                        "is_partial": False,
+                        "is_unique": False,
+                    }
+                ],
+            }
+        },
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "T",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+
+
+def test_applied_redshift_sortkey_changed_from_its_recorded_baseline():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV101",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "column": "created_at",
+                    "current_sortkey1": None,
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "created_at"}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+
+
+def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV104",
+                "evidence": {"schema": "public", "table": "orders", "unsorted": 30.0},
+                "ddl": "VACUUM public.orders;",
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 30.0}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 2.0}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+
+
+def test_applied_materialize_true_when_the_view_becomes_an_ordinary_table():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV301",
+                "evidence": {"schema": "public", "table": "orders_view", "cost_share": 0.4},
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders_view": {"is_ordinary_table": False}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "T",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders_view": {"is_ordinary_table": True}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+
+
+def test_applied_is_none_for_an_unrecognized_future_code():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV999",
+                "evidence": {"schema": "public", "table": "orders", "column": "x"},
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "T",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
