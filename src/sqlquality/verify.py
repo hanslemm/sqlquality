@@ -740,27 +740,51 @@ def _applied_drop_index(
     return not still_present
 
 
-#: The column name inside `KEY(column)` (or `AUTO(KEY(column))`) in a Redshift
-#: `svv_table_info.diststyle` string. Duplicated from `workload/redshift.py`'s identical,
-#: private `_diststyle_key_column`/`_diststyle_is_all` rather than imported: that module
-#: transitively pulls in this project's live-connection machinery (`workload.base`), which
-#: `verify.py` must never import (see the module docstring) — and the regex itself is a
-#: small, stable piece of AWS's own documented vocabulary ('KEY(col)', 'EVEN', 'ALL', any
-#: of those wrapped in `AUTO(...)`), not project logic that could drift between the two
-#: copies. See the original for the fuller accounting of those shapes.
-_DISTSTYLE_KEY_RE = re.compile(r"KEY\(\s*([^)]+?)\s*\)", re.IGNORECASE)
+#: Unwraps an outer `AUTO(...)` from a Redshift `diststyle` string, if present — AWS
+#: documents `AUTO(ALL)`, `AUTO(EVEN)` and `AUTO(KEY(col))` alongside the un-wrapped forms,
+#: so a shape check must look through the wrapper rather than treat it as unrecognized.
+_DISTSTYLE_AUTO_RE = re.compile(r"^AUTO\(\s*(.*)\s*\)$", re.IGNORECASE | re.DOTALL)
+
+#: The column name inside `KEY(column)`, once any `AUTO(...)` wrapper is already stripped.
+_DISTSTYLE_KEY_RE = re.compile(r"^KEY\(\s*([^)]+?)\s*\)$", re.IGNORECASE)
 
 
-def _diststyle_key_column(diststyle: str) -> str | None:
-    """The column name inside `KEY(column)`/`AUTO(KEY(column))`, or `None` when `diststyle`
-    names no key column at all (`EVEN`, `ALL`, or anything else)."""
-    match = _DISTSTYLE_KEY_RE.search(diststyle)
-    return match.group(1).strip() if match else None
+def _diststyle_shape(diststyle: object) -> tuple[str, str | None] | None:
+    """Classify a Redshift `diststyle` value into one of AWS's documented shapes —
+    `("even", None)`, `("all", None)`, `("key", column)` — or `None` when `diststyle` is
+    not a string, or is a string matching none of them.
 
-
-def _diststyle_is_all(diststyle: str) -> bool:
-    """`True` for Redshift's own `ALL` or `AUTO(ALL)` diststyle text."""
-    return "ALL" in diststyle.upper() and _diststyle_key_column(diststyle) is None
+    **Why an unrecognized shape reads as `None`, never `False` (Concern 1, fix round 2,
+    overruling this function's first version).** The closed-vocabulary argument that
+    version made would be sound if the vocabulary were *verified* — it is not. This
+    project carries a standing, documented limitation (CHANGELOG.md, README.md):
+    Redshift's introspection SQL, `svv_table_info` included, has never been executed
+    against a live cluster. Every shape this function recognizes comes from AWS's
+    documentation alone, not observation, and `AUTO(...)` already nests three ways
+    (`AUTO(ALL)`, `AUTO(EVEN)`, `AUTO(KEY(col))`) — good evidence the space is larger than
+    a flat enum read off a doc page could confidently claim to have enumerated. Reporting
+    "this did not parse" as though it were "measured, and it is not a key/ALL/EVEN
+    distribution" is the identical shape of error Task 2's Critical fixed one layer down
+    (a never-fetched relation reported as hard fact) and this task's own Concern 1 fix:
+    a check that could not run must be disclosed, never assumed. `False` stays reserved
+    for a value this function *did* recognize, just not as the shape being checked for —
+    a recognized `EVEN` when the caller asked "is this `KEY(customer_id)`" is a genuine
+    negative, not an unknown.
+    """
+    if not isinstance(diststyle, str):
+        return None
+    text = diststyle.strip()
+    auto_match = _DISTSTYLE_AUTO_RE.match(text)
+    if auto_match:
+        text = auto_match.group(1).strip()
+    if text.upper() == "EVEN":
+        return ("even", None)
+    if text.upper() == "ALL":
+        return ("all", None)
+    key_match = _DISTSTYLE_KEY_RE.match(text)
+    if key_match:
+        return ("key", key_match.group(1).strip())
+    return None
 
 
 def _applied_redshift_key(
@@ -768,7 +792,7 @@ def _applied_redshift_key(
     evidence: dict[str, object],
     before_phys: dict[str, object],
     after_phys: dict[str, object],
-) -> bool | None:
+) -> tuple[bool | None, str | None]:
     """ADV101/ADV102/ADV103 — see `_REDSHIFT_KEY_CODES`.
 
     **Applied means the observed state now matches the *proposed target*, never merely
@@ -780,35 +804,48 @@ def _applied_redshift_key(
     ADV103 proposes `DISTSTYLE ALL` specifically.
 
     - ADV101: `True` iff `after`'s `sortkey1` equals the proposed `column`, exactly.
-    - ADV102: `True` iff `after`'s `diststyle` parses (`_diststyle_key_column`) to the
-      proposed `column`, exactly — not merely "some KEY(...) column changed."
-    - ADV103: `True` iff `after`'s `diststyle` is Redshift's own `ALL`/`AUTO(ALL)` shape
-      (`_diststyle_is_all`).
-
-    A `diststyle` that parses to some *other* column, or to no key column at all, is a
-    genuine mismatch — `False`, never `None`: `diststyle` is a small, closed AWS
-    vocabulary (the same one `workload/redshift.py`'s own `propose_distkey`/
-    `propose_diststyle_all` already rely on for definitive yes/no reads), so failing to
-    parse as the target is itself a measurement, not missing information.
+      `sortkey1` is a bare column name with nothing to parse, so no shape question
+      arises here — only the Ruling 1 gate below.
+    - ADV102: `after`'s `diststyle` classified (`_diststyle_shape`) as `("key",
+      column)` with `column` equal to the proposed one -> `True`; classified as
+      anything else recognized (`EVEN`, `ALL`, or `KEY(`some other column`)`) -> `False`,
+      a genuine mismatch; unrecognized -> `None` (Concern 1, fix round 2).
+    - ADV103: classified as `("all", None)` -> `True`; classified as `EVEN` or any `KEY`
+      shape -> `False`; unrecognized -> `None`.
 
     **Ruling 1.** `None` when either side's `is_ordinary_table` is `null` (`sortkey1`/
     `diststyle` are themselves ambiguous `None`s until `is_ordinary_table` is known — see
     `RedshiftWorkloadAdapter.physical_state`'s docstring), or when ADV101/ADV102's
     evidence does not carry the `column` this comparison needs (defensive — a real
-    proposal from either rule always does).
+    proposal from either rule always does). Both routes carry no note of their own here;
+    `verdicts`'s generic "cannot be observed" wording already covers them.
     """
     if before_phys.get("is_ordinary_table") is None or after_phys.get("is_ordinary_table") is None:
-        return None
+        return None, None
     after_diststyle = after_phys.get("diststyle")
     if code == "ADV103":
-        return isinstance(after_diststyle, str) and _diststyle_is_all(after_diststyle)
+        shape = _diststyle_shape(after_diststyle)
+        if shape is None:
+            return None, (
+                "after's diststyle did not match any recognized shape (Redshift's "
+                "introspection has never been verified against a live cluster); cannot "
+                "tell whether DISTSTYLE ALL was applied."
+            )
+        return shape[0] == "all", None
     column = evidence.get("column")
     if not isinstance(column, str):
-        return None
+        return None, None
     if code == "ADV101":
-        return after_phys.get("sortkey1") == column
+        return after_phys.get("sortkey1") == column, None
     # ADV102
-    return isinstance(after_diststyle, str) and _diststyle_key_column(after_diststyle) == column
+    shape = _diststyle_shape(after_diststyle)
+    if shape is None:
+        return None, (
+            "after's diststyle did not match any recognized shape (Redshift's "
+            "introspection has never been verified against a live cluster); cannot tell "
+            "whether the proposed DISTKEY was applied."
+        )
+    return shape == ("key", column), None
 
 
 def _applied_maintenance(
@@ -909,7 +946,7 @@ def _detect_applied(
     if code in _DROP_INDEX_CODES:
         return _applied_drop_index(evidence, before_phys, after_phys), None
     if code in _REDSHIFT_KEY_CODES:
-        return _applied_redshift_key(code, evidence, before_phys, after_phys), None
+        return _applied_redshift_key(code, evidence, before_phys, after_phys)
     if code == _MAINTENANCE_CODE:
         return _applied_maintenance(evidence, before_phys, after_phys), None
     if code == _MATERIALIZE_CODE:
