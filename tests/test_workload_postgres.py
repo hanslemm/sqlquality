@@ -313,6 +313,9 @@ def test_postgres_reports_its_stats_reset_time_and_cannot_report_since():
     facts = adapter.window_facts()
     assert facts["stats_reset_at"] == "2026-08-01T00:00:00"
     assert facts["since"] is None, "Postgres cannot honour --since; claiming it did would lie"
+    assert facts["since_duration_seconds"] is None, (
+        "not even the bare requested duration may be echoed without a cutoff actually bound"
+    )
     assert facts["limit"] == 500
 
 
@@ -338,7 +341,12 @@ def test_postgres_window_facts_are_null_before_any_fetch():
     which is exactly the distinction the payload relies on."""
     adapter = PostgresWorkloadAdapter(querier=_canned({}))
     facts = adapter.window_facts()
-    assert facts == {"stats_reset_at": None, "since": None, "limit": None}
+    assert facts == {
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": None,
+    }
 
 
 def test_physical_state_is_keyed_by_a_json_serializable_string():

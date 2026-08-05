@@ -243,8 +243,10 @@ def test_fetch_workload_window_names_the_truncation_not_full_coverage():
 
 
 def test_redshift_reports_the_since_cutoff_it_actually_bound():
-    """Unlike Postgres, `sys_query_history` carries timestamps, so `--since` is real and the
-    window is comparable by construction — which is what lets `verify` grade it HIGH."""
+    """Unlike Postgres, `sys_query_history` carries timestamps, so `--since` genuinely
+    binds a real cutoff, recorded here for report text. `verify`'s `COMPARABLE` grade
+    is earned by `since_duration_seconds` matching between two runs, not by this cutoff
+    alone — see `test_redshift_reports_the_requested_duration_alongside_the_cutoff`."""
     adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
     adapter.fetch_workload(timedelta(days=7), 500)
     facts = adapter.window_facts()
@@ -253,11 +255,22 @@ def test_redshift_reports_the_since_cutoff_it_actually_bound():
     assert facts["stats_reset_at"] is None, "Redshift has no cumulative-counter reset"
 
 
+def test_redshift_reports_the_requested_duration_alongside_the_cutoff():
+    """`verify` grades two windows `COMPARABLE` on equal `since_duration_seconds`, not on
+    equal `since` — two runs a week apart with the same `--since 7d` bind two different
+    absolute cutoffs, so the *duration* is what must be recorded and compared."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["since_duration_seconds"] == timedelta(days=7).total_seconds()
+
+
 def test_redshift_window_facts_report_no_since_when_not_requested():
     adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
     adapter.fetch_workload(None, 500)
     facts = adapter.window_facts()
     assert facts["since"] is None
+    assert facts["since_duration_seconds"] is None
     assert facts["limit"] == 500
 
 

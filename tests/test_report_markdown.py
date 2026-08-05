@@ -152,6 +152,7 @@ def test_payload_reports_proposals_window_and_skips():
         "engine": "postgres",
         "stats_reset_at": None,
         "since": None,
+        "since_duration_seconds": None,
         "limit": None,
     }
     assert payload["proposals"][0]["code"] == "ADV001"
@@ -167,8 +168,9 @@ def test_payload_reports_proposals_window_and_skips():
 def test_window_is_an_object_carrying_what_the_comparison_needs():
     """`verify` classifies two runs' windows as nested, disjoint or comparable, and cannot
     do that from a prose sentence. Each field answers one question: `stats_reset_at`
-    whether Postgres's cumulative counters were cleared between runs, `since` whether a
-    duration was applied, `limit` whether the window was truncated."""
+    whether Postgres's cumulative counters were cleared between runs, `since_duration_seconds`
+    whether the same explicit duration was requested on both sides, `limit` whether the
+    window was truncated."""
     payload = advise_payload(
         [],
         Workload(stats=(), window_description="since stats reset at 2026-08-01T00:00:00"),
@@ -176,7 +178,12 @@ def test_window_is_an_object_carrying_what_the_comparison_needs():
         engine="postgres",
         redacted=True,
         degraded=[],
-        window_facts={"stats_reset_at": "2026-08-01T00:00:00", "since": None, "limit": 500},
+        window_facts={
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
     )
     window = payload["window"]
     assert isinstance(window, dict), "a prose string cannot be compared across runs"
@@ -184,6 +191,7 @@ def test_window_is_an_object_carrying_what_the_comparison_needs():
     assert window["engine"] == "postgres"
     assert window["stats_reset_at"] == "2026-08-01T00:00:00"
     assert window["since"] is None
+    assert window["since_duration_seconds"] is None
     assert window["limit"] == 500
 
 
@@ -215,7 +223,7 @@ def test_missing_window_facts_are_null_not_absent():
         degraded=[],
         window_facts={},
     )
-    for key in ("stats_reset_at", "since", "limit"):
+    for key in ("stats_reset_at", "since", "since_duration_seconds", "limit"):
         assert key in payload["window"], f"{key} must be present even when unknown"
         assert payload["window"][key] is None
 

@@ -1583,10 +1583,17 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         passed. Echoing it back would make a baseline/verification pair that is really
         *nested* — the follow-up's cumulative counters contain the baseline's — look
         *comparable*, which is worse than reporting nothing.
+
+        `since_duration_seconds` is always `None` for the identical reason: even the bare
+        *requested duration* (with no cutoff actually bound to it) must not be echoed,
+        since `sqlquality verify` grades two windows `COMPARABLE` on equal
+        `since_duration_seconds` alone, and reporting a duration here would claim a
+        filter this adapter never actually applied.
         """
         return {
             "stats_reset_at": self._stats_reset_at,
             "since": None,
+            "since_duration_seconds": None,
             "limit": self._window_limit,
         }
 

@@ -1201,6 +1201,13 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         #: — see that method's docstring on `PostgresWorkloadAdapter` for why it must not
         #: issue SQL. `None` until `fetch_workload` runs, or when it ran with no `--since`.
         self._since_cutoff: str | None = None
+        #: The *requested duration* itself (`since.total_seconds()`), alongside the
+        #: absolute cutoff above. `sqlquality verify` grades two windows `COMPARABLE` on
+        #: this field, not on `_since_cutoff`: two runs a week apart with the identical
+        #: `--since 7d` bind two different absolute cutoffs but request the same
+        #: duration, and it is the duration, not the cutoff, that makes them comparable
+        #: "by construction." `None` exactly when `_since_cutoff` is `None`.
+        self._since_duration_seconds: float | None = None
         #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
         self._window_limit: int | None = None
 
@@ -1340,8 +1347,12 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         # Recorded for `window_facts()`, which must not issue SQL of its own — see
         # `PostgresWorkloadAdapter.window_facts`'s docstring for why. Unlike Postgres,
         # `since` genuinely is honoured here, so the cutoff actually bound is what gets
-        # reported — not merely echoing the caller's request back.
+        # reported — not merely echoing the caller's request back. The requested
+        # duration itself is recorded alongside it, from `since` (the timedelta
+        # argument), not derived back out of `cutoff` — see `_since_duration_seconds`'s
+        # own comment for why `verify` needs the duration rather than the cutoff.
         self._since_cutoff = cutoff.isoformat() if cutoff is not None else None
+        self._since_duration_seconds = since.total_seconds() if since is not None else None
         self._window_limit = limit
         return WorkloadFetch(
             rows=tuple(
@@ -1372,11 +1383,17 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         way Postgres does, so there is nothing to report there. `since` is the actual
         cutoff `fetch_workload` bound into the statement — see its docstring — not merely
         the caller's request, since `sys_query_history` genuinely lets `--since` be
-        honoured.
+        honoured. `since_duration_seconds` is the *requested duration* underlying that
+        same cutoff (`since.total_seconds()`), reported alongside it rather than instead
+        of it: `sqlquality verify` classifies two windows `COMPARABLE` on this field, since
+        two runs a week apart with the identical `--since 7d` bind different absolute
+        cutoffs but request the same duration, and grading on the cutoff alone made
+        `COMPARABLE` unreachable from any real Redshift pair.
         """
         return {
             "stats_reset_at": None,
             "since": self._since_cutoff,
+            "since_duration_seconds": self._since_duration_seconds,
             "limit": self._window_limit,
         }
 
