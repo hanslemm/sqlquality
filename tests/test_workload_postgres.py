@@ -303,6 +303,270 @@ def test_fetch_workload_window_is_honest_that_since_is_not_supported():
     assert "since stats reset" in fetch.window_description.lower()
 
 
+def test_postgres_reports_its_stats_reset_time_and_cannot_report_since():
+    """`pg_stat_statements` is cumulative with no per-statement timestamps, so `--since`
+    is never applied and must be reported as such rather than echoed back."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned({CAP_STATS_RESET: [("2026-08-01T00:00:00",)]})
+    )
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["stats_reset_at"] == "2026-08-01T00:00:00"
+    assert facts["since"] is None, "Postgres cannot honour --since; claiming it did would lie"
+    assert facts["since_duration_seconds"] is None, (
+        "not even the bare requested duration may be echoed without a cutoff actually bound"
+    )
+    assert facts["limit"] == 500
+
+
+def test_postgres_window_facts_do_not_issue_sql():
+    """`window_facts()` must read only what `fetch_workload` already recorded on the
+    instance — a method that queries would break `--dry-run` and re-read the catalog for a
+    payload field.
+
+    Recording the call rather than raising from the stub: `_run` swallows any exception
+    into `degraded` and returns `[]`, so a stub that raises would be silently absorbed and
+    this test would pass whether or not `window_facts()` actually queried.
+    """
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_STATS_RESET: [("2026-08-01",)]}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.window_facts()
+    assert calls == [], "window_facts() must not issue any SQL"
+
+
+def test_postgres_window_facts_are_null_before_any_fetch():
+    """Present-but-null before `fetch_workload` has ever run — not an unset/absent state,
+    which is exactly the distinction the payload relies on."""
+    adapter = PostgresWorkloadAdapter(querier=_canned({}))
+    facts = adapter.window_facts()
+    assert facts == {
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": None,
+    }
+
+
+def test_physical_state_is_keyed_by_a_json_serializable_string():
+    """A `Relation` is not JSON-serializable, and a `TypeError` here would fire only after
+    the whole analysis has already run — this project has shipped exactly that bug once
+    before."""
+    import json
+
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned({CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)]})
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert list(state) == ["public.orders"]
+    json.dumps(state)  # must not raise
+
+
+def test_physical_state_records_the_indexes_verify_needs_to_detect_application():
+    """ "Was the proposed index created?" is answered by comparing two artifacts' index
+    lists. Without `columns` the question is unanswerable, and without `is_partial` an
+    ADV004 partial index is indistinguishable from a plain one leading with the same
+    column."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ]
+            }
+        )
+    )
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    [index] = state["public.orders"]["indexes"]
+    assert index["name"] == "idx_status"
+    assert index["columns"] == ["status"]
+    assert index["is_partial"] is False
+    assert index["is_unique"] is False
+
+
+def test_a_relation_absent_from_table_facts_is_recorded_as_not_an_ordinary_table():
+    """Postgres's `CAP_TABLE_FACTS` filters `relkind = 'r'`, so a view never appears. That
+    absence is how `verify` detects ADV301's application — the relation becoming a table —
+    without any new catalog query."""
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_TABLE_FACTS: []}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "stg_orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "stg_orders")}))
+    assert state["public.stg_orders"]["is_ordinary_table"] is False
+
+
+def test_only_the_relations_asked_about_are_recorded():
+    """Payload size must scale with findings, not with schema size."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [
+                    ("public", "orders", 50_000, 1024),
+                    ("public", "customers", 10_000, 512),
+                ]
+            }
+        )
+    )
+    adapter.fetch_table_facts(
+        ("public",),
+        frozenset({Relation("public", "orders"), Relation("public", "customers")}),
+    )
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert list(state) == ["public.orders"]
+
+
+def test_a_relation_never_fetched_at_all_is_present_but_null_not_a_false_measurement():
+    """Reproduces the review's Critical finding directly: ADV303 fires for a relation
+    *outside* `aggregation.tables`, and `fetch_table_facts`/`fetch_indexes` are only ever
+    called with `aggregation.tables` (+ `star_tables`) — so that relation's catalog facts
+    are never fetched at all. Before the fix, `physical_state` reported such a relation as
+    `is_ordinary_table: False, indexes: []`, identical to a relation genuinely fetched and
+    found to have neither. `verify` cannot tell those apart, so the moment a later run's
+    workload happens to touch the relation it would see `False -> True` and `[] -> [...]`
+    and conclude a table and its indexes were just created, when nothing physically
+    changed — only what this run happened to look at did.
+
+    `public.orders` is fetched (and genuinely is an ordinary table with one index) to
+    prove the *other* branch is untouched by this fix; `public.never_fetched` is asked
+    about by `physical_state` without ever being passed to `fetch_table_facts` or
+    `fetch_indexes` — exactly the ADV303 shape — and must come back `None`/`None`.
+    """
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)],
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ],
+            }
+        )
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(
+        frozenset({Relation("public", "orders"), Relation("public", "never_fetched")})
+    )
+    assert state["public.orders"]["is_ordinary_table"] is True
+    assert state["public.orders"]["indexes"] == [
+        {"name": "idx_status", "columns": ["status"], "is_partial": False, "is_unique": False}
+    ]
+    never = state["public.never_fetched"]
+    assert never["is_ordinary_table"] is None, "never fetched must read as unknown, not False"
+    assert never["indexes"] is None, "never fetched must read as unknown, not []"
+
+
+def test_a_denied_catalog_read_is_present_but_null_not_a_false_measurement():
+    """A degraded `CAP_TABLE_FACTS`/`CAP_INDEXES` read leaves the caches empty exactly as a
+    never-fetched relation does — this is the review's Important finding 2. Both capabilities
+    are denied here even though the relation genuinely was asked about (`fetch_table_facts`/
+    `fetch_indexes` were called with it), so the *only* way to tell this apart from "fetched,
+    and it has neither" is by consulting `self.degraded` — which is what the fix does.
+    """
+    querier = FakeQuerier(
+        {},
+        fail_markers=(
+            PostgresWorkloadAdapter.SQL[CAP_TABLE_FACTS],
+            PostgresWorkloadAdapter.SQL[CAP_INDEXES],
+        ),
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    assert any(cap == CAP_TABLE_FACTS for cap, _ in adapter.degraded)
+    assert any(cap == CAP_INDEXES for cap, _ in adapter.degraded)
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    entry = state["public.orders"]
+    assert entry["is_ordinary_table"] is None, "a denied read must read as unknown, not False"
+    assert entry["indexes"] is None, "a denied read must read as unknown, not []"
+
+
+def test_a_relation_with_indexes_genuinely_fetched_and_found_to_have_none_reports_empty_list():
+    """The other half of the same distinction: `indexes: []` is a genuine measurement
+    ("we looked, and there are none"), not a stand-in for "we did not look" — and that half
+    was unpinned. Mutating `have_indexes` to check `self._indexes_cache` (which only ever
+    gains a relation `CAP_INDEXES` returned at least one row for) instead of
+    `self._indexes_requested` re-creates the original bug for exactly this field: a
+    fetched-and-genuinely-empty relation would read `null`, and `verify` would lose the
+    "the proposed index is still absent" signal for every unindexed table. `is_ordinary_table`
+    already has this pin (`test_a_relation_absent_from_table_facts_is_recorded_as_not_an_ordinary_table`);
+    this is its `indexes` counterpart.
+    """
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_INDEXES: []}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert state["public.orders"]["indexes"] == [], (
+        "a relation whose indexes were requested and genuinely returned no rows must "
+        "report [], not null — null means 'we did not look'"
+    )
+
+
+def test_postgres_physical_state_does_not_issue_sql():
+    """See `window_facts()`'s identical test docstring: a raising stub does not work here
+    either, since `_run` swallows any exception into `degraded` and returns `[]` — this
+    test would pass whether or not `physical_state` queried. Count calls instead.
+    """
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)],
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ],
+            }
+        )
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert calls == [], "physical_state() must not issue any SQL"
+
+
 def test_a_null_stats_reset_reads_as_an_unknown_time_not_as_None():
     """`stats_reset` is SQL NULL until someone resets statistics — the *default* state.
 

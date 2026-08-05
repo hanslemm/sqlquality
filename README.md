@@ -6,8 +6,8 @@ runs per-engine static **performance anti-pattern** checks (with optional
 captured-`EXPLAIN` analysis), sqlfluff-backed **linting**, and optional, advisory
 **LLM suggestions**.
 
-sqlquality **never executes your SQL**. `complexity`, `lint`, `perf` and `check` are
-fully offline and never open a connection. `advise` is the one exception: it opens a
+sqlquality **never executes your SQL**. `complexity`, `lint`, `perf`, `check` and `verify`
+are fully offline and never open a connection. `advise` is the one exception: it opens a
 **read-only** session to read query history and catalog metadata, using only a fixed set
 of built-in introspection statements. Run `sqlquality advise --dry-run` to print every
 statement it can issue, without connecting.
@@ -31,6 +31,7 @@ Requires Python 3.11+.
   - [lint](#lint)
   - [perf](#perf)
   - [advise](#advise)
+  - [verify](#verify)
   - [check](#check-the-ci-gate)
 - [Configuration](#configuration-sqlqualityyml)
 - [Exit codes](#exit-codes)
@@ -92,6 +93,7 @@ sqlquality check        Gate a dbt change on the complexity delta of its changed
 sqlquality lint         Lint SQL files for best-practice violations (SQLFluff); --fix rewrites them.
 sqlquality perf         Analyze a SQL file for performance anti-patterns (+ optional EXPLAIN plan).
 sqlquality advise       Propose database optimizations from query history and catalog metadata.
+sqlquality verify       Diff two `advise --json` artifacts: was each proposal applied, and did it help?
 ```
 
 The `--dialect` / `-d` flag is validated against sqlglot's dialect registry on every
@@ -585,9 +587,12 @@ DROP INDEX "public"."idx_orders_customer_ref";
 ```
 
 `--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
-`engine`, `proposals`, `redacted`, `skipped`, `window`, plus `dbt` when — and only when — a
-manifest was loaded). This is the first proposal from
-the run above — the real payload lists all five under `proposals`:
+`engine`, `physical_state`, `proposals`, `query_groups`, `redacted`, `skipped`, `window`,
+plus `dbt` when — and only when — a manifest was loaded). This is the first proposal from
+the run above, and the block is abridged in exactly two places: the real payload lists all
+five proposals under `proposals`, and the `query_groups` list is trimmed to one entry. The
+ADV001 object is complete — its `evidence` key set is the one a real ADV001 carries — but each
+rule's `evidence` holds whatever that rule measured, so the key set varies by code.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
@@ -596,17 +601,32 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     "query_groups": 3,
     "query_groups_in_window": 3,
     "tables": [
-      "orders"
+      "public.orders"
     ],
     "total_cost_ms": 925000.0
   },
   "degraded": [],
   "engine": "postgres",
+  "physical_state": {
+    "public.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
   "proposals": [
     {
       "code": "ADV001",
       "confidence": "high",
-      "ddl": "CREATE INDEX ON \"orders\" (\"status\");",
+      "ddl": "CREATE INDEX ON \"public\".\"orders\" (\"status\");",
       "evidence": {
         "calls": 15000,
         "co_occurring_fingerprints": 1,
@@ -614,17 +634,32 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
           "status"
         ],
         "cost_share": 0.6702702702702703,
+        "expression_indexes": [],
+        "fingerprint_digests": [
+          "d2e8aa0a67af"
+        ],
         "leading_ndv": 500.0,
+        "partial_indexes_skipped": [],
         "roles": [
           "equality"
         ],
         "row_estimate": 5200000,
+        "schema": "public",
         "table": "orders"
       },
       "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
-      "title": "Add index on orders(status)"
+      "title": "Add index on public.orders(status)"
     }
     /* … 4 more proposal objects, same shape … */
+  ],
+  "query_groups": [
+    {
+      "calls": 15000,
+      "digest": "d2e8aa0a67af",
+      "mean_ms": 41.333333333333336,
+      "total_time_ms": 620000.0
+    }
+    /* … 2 more query groups, same shape … */
   ],
   "redacted": true,
   "skipped": {
@@ -633,9 +668,52 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     "unqualifiable": 0,
     "ambiguous": 0
   },
-  "window": "since stats reset at 2026-07-19 03:00:00+00"
+  "window": {
+    "description": "since stats reset at 2026-07-19 03:00:00+00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-07-19 03:00:00+00"
+  }
 }
 ```
+
+**Three of those keys exist so that [`verify`](#verify) can diff two runs**, and they are the
+only part of the payload whose contract is about a *later* run rather than this one:
+
+- **`window`** is an object, not the prose sentence 0.3.0 wrote there: `description` (that
+  same sentence, unchanged), `engine`, `stats_reset_at`, `since`,
+  `since_duration_seconds` (the *requested* `--since` duration, e.g. `604800.0` for `7d`,
+  as distinct from `since`'s absolute cutoff) and `limit`. Postgres reports `since` and
+  `since_duration_seconds` as `null` always: it cannot apply `--since` at all, so echoing
+  the flag back would claim a filter that was never applied.
+- **`physical_state`** records, per `"schema.table"`, what the run's catalog reads already
+  saw — no extra round trip. On Postgres that is `is_ordinary_table` plus each existing
+  index's `name`, `columns`, `is_partial` and `is_unique`; on Redshift it is
+  `is_ordinary_table`, `sortkey1`, `diststyle`, `unsorted` and `stats_off`. Every field is a
+  **three-way** signal: `null` means *this run could not tell you* (the relation's facts were
+  never fetched, or the read was denied — see `degraded`), while `false`/`[]` is a real
+  measurement. `verify` reads a `null` as unknown and never as "no".
+
+  On Postgres `is_ordinary_table: false` means a view, a foreign table or a partitioned
+  parent, because the catalog read behind it filters `relkind = 'r'`. **On Redshift the same
+  `false` means less**: it comes from the relation's presence in `svv_table_info`, which
+  omits external (Spectrum) tables *and* genuinely empty local tables, and nothing available
+  distinguishes those — so a Redshift `false` conflates "not a table" with "a table nobody
+  has written to yet". The two engines are deliberately not at parity here.
+- **`query_groups`** is every query group this run analysed — `digest`, `calls`,
+  `total_time_ms` and `mean_ms` (`null`, never `0.0`, when `calls` is `0`) — not only the
+  ones some proposal cites, and each index-rule proposal names the ones behind it in
+  `evidence.fingerprint_digests`. This is a **different key** from
+  `analyzed.query_groups`, which is (and stays) an integer count.
+
+  `analyzed.query_groups` is how many groups were understood; `analyzed.query_groups_in_window`
+  is how many the window held.
+
+All three keys are **always present** — `{}`, `[]` and a full object rather than omitted when
+empty. That is what lets `verify` tell an artifact written before these keys existed (which it
+refuses) from one that genuinely has nothing to report.
 
 **Coverage is always disclosed**, not just when it is bad — the terminal, markdown and
 JSON paths all print how many query groups were actually understood:
@@ -773,6 +851,125 @@ A manifest that is missing, unreadable or malformed degrades to "no enrichment" 
 line on stderr — `advise` never aborts an otherwise-successful run over an optional input,
 since by the time the manifest loads the whole catalog analysis has already run.
 
+### verify
+
+Closes `advise`'s feedback loop. Every proposal `advise` makes is a hypothesis; `verify`
+diffs a baseline `advise --json` artifact against a later one and reports, per proposal,
+whether the advice was **applied** and whether the queries that justified it actually got
+**faster**.
+
+It is **fully offline**: it reads two files, opens no connection and needs no credentials,
+so anyone reviewing a change can run it — including people who will never have production
+access. The baseline is an ordinary `advise --json` run; there is no separate file format.
+
+```console
+$ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json > before.json
+# ... create the proposed index, let the workload run ...
+$ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json > after.json
+$ sqlquality verify before.json after.json
+Window relation: nested — both runs report the same stats_reset_at and neither restricted
+its window, so the after run's cumulative pg_stat_statements counters contain the before
+run's. Every pre-change execution is still averaged into the after mean, so a real
+improvement is understated here, sometimes badly: a proposal that genuinely helped can read
+as 'unchanged'. Verdicts are capped at medium confidence for that reason. For an undiluted
+comparison, call pg_stat_statements_reset() yourself right after applying a change and take
+the after artifact from there — sqlquality never writes to your database, this reset
+included.
+Run order is taken from the argument order: BEFORE, then AFTER. ...
+workload: before 5000.0 ms across 1 query group(s); after 2000.0 ms across 1 query group(s)
+             Verify — postgres (1 proposal, 1 applied, 1 improved)
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┓
+┃ proposal                      ┃ applied ┃ outcome  ┃ mean per call ┃ conf   ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━┩
+│ ADV001 public.orders (status) │ yes     │ improved │ 50.0 → 2.0 ms │ medium │
+└───────────────────────────────┴─────────┴──────────┴───────────────┴────────┘
+```
+
+The table, the per-proposal notes and the disclosures above go to stdout and stderr
+respectively; `--json` emits the same content (verdicts, counts, window relation and every
+caveat) as one machine-readable payload, and `--markdown PATH` writes a report for a ticket
+or PR comment. `verify` **reports and never gates**: exit 0 whenever a comparison was
+reported, exit 2 when it was refused, never 1. There is deliberately no `--gate` flag.
+
+**`applied` is observed, not declared.** It comes from the physical state each run recorded
+(`physical_state` in the artifact) — an index that now leads with the proposed columns, a
+dropped index that is gone, a `sortkey1`/`diststyle` that matches the *proposed target*
+rather than merely having changed. `applied: unknown` is a distinct answer from
+`applied: no`: "we could not tell whether you did it" is not "you did not do it", and the
+rules that have nothing observable at all (ADV005 and ADV006 advise a query rewrite, ADV303
+needs a dbt manifest an offline command does not have) are always `unknown` rather than
+guessed at.
+
+**Outcomes** are `improved`, `unchanged`, `regressed`, `disappeared`, `not_applied` and
+`unobservable`. The most valuable is **applied but unchanged** — the work was done and it
+did not help, which the note says in as many words.
+
+**Mean time per call is the metric; `cost_share` is not.** `pg_stat_statements` is
+cumulative and carries no per-statement timestamps, so a group's share of the window falls
+simply because a week of other traffic accumulated. `cost_share` is the right metric for
+*prioritising* work (which is why `advise` uses it) and close to useless for *measuring* an
+improvement, so it rides along as context — whether the finding still matters — and never as
+the verdict. The workload-context line prints both runs' total window cost and group count
+so a global workload shift is visible rather than deduced.
+
+**Confidence comes from how comparable the two windows are:**
+
+| windows | grade | why |
+|---|---|---|
+| disjoint (the counters were reset between the runs) | high | independent samples |
+| comparable duration (both runs requested the same `--since`) | high | the same window length by construction |
+| nested (Postgres cumulative, never reset) | medium | pre-change executions dilute the mean, so a real gain is **understated** |
+| incomparable (a one-sided or mismatched `--since`, an unknown `stats_reset_at`) | low | the windows cannot be placed relative to each other |
+
+The **nested** case is the common one — you baselined last Tuesday and never reset the
+counters — and it is the one to know about: a proposal that genuinely helped can read as
+`unchanged` there. `verify` prints the caveat on every such run and suggests
+`pg_stat_statements_reset()` for an undiluted comparison. sqlquality never runs it for you;
+it never writes to your database.
+
+**Run order is taken from the argument order** (`BEFORE` first). An `advise` artifact
+carries no run timestamp — deliberately, so that two runs over an unchanged workload produce
+comparable bytes — so a swapped pair is only detectable in one case, which is refused: both
+runs report a `stats_reset_at` and the after run's is *earlier*, which cannot happen, since a
+server's statistics-reset instant does not move backwards. Otherwise `verify` says it cannot
+tell rather than inferring an order it has no evidence for.
+
+**`verify` refuses rather than guesses** — exit 2, naming the cause:
+
+| refused | why |
+|---|---|
+| an unreadable, non-UTF-8, malformed, or non-object JSON file | it is not an `advise --json` artifact |
+| an artifact missing the keys 0.4.0 added (`window` as an object with all its fields, `physical_state`, `query_groups`) | 0.3.0 and intermediate builds wrote less; regenerate the baseline rather than let a verdict rest on absent data |
+| the same artifact twice — identical path, or byte-identical content | it would report every proposal unchanged, which reads as a finding rather than a mistake; two genuinely distinct runs cannot be byte-identical, since the counters accumulate |
+| two artifacts from different engines | they describe two different servers, so nothing in one corresponds to anything in the other |
+| two runs that disagree about `--keep-literals` | redaction changes the canonical query text every digest is computed from, so the same query group is recorded under different identifiers; its "absence" would be a fact about the flag, not about your database |
+| a demonstrably swapped pair (see above) | the comparison would be reversed |
+
+Everything else that weakens the comparison is **disclosed rather than folded into a
+verdict**: a `--limit` mismatch (a group missing from one artifact may be a sampling
+artifact rather than a real disappearance, so `disappeared` is not graded on that alone),
+each run's `degraded` capabilities (a read that could not run produces the same emptiness a
+real change would), recommendations whose key matched more than one proposal *within their
+own artifact* (reported as unmatched — neither disappeared nor new), and proposals only the
+after run makes (no verdict, because there is nothing to compare them against).
+
+**An after-only proposal is only called a *new* finding when both runs' coverage supports
+that.** Three things withhold the claim:
+
+- the **before** run's reads were degraded, so it may never have had the evidence to make that
+  recommendation — its absence is then a fact about that run, not about your database;
+- the **before** run's window sampled fewer (or an unknown number of) query groups, for the
+  same reason;
+- the **after** run's reads were degraded in a way that can *relax* a rule rather than silence
+  it. A rule that cannot evaluate a threshold proposes anyway at reduced confidence — the right
+  posture for `advise`, which discloses rather than withholds — so a run that could not read
+  table sizes, or could not see an index that already covers the predicate, can make a
+  recommendation a fully-observed run would not have made at all.
+
+In each case `verify` still lists those proposals and says why it will not call them new. This
+is the same treatment a query group's absence from the *after* run already gets before
+`disappeared` may be graded; the directions of the same reasoning are deliberately symmetric.
+
 ### check (the CI gate)
 
 Scores each changed model on both a candidate and a baseline dbt manifest, and gates
@@ -897,6 +1094,11 @@ Per-command nuances of code `1`:
   produced — proposals are advisory and never gate. It exits 2 on a usage, config,
   connection or input error (unresolvable credentials, connection failure, missing
   driver, malformed `--since`, out-of-range `--timeout`). It never exits 1.
+- **`verify`** exits 0 whenever a comparison was reported, whatever the verdicts say — a
+  regression does not gate, and there is deliberately no `--gate` flag. It exits 2 when it
+  refuses the pair (see [verify](#verify) for the full list: an unreadable or pre-0.4.0
+  artifact, the same artifact twice, two engines, two redaction settings, a demonstrably
+  swapped pair) or when a `--markdown` path cannot be written. It never exits 1.
 
 ## CI recipe (a gate that actually gates)
 
@@ -1189,3 +1391,29 @@ LLM suggestions unavailable: The 'anthropic' package is required for AnthropicPr
   model is not reported until the downstream one is gone, so a fully dead chain unwinds one
   model per run, from its leaf. Conservative by construction: it never flags a model that
   something declares a dependency on.
+- **`verify` cannot tell which of two artifacts is older, except in one case.** An `advise`
+  artifact carries no run timestamp — deliberately: two runs over an unchanged workload
+  produce comparable bytes, which is what makes them diffable at all — so `verify` takes run
+  order from the argument order. The one detectable swap is refused: both runs report a
+  `stats_reset_at` and the after run's is earlier, which a server cannot do. Pass the earlier
+  artifact first; nothing in the pair will catch it for you if you do not.
+- **On the common nested-window Postgres path `verify` understates a real improvement.**
+  `pg_stat_statements` is cumulative, so unless the counters were reset between the two runs
+  the later window contains the earlier one and every pre-change execution is still averaged
+  into the after mean. A proposal that genuinely helped can therefore read as `unchanged`.
+  This is disclosed on every such run and capped at medium confidence rather than engineered
+  around, because the alternative is writing to your database: `verify` suggests
+  `pg_stat_statements_reset()` and never performs it.
+- **`verify` cannot observe whether ADV005, ADV006 or ADV303 were acted on.** The first two
+  advise a query rewrite, whose only trace is the group's fingerprint changing because the
+  SQL changed; ADV303 needs a dbt manifest an offline command does not have. Their verdict is
+  `unobservable`, and a vanished query group is reported as *possibly* addressed at low
+  confidence — disappearance is not proof.
+- **`verify`'s Redshift verdicts are weaker than its Postgres ones, beyond the standing
+  "never run against a live cluster" caveat.** ADV002/ADV003/ADV104/ADV105/ADV301 name no
+  individual query group, so none of them can ever be graded `improved`, `unchanged` or
+  `regressed` — only `not_applied` or `unobservable`, with the applied signal beside it — and
+  on Redshift that leaves ADV101/ADV102/ADV103 as the only rules whose speed change is
+  gradable at all. `is_ordinary_table` also means less there than on Postgres (see the
+  [`advise --json`](#advise) payload notes above), and the four Redshift physical fields
+  beneath it are unreadable until it is known.

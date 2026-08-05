@@ -242,6 +242,152 @@ def test_fetch_workload_window_names_the_truncation_not_full_coverage():
     assert "most expensive" in fetch.window_description.lower()
 
 
+def test_redshift_reports_the_since_cutoff_it_actually_bound():
+    """Unlike Postgres, `sys_query_history` carries timestamps, so `--since` genuinely
+    binds a real cutoff, recorded here for report text. `verify`'s `COMPARABLE` grade
+    is earned by `since_duration_seconds` matching between two runs, not by this cutoff
+    alone — see `test_redshift_reports_the_requested_duration_alongside_the_cutoff`."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["since"] is not None
+    assert facts["limit"] == 500
+    assert facts["stats_reset_at"] is None, "Redshift has no cumulative-counter reset"
+
+
+def test_redshift_reports_the_requested_duration_alongside_the_cutoff():
+    """`verify` grades two windows `COMPARABLE` on equal `since_duration_seconds`, not on
+    equal `since` — two runs a week apart with the same `--since 7d` bind two different
+    absolute cutoffs, so the *duration* is what must be recorded and compared."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["since_duration_seconds"] == timedelta(days=7).total_seconds()
+
+
+def test_redshift_window_facts_report_no_since_when_not_requested():
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(None, 500)
+    facts = adapter.window_facts()
+    assert facts["since"] is None
+    assert facts["since_duration_seconds"] is None
+    assert facts["limit"] == 500
+
+
+def test_redshift_window_facts_do_not_issue_sql():
+    """See the identical Postgres test's docstring: `window_facts()` must only read what
+    `fetch_workload` already recorded on the instance.
+
+    Recording the call rather than raising from the stub: `_run` swallows any exception
+    into `degraded` and returns `[]`, so a stub that raises would be silently absorbed and
+    this test would pass whether or not `window_facts()` actually queried.
+    """
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_WORKLOAD: []}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.window_facts()
+    assert calls == [], "window_facts() must not issue any SQL"
+
+
+def test_redshift_records_its_own_levers_and_says_absence_means_less_here():
+    """`svv_table_info` omits empty tables as well as external ones, so
+    `is_ordinary_table: False` on Redshift is weaker evidence than on Postgres."""
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    state = adapter.physical_state(frozenset({Relation("public", "events")}))
+    entry = state["public.events"]
+    # The set assertion alone would pass with only one of these five fields correct — each
+    # is checked on its own so a single wrong or missing field fails by itself.
+    assert entry["is_ordinary_table"] is True
+    assert entry["sortkey1"] == "created_at"
+    assert entry["diststyle"] == "KEY(tenant_id)"
+    assert entry["unsorted"] == 2.0
+    assert entry["stats_off"] == 1.0
+    assert set(entry) >= {"is_ordinary_table", "sortkey1", "diststyle", "unsorted", "stats_off"}
+
+
+def test_redshift_physical_state_reports_absence_as_not_an_ordinary_table():
+    """A relation `svv_table_info` never returned a row for — external, or genuinely empty
+    — reads as `is_ordinary_table: False`, the same boolean Postgres uses for a stronger
+    reason (see this function's docstring in `redshift.py`)."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_TABLE_FACTS: []}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "spectrum_tbl")}))
+    state = adapter.physical_state(frozenset({Relation("public", "spectrum_tbl")}))
+    entry = state["public.spectrum_tbl"]
+    assert entry["is_ordinary_table"] is False
+    assert entry["sortkey1"] is None
+    assert entry["diststyle"] is None
+    assert entry["unsorted"] is None
+    assert entry["stats_off"] is None
+
+
+def test_redshift_never_fetched_relation_is_present_but_null_not_a_false_measurement():
+    """Same Critical finding as Postgres's identical test: `svv_table_info` was never even
+    asked about `public.never_fetched` (it was never passed to `fetch_table_facts`, exactly
+    the shape an ADV303 proposal for a relation outside `aggregation.tables` takes), and
+    that must read as unknown on every field, not as `is_ordinary_table: False` — which is
+    indistinguishable from a genuinely-empty or external table and would make a later run
+    that does observe it look like the table and its levers were just created."""
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    state = adapter.physical_state(
+        frozenset({Relation("public", "events"), Relation("public", "never_fetched")})
+    )
+    assert state["public.events"]["is_ordinary_table"] is True
+    never = state["public.never_fetched"]
+    assert never["is_ordinary_table"] is None
+    assert never["sortkey1"] is None
+    assert never["diststyle"] is None
+    assert never["unsorted"] is None
+    assert never["stats_off"] is None
+
+
+def test_redshift_denied_catalog_read_is_present_but_null_not_a_false_measurement():
+    """Important finding 2 on Redshift: a denied `CAP_TABLE_FACTS` read must be
+    distinguishable from "fetched, and it genuinely has nothing" — recoverable only by
+    consulting `self.degraded`, which is what the fix does."""
+    querier = FakeQuerier({}, fail_markers=(RedshiftWorkloadAdapter.SQL[CAP_TABLE_FACTS],))
+    adapter = RedshiftWorkloadAdapter(querier=querier)
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    assert any(cap == CAP_TABLE_FACTS for cap, _ in adapter.degraded)
+    state = adapter.physical_state(frozenset({Relation("public", "events")}))
+    entry = state["public.events"]
+    assert entry["is_ordinary_table"] is None, "a denied read must read as unknown, not False"
+    assert entry["sortkey1"] is None
+    assert entry["diststyle"] is None
+    assert entry["unsorted"] is None
+    assert entry["stats_off"] is None
+
+
+def test_redshift_physical_state_does_not_issue_sql():
+    """See `window_facts()`'s identical test docstring: a raising stub does not work here
+    either, since `_run` swallows any exception into `degraded` and returns `[]` — this
+    test would pass whether or not `physical_state` queried. Count calls instead.
+    """
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.physical_state(frozenset({Relation("public", "events")}))
+    assert calls == [], "physical_state() must not issue any SQL"
+
+
 def test_fetch_workload_since_is_actually_bound_into_the_statement():
     """Guards the claim the test above makes in prose: `--since` must change what the
     statement is run with, not just what the sentence says. Without this, a

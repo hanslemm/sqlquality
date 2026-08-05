@@ -5,6 +5,187 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`sqlquality verify BEFORE AFTER`** — a new, **fully offline** command that diffs two
+  `advise --json` artifacts and reports, per proposal, whether the advice was **applied**
+  (observed from the two runs' recorded `physical_state`, never declared or asked) and
+  whether the query groups that justified it actually got **faster per call**. It reads two
+  files, connects to nothing and needs no credentials, so anyone reviewing a change can run
+  it. `--json` and `--markdown PATH` mirror `advise`'s options; it exits 0 whenever a
+  comparison was reported and 2 when it was refused, never 1 — `verify` reports and never
+  gates, and there is deliberately no `--gate` flag.
+
+  Each proposal gets an outcome (`improved`, `unchanged`, `regressed`, `disappeared`,
+  `not_applied`, `unobservable`) and a confidence taken from how comparable the two
+  **windows** are. The valuable one is **applied but unchanged**: the work was done and it
+  did not help.
+
+  **Mean time per call is the metric; `cost_share` rides along only as context.** On
+  Postgres `pg_stat_statements` is cumulative, so a group's share of the window falls simply
+  because a week of other traffic accumulated — `cost_share` measures whether a finding
+  still *matters*, never whether it got *better*. The workload-context line prints both
+  runs' total window cost and query-group count so a global workload shift is visible
+  rather than deduced.
+
+  **On the common Postgres path (counters baselined once and never reset) the two windows
+  are *nested*: the later one contains the earlier one, so a real improvement is
+  understated** — sometimes badly enough that a proposal which genuinely helped reads as
+  `unchanged`. `verify` says so in the caveat it prints on every such run, caps those
+  verdicts at medium confidence, and names the remedy (call `pg_stat_statements_reset()`
+  yourself right after applying a change and take the after artifact from there —
+  sqlquality never writes to your database, this reset included).
+
+  **`verify` refuses rather than guesses** (exit 2, with the reason): an unreadable,
+  non-UTF-8, malformed or non-object JSON file; an artifact missing the keys this release
+  added, i.e. one produced by 0.3.0 or an intermediate build — regenerate it rather than let
+  a verdict rest on absent data; the same artifact twice (identical path, or byte-identical
+  content, which two genuinely distinct runs cannot produce since the counters accumulate);
+  two artifacts from **different engines**; two runs that **disagree about literal
+  redaction** (`--keep-literals` changes the canonical query text every query-group digest
+  is computed from, so the same query group is recorded under different identifiers in the
+  two artifacts — an absence there is not a measurement); and a pair whose artifacts are
+  demonstrably **swapped**, which is detectable only when both runs report a
+  `stats_reset_at` and the after run's is earlier, since a server's statistics-reset instant
+  cannot move backwards.
+
+  Everything else that limits what the comparison can claim is **disclosed rather than
+  folded silently into a verdict**: the window relation and what it does to confidence; that
+  run order is otherwise taken from the argument order (an `advise` artifact carries no run
+  timestamp, deliberately, so its bytes stay reproducible); a `--limit` mismatch, which
+  makes a group missing from one artifact possibly a sampling artifact rather than a real
+  disappearance; each run's `degraded` capabilities, since a read that could not run
+  produces the same emptiness a real change would; recommendations whose key matched more
+  than one proposal within their *own* artifact, which are reported as unmatched rather than
+  as disappeared or new; and proposals only the after run makes, which carry no verdict
+  because there is nothing to compare them against.
+
+  **Whether an after-only proposal is a *new* finding is itself a claim `verify` will not make
+  unless both runs' coverage supports it.** Three conditions withhold it, and in each the
+  proposals are still listed with the reason stated rather than being called new — exactly the
+  treatment a query group's absence from the *after* run already gets before `disappeared` may
+  be graded:
+
+  - the **before** run's reads were degraded, so it may never have had the evidence to make
+    that recommendation — the absence is a fact about that run, not about your database;
+  - the **before** run's window sampled fewer (or an unknown number of) query groups, for the
+    same reason;
+  - the **after** run's reads were degraded in a way that can *relax* a rule rather than
+    silence it. A rule that cannot evaluate a threshold proposes anyway at reduced confidence —
+    correct for `advise`, whose job is to disclose rather than withhold — so a run that could
+    not read table sizes, or could not see an existing index, can make a recommendation a
+    fully-observed run would not have made at all.
+
+- `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
+  relation some proposal targets *or* the run's workload analysis touched
+  (`aggregation.tables`): Postgres records `is_ordinary_table` and each existing index's
+  `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
+  `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence
+  `sqlquality verify` diffs between two artifacts to tell whether a
+  proposal was actually applied — observed from what the run's own catalog reads already
+  returned, never a second round trip. Scoped to the union, not to proposal relations alone: a
+  relation whose proposal got resolved between two runs (the recommended index now
+  exists, so the rule stops firing) would otherwise have no entry at all in the very run
+  `verify` needs it in. The key itself is always present, even when empty: an *absent*
+  `physical_state` key (an artifact from before this feature) and an *empty* `{}` one
+  (this run found no relation to report on at all) are different facts, and `verify`
+  needs to tell them apart.
+
+  **Each field within an entry is a genuine three-way signal, not just present-vs-absent:**
+  `null` means *this run could not tell you* — either the relation's catalog facts were
+  never fetched at all (e.g. a dbt-enriched proposal for a relation outside the analyzed
+  workload), or the relevant catalog read was denied (see `degraded`) — while `false` /
+  `[]` is a real measurement (Postgres's `is_ordinary_table: false` means a view, a
+  foreign table, or a partitioned parent; `indexes: []` means the relation was fetched and
+  genuinely has none). Treating `null` as `false`/`[]`, or the reverse, fabricates a
+  transition across two runs where nothing physically changed — only what each run
+  happened to fetch did.
+
+  **`is_ordinary_table` is not at parity between the two engines, and deliberately so.** On
+  Postgres it comes from a catalog read filtered `relkind = 'r'`, so `false` unambiguously
+  means "not an ordinary table". On Redshift it comes from the relation's presence in
+  `svv_table_info`, which omits external (Spectrum) tables — those cannot carry a SORTKEY,
+  DISTKEY or DISTSTYLE at all — *and* genuinely **empty** local tables, which can. Nothing
+  available to the adapter tells those two apart, so a Redshift `false` conflates "not a
+  table" with "a table nobody has written to yet", and any `verify` verdict resting on it is
+  correspondingly weaker than the identical field name suggests. `null` still means "this run
+  could not tell you" on both engines; it is only `false` whose meaning differs.
+
+- `advise --json` now carries `query_groups`, a top-level `list[dict]` of **every** workload
+  query group this run analysed, each with `digest`
+  (the same 12-character id as `evidence["fingerprint"]`/`evidence["fingerprint_digests"]`),
+  `calls`, `total_time_ms`, and `mean_ms` (`total_time_ms / calls`, or `null` — never
+  `0.0` — when `calls` is `0`, since a group with no recorded calls has no meaningful mean
+  to report). This is the workload evidence `sqlquality verify`
+  compares against a later run's timings for the same query groups. The key is always
+  present, `[]` when the run analysed no query groups at all, for the same reason
+  `physical_state` is: an absent key marks a pre-this-feature artifact, distinct from a
+  genuinely-empty run.
+
+  **Not scoped to what some proposal currently cites**, for the same reason
+  `physical_state` is not scoped to proposal relations alone: a group whose proposal got
+  resolved between two runs (the recommended index now exists, so the rule stops firing and
+  stops citing the group) would otherwise vanish from the later artifact even though the
+  query is still running, and `verify` would read that as the query having disappeared
+  rather than as the improvement it is. The list is bounded by the same `--limit` that
+  bounds the workload itself, and `analyzed.query_groups_in_window` reports its size, so it
+  scales with the workload rather than with the schema.
+
+  **This is a different key from, and coexists with, the existing
+  `payload["analyzed"]["query_groups"]`** — that one is (and remains) an integer count of
+  how many query groups this run understood; the new one is the list of those groups with
+  their timings. JSON nesting disambiguates the two (one is nested under
+  `"analyzed"`, the other sits at the payload's root) — renaming the older, already-shipped
+  key to avoid the collision would itself be a breaking change to existing consumers, and
+  is out of scope here.
+
+  Every index- and physical-design-rule proposal (ADV001, ADV004, ADV005, ADV006, ADV007,
+  ADV008, ADV101, ADV102, ADV103) now also carries `evidence["fingerprint_digests"]`: a
+  sorted tuple of the same 12-character digests, naming which of `query_groups` back that
+  specific proposal — beside the existing `fingerprints` / `co_occurring_fingerprints`
+  counts, not replacing them. Every other rule omits the key entirely rather than emit `[]`,
+  since an empty list would misread as "zero query groups support this" rather than the true
+  "this rule does not name individual query groups": Postgres's ADV002/ADV003 (catalog
+  measurements — index scan counts, index-prefix comparisons), Redshift's ADV104/ADV105 (a
+  direct catalog measurement and a verbatim Amazon Redshift Advisor relay, respectively), and
+  the dbt rules ADV301/ADV303 — the first proposes on a relation's *aggregate* share of
+  workload cost rather than on any one group's timings, the second on a model the workload
+  never touched at all. `sqlquality verify` consequently never grades those rules
+  `improved`, `unchanged` or `regressed` — there is no per-group timing to compare — only
+  `not_applied` when the change demonstrably was not made, and `unobservable` otherwise, with
+  the applied signal reported beside it.
+
+  `evidence["fingerprint_digests"]` is a `--json`-only key: `--markdown`'s evidence line
+  omits it, since a list of opaque 12-character hashes (one per backing query group) is a
+  machine correlation key for `verify` with no meaning to a human reader — the
+  human-relevant number is already right beside it as `fingerprints` /
+  `co_occurring_fingerprints`. `--markdown` output is otherwise unchanged by this release.
+
+### Changed
+
+- **Breaking:** `advise --json`'s `"window"` key is now an object —
+  `{"description": str, "engine": str, "stats_reset_at": str | None, "since": str | None,
+  "since_duration_seconds": float | None, "limit": int | None}` — rather than the bare
+  prose string it was in 0.3.0. A sentence cannot be compared across two runs, and
+  `sqlquality verify` needs to tell whether a baseline and a follow-up
+  windows are disjoint, nested (Postgres's cumulative `pg_stat_statements` counters were
+  never reset between the two, so the baseline is really a subset of the follow-up) or
+  otherwise comparable before it can grade its own confidence. The old `description`
+  string is unchanged and still present, under that key. **Artifacts produced by 0.3.0
+  are not accepted by `verify`** — this key's shape is exactly how it tells an old
+  artifact apart from one that genuinely has nothing to report for a field, so
+  regenerate any saved baseline with the current version before verifying it.
+
+  `"since_duration_seconds"` is the *requested* `--since` duration (e.g. `7d` is
+  `604800.0`), separate from `"since"`'s *absolute* cutoff: `verify` grades two windows
+  comparable on equal *durations*, not equal cutoffs, because two runs a week apart with
+  the identical `--since 7d` bind two different absolute cutoffs by construction but
+  request the same duration — grading on the cutoff alone would have made Redshift's
+  `COMPARABLE` case unreachable from any real pair of runs. Postgres always reports it as
+  `null`, the same as `"since"`, since it cannot apply `--since` at all.
+
 ## [0.3.0] - 2026-08-03
 
 `advise` is new in this release. Everything below describes it as it ships; it has no

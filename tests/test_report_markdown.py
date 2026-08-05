@@ -1,7 +1,28 @@
 from sqlquality.delta import ModelDelta
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
+from sqlquality.models import (
+    Aggregation,
+    ColumnRole,
+    ColumnUsage,
+    Confidence,
+    Proposal,
+    QueryStat,
+    Relation,
+    TableFacts,
+    Workload,
+)
 from sqlquality.report import advise_payload, render_advise_markdown, render_markdown
+from sqlquality.workload.fingerprint import (
+    FLAG_LEADING_WILDCARD_LIKE,
+    FLAG_SELECT_STAR,
+    fingerprint_id,
+)
+from sqlquality.workload.postgres import (
+    propose_indexes,
+    propose_join_keys,
+    propose_sargability,
+    propose_select_star,
+)
 
 PASS = GateReport(
     deltas=[ModelDelta("model.demo.orders", 10.7, 11.1, 0.4, False)],
@@ -126,7 +147,14 @@ def test_payload_reports_proposals_window_and_skips():
     payload = _payload()
     assert payload["engine"] == "postgres"
     assert payload["redacted"] is True
-    assert payload["window"] == "since stats reset at 2026-07-01"
+    assert payload["window"] == {
+        "description": "since stats reset at 2026-07-01",
+        "engine": "postgres",
+        "stats_reset_at": None,
+        "since": None,
+        "since_duration_seconds": None,
+        "limit": None,
+    }
     assert payload["proposals"][0]["code"] == "ADV001"
     assert payload["skipped"] == {
         "unparseable": 2,
@@ -135,6 +163,336 @@ def test_payload_reports_proposals_window_and_skips():
         "ambiguous": 4,
     }
     assert payload["degraded"] == [{"capability": "ndv", "reason": "permission denied"}]
+
+
+def test_window_is_an_object_carrying_what_the_comparison_needs():
+    """`verify` classifies two runs' windows as nested, disjoint or comparable, and cannot
+    do that from a prose sentence. Each field answers one question: `stats_reset_at`
+    whether Postgres's cumulative counters were cleared between runs, `since_duration_seconds`
+    whether the same explicit duration was requested on both sides, `limit` whether the
+    window was truncated."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="since stats reset at 2026-08-01T00:00:00"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    )
+    window = payload["window"]
+    assert isinstance(window, dict), "a prose string cannot be compared across runs"
+    assert window["description"] == "since stats reset at 2026-08-01T00:00:00"
+    assert window["engine"] == "postgres"
+    assert window["stats_reset_at"] == "2026-08-01T00:00:00"
+    assert window["since"] is None
+    assert window["since_duration_seconds"] is None
+    assert window["limit"] == 500
+
+
+def test_the_window_description_is_preserved_verbatim():
+    """The prose sentence is what a human reads and it is already carefully worded — the
+    structured fields are added beside it, not instead of it."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="since stats reset at T (--since is not supported)"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={},
+    )
+    assert payload["window"]["description"] == ("since stats reset at T (--since is not supported)")
+
+
+def test_missing_window_facts_are_null_not_absent():
+    """A key that is absent and a key that is null are different to a consumer. `verify`
+    distinguishes "this engine cannot tell you" from "this field was never written", and
+    only the second is a reason to reject the artifact."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        window_facts={},
+    )
+    for key in ("stats_reset_at", "since", "since_duration_seconds", "limit"):
+        assert key in payload["window"], f"{key} must be present even when unknown"
+        assert payload["window"][key] is None
+
+
+def test_physical_state_is_always_present_even_when_the_caller_gave_none():
+    """Unlike `dbt`, this key must never be omitted: an *absent* `physical_state` is how
+    `verify` tells a pre-this-feature artifact apart from one that genuinely found nothing
+    physical to report — omitting it on an empty result would blur that distinction."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert "physical_state" in payload
+    assert payload["physical_state"] == {}
+
+
+def test_physical_state_carries_what_the_adapter_reported():
+    """The caller hands in `adapter.physical_state(relations)` verbatim; this function's
+    only job is to place it under a stable key, not to reshape it."""
+    given = {
+        "public.orders": {
+            "is_ordinary_table": True,
+            "indexes": [
+                {
+                    "name": "idx_status",
+                    "columns": ["status"],
+                    "is_partial": False,
+                    "is_unique": False,
+                }
+            ],
+        }
+    }
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        physical_state=given,
+    )
+    assert payload["physical_state"] == given
+
+
+def test_query_groups_is_always_present_and_empty_when_the_workload_is_empty():
+    """Like `physical_state`, this key must never be omitted: an *absent* `query_groups` is
+    how `verify` (a later task) tells a pre-this-feature artifact apart from one that
+    genuinely analysed no query groups at all."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert "query_groups" in payload
+    assert payload["query_groups"] == []
+
+
+def test_query_groups_includes_every_group_regardless_of_citation():
+    """Task 6's fix round 3 (Critical): `query_groups` used to be scoped to digests some
+    proposal's `fingerprint_digests` cited — the identical blind spot the sanctioned
+    `physical_state` scoping fix closed one payload key over. A group `unreferenced` here
+    stands in for the exact real-world shape that bug missed: a group whose proposal
+    *resolved* between two `advise` runs (the recommended index now exists, so the rule
+    stops firing and stops citing the group) looks identical to a group nothing ever
+    proposed on — both are simply absent from every proposal's citations. `verify` needs
+    both, so `query_groups` now includes every group in `workload.stats`, cited or not."""
+    referenced = QueryStat(fingerprint="select 1", sql="select 1", calls=10, total_time_ms=100.0)
+    unreferenced = QueryStat(fingerprint="select 2", sql="select 2", calls=10, total_time_ms=100.0)
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (fingerprint_id("select 1"),)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(stats=(referenced, unreferenced), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    digests = {g["digest"] for g in payload["query_groups"]}
+    assert digests == {fingerprint_id("select 1"), fingerprint_id("select 2")}
+
+
+def test_query_groups_reports_digest_calls_total_time_ms_and_mean_ms_per_field():
+    digest = fingerprint_id("select 1")
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (digest,)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(
+            stats=(
+                QueryStat(fingerprint="select 1", sql="select 1", calls=50, total_time_ms=500.0),
+            ),
+            window_description="w",
+        ),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    [group] = payload["query_groups"]
+    # Asserted per field, not as one dict comparison a single wrong field could still pass
+    # against by accident.
+    assert group["digest"] == digest
+    assert group["calls"] == 50
+    assert group["total_time_ms"] == 500.0
+    assert group["mean_ms"] == 10.0
+
+
+def test_mean_ms_is_null_rather_than_zero_when_a_group_has_no_calls():
+    """0.0 reads as "instantaneous", which is the opposite of "unknown"."""
+    digest = fingerprint_id("select 1")
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (digest,)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(
+            stats=(QueryStat(fingerprint="select 1", sql="select 1", calls=0, total_time_ms=0.0),),
+            window_description="w",
+        ),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    [group] = payload["query_groups"]
+    assert group["calls"] == 0
+    assert group["total_time_ms"] == 0.0
+    assert group["mean_ms"] is None
+
+
+def test_query_groups_has_no_dangling_references_across_several_rules_firing_at_once():
+    """Every digest a proposal cites must resolve to an entry in `query_groups` — a
+    dangling digest would make a proposal unverifiable by a later `verify` run — and,
+    since Task 6's fix round 3, `query_groups` also carries every *uncited* group in the
+    workload, not only what these proposals happen to cite. Exercised against several
+    rules firing together (ADV001, ADV007, ADV005, ADV006), not one rule in isolation: a
+    single-rule test cannot catch a rule that forgets to route its usage's fingerprints
+    through the same workload `report.py` reads back."""
+    orders = Relation("public", "orders")
+    order_items = Relation("public", "order_items")
+    wide_table = Relation("public", "wide_table")
+
+    fp_index = 'SELECT "id" FROM "orders" WHERE "status" = %s'
+    fp_join = 'SELECT "id" FROM "order_items" WHERE "order_id" = %s'
+    fp_wildcard = 'SELECT "id" FROM "orders" WHERE "note" LIKE %s'
+    fp_star = 'SELECT * FROM "wide_table"'
+    fp_unreferenced = "SELECT 1"
+
+    aggregation = Aggregation(
+        usage=(
+            ColumnUsage(
+                relation=orders,
+                column="status",
+                role=ColumnRole.EQUALITY,
+                calls=50,
+                cost_ms=500.0,
+                cost_share=0.5,
+                fingerprint_ids=frozenset({fp_index}),
+            ),
+            ColumnUsage(
+                relation=order_items,
+                column="order_id",
+                role=ColumnRole.JOIN,
+                calls=50,
+                cost_ms=400.0,
+                cost_share=0.4,
+                fingerprint_ids=frozenset({fp_join}),
+            ),
+        ),
+        total_cost_ms=1000.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({orders, order_items}),
+    )
+    facts = {
+        orders: TableFacts(
+            relation=orders, row_estimate=100_000, size_bytes=10**8, columns=("id", "status")
+        ),
+        order_items: TableFacts(
+            relation=order_items,
+            row_estimate=100_000,
+            size_bytes=10**8,
+            columns=("id", "order_id"),
+        ),
+        wide_table: TableFacts(
+            relation=wide_table,
+            row_estimate=100_000,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(20)),
+        ),
+    }
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint=fp_index,
+                sql="select id from orders where status = $1",
+                calls=50,
+                total_time_ms=500.0,
+            ),
+            QueryStat(
+                fingerprint=fp_join,
+                sql="select id from order_items where order_id = $1",
+                calls=50,
+                total_time_ms=400.0,
+            ),
+            QueryStat(
+                fingerprint=fp_wildcard,
+                sql="select id from orders where note like $1",
+                calls=10,
+                total_time_ms=300.0,
+                flags=frozenset({FLAG_LEADING_WILDCARD_LIKE}),
+            ),
+            QueryStat(
+                fingerprint=fp_star,
+                sql="select * from wide_table",
+                calls=10,
+                total_time_ms=300.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+            QueryStat(fingerprint=fp_unreferenced, sql="select 1", calls=1000, total_time_ms=1.0),
+        ),
+        window_description="w",
+    )
+
+    proposals = (
+        propose_indexes(aggregation.usage, facts, {}, min_cost_share=0.01)
+        + propose_join_keys(aggregation.usage, facts, {}, min_cost_share=0.01)
+        + propose_sargability(aggregation.usage, workload, min_cost_share=0.01)
+        + propose_select_star(workload, facts, min_cost_share=0.01, dialect="postgres")
+    )
+    codes = {p.code for p in proposals}
+    assert codes == {"ADV001", "ADV007", "ADV005", "ADV006"}
+
+    payload = advise_payload(
+        proposals, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    group_digests = {g["digest"] for g in payload["query_groups"]}
+
+    referenced: set[str] = set()
+    for p in proposals:
+        for digest in p.evidence.get("fingerprint_digests", ()):
+            referenced.add(digest)
+            assert digest in group_digests, f"{p.code} cites {digest}, absent from query_groups"
+
+    # query_groups now covers every group workload.stats carries, cited or not (Task 6's
+    # fix round 3) -- the uncited group must still be present, not excluded.
+    assert fingerprint_id(fp_unreferenced) in group_digests
+    assert group_digests == {fingerprint_id(stat.fingerprint) for stat in workload.stats}
 
 
 def test_payload_is_json_serializable():
@@ -433,4 +791,36 @@ def test_markdown_renders_evidence_the_way_json_does():
         proposals, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
     )
     assert "columns=['status', 'created_at']" in md
+
+
+def test_markdown_suppresses_fingerprint_digests_but_keeps_the_human_count():
+    """`fingerprint_digests` is a machine correlation key for `sqlquality verify` — a list
+    of opaque 12-character hashes, one per backing query group, meaningless to a human
+    reading a report. For a proposal backed by many query groups this would print a line
+    full of hashes where the human-relevant number (`co_occurring_fingerprints`) is already
+    right beside it. `--json` still carries the key; only `--markdown` must not."""
+    digests = ("00b9a0c6bf02", "11c0b1d7c013", "22d1c2e8d124")
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="Add index on orders(status, created_at)",
+            rationale="r",
+            evidence={
+                "co_occurring_fingerprints": len(digests),
+                "fingerprint_digests": digests,
+                "cost_share": 0.5,
+            },
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+    ]
+    md = render_advise_markdown(
+        proposals, WORKLOAD, AGGREGATION, engine="postgres", redacted=True, degraded=[]
+    )
+    assert "fingerprint_digests" not in md
+    for digest in digests:
+        assert digest not in md
+    # The suppression must not swallow the whole evidence line, nor the human-meaningful
+    # count that sits beside the suppressed key.
+    assert "co_occurring_fingerprints=3" in md
     assert "('status', 'created_at')" not in md

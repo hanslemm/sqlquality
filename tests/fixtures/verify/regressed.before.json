@@ -1,0 +1,91 @@
+{
+  "analyzed": {
+    "query_groups": 3,
+    "query_groups_in_window": 3,
+    "tables": [
+      "g_regressed.orders"
+    ],
+    "total_cost_ms": 297.615744
+  },
+  "degraded": [],
+  "engine": "postgres",
+  "physical_state": {
+    "g_regressed.orders": {
+      "indexes": [
+        {
+          "columns": [
+            "id"
+          ],
+          "is_partial": false,
+          "is_unique": true,
+          "name": "orders_pkey"
+        }
+      ],
+      "is_ordinary_table": true
+    }
+  },
+  "proposals": [
+    {
+      "code": "ADV001",
+      "confidence": "high",
+      "ddl": "CREATE INDEX ON \"g_regressed\".\"orders\" (\"status\");",
+      "evidence": {
+        "calls": 20,
+        "co_occurring_fingerprints": 1,
+        "columns": [
+          "status"
+        ],
+        "cost_share": 0.9999046757418855,
+        "expression_indexes": [],
+        "fingerprint_digests": [
+          "6bc8061ef411"
+        ],
+        "leading_ndv": 2971.0,
+        "partial_indexes_skipped": [],
+        "roles": [
+          "equality"
+        ],
+        "row_estimate": 700000,
+        "schema": "g_regressed",
+        "table": "orders"
+      },
+      "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
+      "title": "Add index on g_regressed.orders(status)"
+    }
+  ],
+  "query_groups": [
+    {
+      "calls": 20,
+      "digest": "6bc8061ef411",
+      "mean_ms": 14.8793687,
+      "total_time_ms": 297.587374
+    },
+    {
+      "calls": 1,
+      "digest": "57e8bbc60586",
+      "mean_ms": 0.018872,
+      "total_time_ms": 0.018872
+    },
+    {
+      "calls": 1,
+      "digest": "b529b333724a",
+      "mean_ms": 0.009498,
+      "total_time_ms": 0.009498
+    }
+  ],
+  "redacted": true,
+  "skipped": {
+    "ambiguous": 0,
+    "noise": 2,
+    "unparseable": 0,
+    "unqualifiable": 0
+  },
+  "window": {
+    "description": "since stats reset at 2026-08-05 21:06:09.669739+00:00",
+    "engine": "postgres",
+    "limit": 500,
+    "since": null,
+    "since_duration_seconds": null,
+    "stats_reset_at": "2026-08-05 21:06:09.669739+00:00"
+  }
+}
