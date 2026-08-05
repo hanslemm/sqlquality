@@ -20,10 +20,12 @@ import pytest
 
 from sqlquality.models import Confidence
 from sqlquality.verify import (
+    ArtifactMismatch,
     ProposalIndex,
     VerifyOutcome,
     WindowLimits,
     WindowRelation,
+    artifact_incomparabilities,
     classify_windows,
     confidence_for,
     group_index,
@@ -1077,6 +1079,7 @@ def _payload(
     since_duration_seconds: float | None = None,
     limit: int | None = 500,
     degraded: Sequence[dict[str, object]] = (),
+    redacted: bool = True,
 ) -> dict[str, object]:
     relation_key = f"{schema}.{table}"
     digests = [g[0] for g in groups]
@@ -1125,6 +1128,11 @@ def _payload(
 
     return {
         "engine": engine,
+        # `not keep_literals`, exactly as `advise_payload` records it. Always present, and
+        # `True` on both sides by default: a *differing* value makes the two artifacts'
+        # query-group digests incommensurable (see `artifact_incomparabilities`), which is a
+        # pair-level refusal, not something an outcome test should trip over by accident.
+        "redacted": redacted,
         "window": {
             "description": "test window",
             "engine": engine,
@@ -1347,6 +1355,7 @@ def test_ruling_4_a_before_side_key_collision_is_excluded_not_mis_graded():
     }
     before = {
         "proposals": [colliding_a, colliding_b, normal],
+        "redacted": True,
         "physical_state": {
             "public.orders": {"is_ordinary_table": True, "indexes": []},
             "public.customers": {"is_ordinary_table": True, "indexes": []},
@@ -1356,6 +1365,7 @@ def test_ruling_4_a_before_side_key_collision_is_excluded_not_mis_graded():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.customers": {"is_ordinary_table": True, "indexes": []}},
         "query_groups": [],
         "window": window,
@@ -1466,16 +1476,29 @@ def test_ruling_9_adv105_applied_comes_from_advisor_row_presence_in_after():
         "since_duration_seconds": None,
         "limit": 500,
     }
-    before = {"proposals": [sort_rec], "physical_state": {}, "query_groups": [], "window": window}
+    before = {
+        "proposals": [sort_rec],
+        "redacted": True,
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+    }
 
     # Advisor no longer recommends it -> the design spec's own applied signal for ADV105.
-    after_gone = {"proposals": [], "physical_state": {}, "query_groups": [], "window": window}
+    after_gone = {
+        "proposals": [],
+        "redacted": True,
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+    }
     [verdict_gone] = verdicts(before, after_gone)
     assert verdict_gone.applied is True
 
     # Advisor still recommends the identical thing, unambiguously -> not applied.
     after_same = {
         "proposals": [dict(sort_rec)],
+        "redacted": True,
         "physical_state": {},
         "query_groups": [],
         "window": window,
@@ -1486,6 +1509,7 @@ def test_ruling_9_adv105_applied_comes_from_advisor_row_presence_in_after():
     # The same key collides with another proposal in `after` -> cannot tell, disclosed.
     after_collision = {
         "proposals": [dict(sort_rec), dict(sort_rec)],
+        "redacted": True,
         "physical_state": {},
         "query_groups": [],
         "window": window,
@@ -1521,9 +1545,16 @@ def test_finding_2_adv105_applied_is_none_when_the_after_advisor_read_was_denied
         "since_duration_seconds": None,
         "limit": 500,
     }
-    before = {"proposals": [sort_rec], "physical_state": {}, "query_groups": [], "window": window}
+    before = {
+        "proposals": [sort_rec],
+        "redacted": True,
+        "physical_state": {},
+        "query_groups": [],
+        "window": window,
+    }
     after_denied = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {},
         "query_groups": [],
         "window": window,
@@ -1559,6 +1590,7 @@ def test_concern_3_adv105_confidence_never_exceeds_medium_even_under_a_disjoint_
     }
     before = {
         "proposals": [sort_rec],
+        "redacted": True,
         "physical_state": {},
         "query_groups": [],
         "window": {
@@ -1572,6 +1604,7 @@ def test_concern_3_adv105_confidence_never_exceeds_medium_even_under_a_disjoint_
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {},
         "query_groups": [],
         "window": {
@@ -1639,6 +1672,7 @@ def test_applied_drop_index_true_when_the_named_index_is_gone():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {
             "public.orders": {
                 "is_ordinary_table": True,
@@ -1664,6 +1698,7 @@ def test_applied_drop_index_true_when_the_named_index_is_gone():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
         "query_groups": [],
         "window": before["window"],
@@ -1690,6 +1725,7 @@ def test_finding_5_applied_drop_index_null_gate_is_pinned():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": None}},
         "query_groups": [],
         "window": {
@@ -1703,6 +1739,7 @@ def test_finding_5_applied_drop_index_null_gate_is_pinned():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
         "query_groups": [],
         "window": before["window"],
@@ -1725,6 +1762,7 @@ def test_applied_redshift_sortkey_true_when_after_matches_the_proposed_column():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
         "query_groups": [],
         "window": {
@@ -1738,6 +1776,7 @@ def test_applied_redshift_sortkey_true_when_after_matches_the_proposed_column():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "created_at"}},
         "query_groups": [],
         "window": before["window"],
@@ -1767,6 +1806,7 @@ def test_applied_redshift_sortkey_is_false_when_a_different_sortkey_was_set():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
         "query_groups": [],
         "window": {
@@ -1780,6 +1820,7 @@ def test_applied_redshift_sortkey_is_false_when_a_different_sortkey_was_set():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "tenant_id"}},
         "query_groups": [],
         "window": before["window"],
@@ -1808,6 +1849,7 @@ def test_finding_3_adv101_a_null_sortkey1_is_none_not_a_guessed_false():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
         "query_groups": [],
         "window": {
@@ -1821,6 +1863,7 @@ def test_finding_3_adv101_a_null_sortkey1_is_none_not_a_guessed_false():
     }
     after_null = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
         "query_groups": [],
         "window": before["window"],
@@ -1833,6 +1876,7 @@ def test_finding_3_adv101_a_null_sortkey1_is_none_not_a_guessed_false():
     # not collapse into "everything unknown".
     after_mismatch = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "tenant_id"}},
         "query_groups": [],
         "window": before["window"],
@@ -1855,6 +1899,7 @@ def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_propose
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
         "query_groups": [],
         "window": {
@@ -1869,6 +1914,7 @@ def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_propose
     # Matches the proposed column exactly -> applied.
     after_match = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {
             "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(customer_id)"}
         },
@@ -1881,6 +1927,7 @@ def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_propose
     # A DIFFERENT distkey column was set -> a genuine mismatch, never credited.
     after_mismatch = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {
             "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(region)"}
         },
@@ -1916,6 +1963,7 @@ def test_concern_1_round_2_an_unrecognized_diststyle_is_none_a_recognized_mismat
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
         "query_groups": [],
         "window": {
@@ -1931,6 +1979,7 @@ def test_concern_1_round_2_an_unrecognized_diststyle_is_none_a_recognized_mismat
     # Unrecognized text — not one of AWS's documented shapes at all -> cannot tell.
     after_unrecognized = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {
             "public.orders": {"is_ordinary_table": True, "diststyle": "SOMETHING_UNDOCUMENTED"}
         },
@@ -1945,6 +1994,7 @@ def test_concern_1_round_2_an_unrecognized_diststyle_is_none_a_recognized_mismat
     # measurement, still False, not swept into "unknown" alongside the case above.
     after_recognized_mismatch = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
         "query_groups": [],
         "window": before["window"],
@@ -1962,6 +2012,7 @@ def test_applied_redshift_diststyle_all_true_only_for_alls_own_shape():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
         "query_groups": [],
         "window": {
@@ -1975,6 +2026,7 @@ def test_applied_redshift_diststyle_all_true_only_for_alls_own_shape():
     }
     after_all = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "ALL"}},
         "query_groups": [],
         "window": before["window"],
@@ -1985,6 +2037,7 @@ def test_applied_redshift_diststyle_all_true_only_for_alls_own_shape():
     # Some KEY(...) distribution was set instead of ALL -> not applied.
     after_key = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {
             "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(customer_id)"}
         },
@@ -2004,6 +2057,7 @@ def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
                 "ddl": "VACUUM public.orders;",
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 30.0}},
         "query_groups": [],
         "window": {
@@ -2017,6 +2071,7 @@ def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 2.0}},
         "query_groups": [],
         "window": before["window"],
@@ -2039,6 +2094,7 @@ def test_finding_5_applied_maintenance_numeric_guard_is_pinned():
                 "ddl": "VACUUM public.orders;",
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": 30.0}},
         "query_groups": [],
         "window": {
@@ -2052,6 +2108,7 @@ def test_finding_5_applied_maintenance_numeric_guard_is_pinned():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "unsorted": None}},
         "query_groups": [],
         "window": before["window"],
@@ -2069,6 +2126,7 @@ def test_applied_materialize_true_when_the_view_becomes_an_ordinary_table():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders_view": {"is_ordinary_table": False}},
         "query_groups": [],
         "window": {
@@ -2082,6 +2140,7 @@ def test_applied_materialize_true_when_the_view_becomes_an_ordinary_table():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders_view": {"is_ordinary_table": True}},
         "query_groups": [],
         "window": before["window"],
@@ -2104,6 +2163,7 @@ def test_finding_5_applied_materialize_null_gate_is_pinned():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders_view": {"is_ordinary_table": None}},
         "query_groups": [],
         "window": {
@@ -2117,6 +2177,7 @@ def test_finding_5_applied_materialize_null_gate_is_pinned():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders_view": {"is_ordinary_table": False}},
         "query_groups": [],
         "window": before["window"],
@@ -2134,6 +2195,7 @@ def test_applied_is_none_for_an_unrecognized_future_code():
                 "ddl": None,
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True}},
         "query_groups": [],
         "window": {
@@ -2147,6 +2209,7 @@ def test_applied_is_none_for_an_unrecognized_future_code():
     }
     after = {
         "proposals": [],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True}},
         "query_groups": [],
         "window": before["window"],
@@ -2195,6 +2258,7 @@ def test_the_headline_case_a_resolved_proposal_still_grades_applied_and_improved
                 "ddl": "CREATE INDEX ON public.orders (status);",
             }
         ],
+        "redacted": True,
         "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
         "query_groups": [{"digest": "aaa", "calls": 10, "total_time_ms": 1000.0, "mean_ms": 100.0}],
         "window": {
@@ -2210,6 +2274,7 @@ def test_the_headline_case_a_resolved_proposal_still_grades_applied_and_improved
         # No proposals at all for public.orders (or anywhere): the index was created, so
         # ADV001 stopped firing. Before the fix, `physical_state` would be `{}` here.
         "proposals": [],
+        "redacted": True,
         "physical_state": {
             "public.orders": {
                 "is_ordinary_table": True,
@@ -2325,9 +2390,103 @@ def test_finding_n1_a_degraded_after_workload_read_is_not_a_query_group_that_sto
     assert "possibly addressed" in verdict_clean.note
 
 
-def _adv105_pair(after_degraded: Sequence[dict[str, object]]) -> tuple[dict, dict]:
+#: A Redshift `"window"` object, all keys present, as `RedshiftWorkloadAdapter.window_facts`
+#: reports them when `--since` was not passed.
+_REDSHIFT_WINDOW: dict[str, object] = {
+    "description": "d",
+    "engine": "redshift",
+    "stats_reset_at": None,
+    "since": None,
+    "since_duration_seconds": None,
+    "limit": 500,
+}
+
+#: `RedshiftWorkloadAdapter.physical_state`'s five fields for a relation whose
+#: `CAP_TABLE_FACTS` read succeeded and which `svv_table_info` returned.
+_REDSHIFT_FACTS_OBSERVED: dict[str, object] = {
+    "is_ordinary_table": True,
+    "sortkey1": "created_at",
+    "diststyle": "EVEN",
+    "unsorted": 4.0,
+    "stats_off": 2.0,
+}
+
+#: The same five fields when `CAP_TABLE_FACTS` was denied — all `None`, per that method's
+#: `have_facts` gate. `is_ordinary_table` is the field that disambiguates: `None` means
+#: "this run could not tell you".
+_REDSHIFT_FACTS_UNREAD: dict[str, object] = {
+    "is_ordinary_table": None,
+    "sortkey1": None,
+    "diststyle": None,
+    "unsorted": None,
+    "stats_off": None,
+}
+
+#: The same five fields for a relation `CAP_TABLE_FACTS` *did* return on, but which
+#: `svv_table_info` omits — Redshift's `physical_facts_gap` degradation. `is_ordinary_table`
+#: is a genuine `False` (requested, succeeded, absent from the view); the four physical levers
+#: stay `None` because there is no row to read them from.
+_REDSHIFT_FACTS_GAP: dict[str, object] = {
+    "is_ordinary_table": False,
+    "sortkey1": None,
+    "diststyle": None,
+    "unsorted": None,
+    "stats_off": None,
+}
+
+#: One `query_groups` entry, as `_query_groups_payload` emits it for a group with calls.
+_REDSHIFT_GROUP: dict[str, object] = {
+    "digest": "aaa",
+    "calls": 12,
+    "total_time_ms": 240.0,
+    "mean_ms": 20.0,
+}
+
+
+def _adv105_pair(capability: str) -> tuple[dict, dict]:
     """A Redshift ADV105 pair whose recommendation is present in `before` and absent from
-    `after` — the shape `_applied_advisor` reads as "Advisor no longer recommends it"."""
+    `after` because `capability`'s read was denied in `after`.
+
+    **Each `after` here is the shape a real `advise` run emits for that specific denial, not
+    one shape reused four times** (review finding C, fix round 5). The previous version paired
+    `proposals: []` with `physical_state: {}` and `query_groups: []` for all four — which is
+    what a `workload` denial emits, but not what a `schema`- or `table_facts`-only denial
+    does, since those leave the workload read (and therefore `query_groups`) intact. Inert at
+    the time, because `_applied_advisor` reads only `after_index`; flagged because a fixture
+    production cannot generate is exactly what let fix round 3's headline bug pass its own
+    test, and because the reasoning would rot silently if ADV105 ever consulted
+    `physical_state`.
+
+    What each denial actually produces, traced through `cli.py`/`redshift.py`:
+
+    * `advisor` — only `_advisor_rows` fails (→ `[]`). The workload read, the aggregation and
+      `fetch_table_facts` all succeed, so `query_groups` is populated and `physical_state`
+      carries a fully-observed entry for `public.orders` (it is in `aggregation.tables`).
+    * `workload` — `_run` returns `[]`, so `workload.stats` is empty → `query_groups: []`,
+      `aggregation.tables` empty, `facts` empty, `proposal_relations` empty, hence
+      `physical_state: {}` and `proposals: []`. The one case whose emptiness is total, and
+      the one demonstrated live on the Postgres side.
+    * `schema` — the workload read succeeds, so `query_groups` is populated, but with no
+      column metadata the aggregator cannot qualify relations, so `aggregation.tables` is
+      empty and `physical_state` is `{}`.
+    * `table_facts` — the workload read succeeds and relations qualify, so `query_groups` is
+      populated *and* `physical_state` has an entry per `aggregation.tables` relation with
+      all five fields `None`. **`public.orders` is deliberately not one of them**: a relation
+      in `aggregation.tables` still gets its Advisor row (the fetch set is
+      `aggregation.tables | frozenset(facts)`), so a `table_facts` denial cannot suppress its
+      ADV105. The only relation whose ADV105 this denial does remove is one reached solely
+      through `star_tables` — present in `facts`, absent from `aggregation.tables` — and an
+      empty `facts` removes it from `physical_state` too. So `public.orders` is that
+      relation here, and `public.line_items` stands in for the aggregation-reached one.
+    * `read_only` — Redshift could not pin the session read-only. Nothing is removed from any
+      payload key, so this `after` is a *fully observed* run in which Advisor genuinely no
+      longer recommends the change: `query_groups` populated, `physical_state` fully
+      observed, `proposals: []`. This is the shape the fix must still grade `applied=True`.
+    * `physical_facts_gap` — `propose` declines to grade relations with a hot predicate that
+      `svv_table_info` omits. Those relations *are* in `physical_state`, with a genuine
+      `is_ordinary_table: false` and four `None` levers; ADV105's own row fetch is
+      unaffected, so this too is a genuine resolution.
+    """
     sort_rec = {
         "code": "ADV105",
         "evidence": {
@@ -2339,27 +2498,50 @@ def _adv105_pair(after_degraded: Sequence[dict[str, object]]) -> tuple[dict, dic
         },
         "ddl": None,
     }
-    window = {
-        "description": "d",
-        "engine": "redshift",
-        "stats_reset_at": None,
-        "since": None,
-        "since_duration_seconds": None,
-        "limit": 500,
-    }
     before = {
-        "proposals": [sort_rec],
-        "physical_state": {},
-        "query_groups": [],
-        "window": window,
+        "engine": "redshift",
+        "redacted": True,
+        # `proposal_relations(proposals) | aggregation.tables` — ADV105's own relation is in
+        # it, so a real `before` artifact always carries an entry for it.
+        "physical_state": {"public.orders": dict(_REDSHIFT_FACTS_OBSERVED)},
+        "query_groups": [dict(_REDSHIFT_GROUP)],
+        "window": dict(_REDSHIFT_WINDOW),
         "degraded": [],
+        "proposals": [sort_rec],
     }
+    after_state: dict[str, object]
+    after_groups: list[dict[str, object]]
+    if capability == "advisor":
+        after_state = {"public.orders": dict(_REDSHIFT_FACTS_OBSERVED)}
+        after_groups = [dict(_REDSHIFT_GROUP)]
+    elif capability == "workload":
+        after_state = {}
+        after_groups = []
+    elif capability == "schema":
+        after_state = {}
+        after_groups = [dict(_REDSHIFT_GROUP)]
+    elif capability == "table_facts":
+        after_state = {"public.line_items": dict(_REDSHIFT_FACTS_UNREAD)}
+        after_groups = [dict(_REDSHIFT_GROUP)]
+    elif capability == "read_only":
+        after_state = {"public.orders": dict(_REDSHIFT_FACTS_OBSERVED)}
+        after_groups = [dict(_REDSHIFT_GROUP)]
+    elif capability == "physical_facts_gap":
+        after_state = {
+            "public.orders": dict(_REDSHIFT_FACTS_OBSERVED),
+            "public.line_items": dict(_REDSHIFT_FACTS_GAP),
+        }
+        after_groups = [dict(_REDSHIFT_GROUP)]
+    else:  # pragma: no cover - a capability this helper has not been taught
+        raise AssertionError(f"_adv105_pair has no modelled `after` shape for {capability!r}")
     after = {
+        "engine": "redshift",
+        "redacted": True,
+        "physical_state": after_state,
+        "query_groups": after_groups,
+        "window": dict(_REDSHIFT_WINDOW),
+        "degraded": [{"capability": capability, "reason": "permission denied"}],
         "proposals": [],
-        "physical_state": {},
-        "query_groups": [],
-        "window": window,
-        "degraded": [dict(entry) for entry in after_degraded],
     }
     return before, after
 
@@ -2379,7 +2561,7 @@ def test_finding_n1_adv105_applied_is_none_when_any_read_feeding_its_proposal_wa
     Each therefore produces the identical empty `proposals` list a genuinely-resolved
     recommendation does — `applied=True` there is the tool telling a user they addressed
     something when it never looked."""
-    before, after = _adv105_pair([{"capability": capability, "reason": "permission denied"}])
+    before, after = _adv105_pair(capability)
     [verdict] = verdicts(before, after)
     assert verdict.applied is None
     assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
@@ -2396,13 +2578,13 @@ def test_finding_n3_a_degradation_that_cannot_suppress_the_proposal_still_reache
     `entry.get("capability") == capability` to `"capability" in entry` left the whole suite
     green (re-review finding N3). The replacement compares *names* against a per-absence
     dependency set, and this test fails the moment that comparison stops discriminating."""
-    before, after = _adv105_pair([{"capability": "read_only", "reason": "not permitted"}])
+    before, after = _adv105_pair("read_only")
     [verdict] = verdicts(before, after)
     assert verdict.applied is True
 
     # …and `physical_facts_gap`, the other Redshift degradation that suppresses only
     # ADV101/ADV102/ADV103 (whose applied signal is `physical_state`), never ADV105's row.
-    _, after_gap = _adv105_pair([{"capability": "physical_facts_gap", "reason": "2 relations"}])
+    _, after_gap = _adv105_pair("physical_facts_gap")
     [verdict_gap] = verdicts(before, after_gap)
     assert verdict_gap.applied is True
 
@@ -2508,3 +2690,174 @@ def test_every_absence_verify_reads_as_evidence_is_classified():
             f"{absence.value} depends on names no adapter records: "
             f"{sorted(dependencies - KNOWN_DEGRADATIONS)}"
         )
+
+
+# --- Finding B, fix round 5: two artifacts can fail to share a coordinate system ---------
+#
+# The fourth door, and the first that has nothing to do with `degraded`. `--keep-literals`
+# changes the canonical query text `fingerprint_id` hashes, so two runs over an identical
+# workload record the same query group under different digests. Reproduced by review from two
+# real `advise` runs — no degradation, matching `--limit`, the recommendation genuinely
+# applied, the query still running 30 times — as `applied=True outcome=DISAPPEARED note="Cited
+# query group(s) no longer appear in the after run."`
+#
+# Handled as a third, distinct concept rather than a wider `Absence` (see `ArtifactMismatch`):
+# "we could not look" and "these two measurements have no shared coordinate system" are
+# different failures, and collapsing distinct states is how every one of this task's false
+# claims got made. `tests/integration/test_verify_redaction_live.py` drives it end to end
+# through two real `advise` invocations.
+
+
+def _digest_of(sql: str, *, keep_literals: bool) -> str:
+    """The digest a real `advise` run would record for `sql` at this redaction setting —
+    computed through the production `ingest`/`fingerprint_id` path, not asserted from a
+    hard-coded string, so this cannot drift away from what `advise` actually emits."""
+    from sqlquality.models import RawQueryRow, WorkloadFetch
+    from sqlquality.workload.fingerprint import fingerprint_id, ingest
+
+    fetch = WorkloadFetch(
+        rows=(RawQueryRow(sql=sql, calls=10, total_time_ms=1000.0),), window_description="w"
+    )
+    workload = ingest(fetch, "postgres", keep_literals=keep_literals)
+    [stat] = workload.stats
+    return fingerprint_id(stat.fingerprint)
+
+
+def test_redaction_changes_the_digest_so_the_specs_stable_across_runs_claim_is_conditional():
+    """The premise the whole finding rests on, established from the production path rather
+    than taken from the review. The design spec said the digest is "stable across runs" full
+    stop; it is stable across runs *with the same redaction setting*, which is why the spec
+    now says so."""
+    sql = "SELECT id FROM public.orders WHERE status = 'shipped'"
+    redacted = _digest_of(sql, keep_literals=False)
+    retained = _digest_of(sql, keep_literals=True)
+    assert redacted != retained, (
+        "redaction no longer changes the digest — if this is deliberate, finding B's "
+        f"premise and `ArtifactMismatch.REDACTION` need revisiting (both were {redacted})"
+    )
+
+
+def test_finding_b_a_redaction_mismatch_claims_no_group_level_verdict():
+    """The reachable false claim. Same relation, same index genuinely created, the cited
+    group still running in `after` — but recorded under a digest the `before` run would never
+    produce. `DISAPPEARED` there is the governing rule's exact violation, and no confidence
+    grade makes it honest: the group is not missing, it is under a different name.
+
+    The two payloads deliberately share a digest string (`"aaa"`), so the test does not depend
+    on the digest arithmetic at all — the point is that `verify` must refuse on the *declared
+    settings*, before it ever looks at whether the keys happen to line up. That also makes the
+    control below exact: flipping one flag is the only difference between the two runs."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], limit=500, redacted=True)
+    after = _payload(groups=[("aaa", 10, 400.0)], limit=500, redacted=False)
+
+    # Neither existing gate can see this: no degradation, and the limits match.
+    assert window_limits(before, after).may_be_sampling_artifact is False
+    assert after["degraded"] == [] and before["degraded"] == []
+
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True  # physical_state carries no digest; still readable
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.confidence is Confidence.LOW
+    # Both means, not only `mean_after`: a lone `mean_before` beside a null `mean_after` is
+    # the shape a reader interprets as "the query stopped running".
+    assert verdict.mean_before is None and verdict.mean_after is None
+    assert "redaction" in verdict.note
+    assert "no longer appear" not in verdict.note
+    assert "IMPROVED" not in verdict.note
+
+    # The control, and the reason this is not a blanket refusal: the identical pair with the
+    # same redaction setting on both sides still grades the real 60% improvement.
+    after_same = _payload(groups=[("aaa", 10, 400.0)], limit=500, redacted=True)
+    [verdict_same] = verdicts(before, after_same)
+    assert verdict_same.outcome is VerifyOutcome.IMPROVED
+    assert verdict_same.mean_before == 100.0 and verdict_same.mean_after == 40.0
+
+
+def test_finding_b_a_redaction_mismatch_still_reports_a_change_that_was_not_made():
+    """The boundary in the other direction, and the reason the incomparability check sits
+    *after* the `applied is False` branch rather than in front of it. `NOT_APPLIED` rests
+    entirely on `physical_state`, which carries no digest and is untouched by redaction.
+    Withholding it would be this fix committing the same sin in reverse — "we cannot tell"
+    about something the two artifacts do establish."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], indexes=[], redacted=True)
+    after = _payload(groups=[("aaa", 10, 100.0)], indexes=[], redacted=False)
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is False
+    assert verdict.outcome is VerifyOutcome.NOT_APPLIED
+    assert verdict.confidence is confidence_for(classify_windows(before, after))
+    assert "redaction" in verdict.note
+
+
+def test_finding_b_an_unreadable_redacted_flag_is_disclosed_not_assumed_comparable():
+    """The defensive arm, following `classify_windows`'s existing precedent exactly: a
+    missing or non-string `engine` yields `INCOMPARABLE` rather than being read as "the
+    engines presumably match". Every artifact `advise` has ever written carries `redacted`
+    as a genuine `bool`, so this is reachable only from a truncated or hand-edited one —
+    but the alternative is assuming an unverifiable premise about how the query text was
+    canonicalized, which is the assumption this whole round exists to remove.
+
+    **The `redacted` key missing from *both* sides is the case that needs this arm**, and the
+    one asserted first. A one-sided absence would also be caught by the `!=` comparison below
+    it (`True != None`), so deleting this arm would still be noticed — but two missing flags
+    compare *equal* to each other, exactly the "both null therefore presumably the same"
+    inference `WindowRelation.INCOMPARABLE`'s docstring already forbids for `stats_reset_at`.
+    Without this arm that pair silently earns a full group-level verdict."""
+    before_both = _payload(groups=[("aaa", 10, 1000.0)])
+    after_both = _payload(groups=[("aaa", 10, 400.0)])
+    del before_both["redacted"]
+    del after_both["redacted"]
+    assert before_both.get("redacted") == after_both.get("redacted")  # equal, and both unknown
+
+    [item] = artifact_incomparabilities(before_both, after_both)
+    assert item.mismatch is ArtifactMismatch.REDACTION
+    assert "readable" in item.detail
+    [verdict_both] = verdicts(before_both, after_both)
+    assert verdict_both.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict_both.mean_before is None and verdict_both.mean_after is None
+
+    # One side unreadable: also disclosed, and named as unreadable rather than as a
+    # disagreement between two settings — `None` is not a redaction setting.
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 400.0)])
+    del after["redacted"]
+    [one_sided] = artifact_incomparabilities(before, after)
+    assert "readable" in one_sided.detail
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.mean_before is None and verdict.mean_after is None
+
+    # A non-bool value is the same situation, not a value to compare.
+    after_bad = {**after, "redacted": "yes"}
+    assert artifact_incomparabilities(before, after_bad)
+
+
+def test_artifact_incomparabilities_is_callable_on_its_own_for_task_7s_refusal_list():
+    """Task 7 owns the CLI and should refuse the whole comparison up front, rendering each
+    reason once, rather than reading the same sentence off every proposal's `note`. That
+    requires the check to be reachable without running `verdicts` at all, and to return
+    structured data rather than prose — pinned here so a later refactor cannot bury it
+    inside the verdict loop."""
+    same = _payload(groups=[("aaa", 10, 1000.0)], redacted=True)
+    assert artifact_incomparabilities(same, dict(same)) == ()
+
+    mismatched = _payload(groups=[("aaa", 10, 1000.0)], redacted=False)
+    found = artifact_incomparabilities(same, mismatched)
+    assert [item.mismatch for item in found] == [ArtifactMismatch.REDACTION]
+    assert found[0].detail and found[0].detail.endswith(".")
+    # The values that disagree are named, so the CLI does not have to re-derive them.
+    assert "redacted=True" in found[0].detail and "redacted=False" in found[0].detail
+
+
+def test_every_artifact_mismatch_is_classified():
+    """The same structural pin as round 4's two, for the new concept: a second
+    `ArtifactMismatch` member added without an entry in `_MISMATCH_EFFECT` must fail a test
+    rather than silently disclose nothing. Round 4 established that an omission in a
+    hand-maintained table is this codebase's most repeated defect; a new table gets the same
+    guard on the day it is introduced, not three rounds later."""
+    from sqlquality.verify import _MISMATCH_EFFECT, ArtifactMismatch
+
+    assert set(ArtifactMismatch) == set(_MISMATCH_EFFECT), (
+        f"unclassified: {sorted(m.value for m in set(ArtifactMismatch) - set(_MISMATCH_EFFECT))}"
+    )
+    for mismatch, effect in _MISMATCH_EFFECT.items():
+        assert effect, f"{mismatch.value} declares no effect"

@@ -585,9 +585,11 @@ DROP INDEX "public"."idx_orders_customer_ref";
 ```
 
 `--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
-`engine`, `proposals`, `redacted`, `skipped`, `window`, plus `dbt` when — and only when — a
-manifest was loaded). This is the first proposal from
-the run above — the real payload lists all five under `proposals`:
+`engine`, `physical_state`, `proposals`, `query_groups`, `redacted`, `skipped`, `window`,
+plus `dbt` when — and only when — a manifest was loaded). This is the first proposal from
+the run above, and the block is abridged: the real payload lists all five proposals under
+`proposals`, and carries `physical_state` and `query_groups` — the catalog and workload
+baselines `sqlquality verify` diffs against a later run — which are omitted here for length.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json

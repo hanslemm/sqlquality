@@ -530,6 +530,130 @@ def window_limits(before: dict[str, object], after: dict[str, object]) -> Window
     )
 
 
+class ArtifactMismatch(str, Enum):
+    """A pair-level fact that makes two artifacts' **query-group identities** incommensurable
+    — deliberately a separate concept from both `Absence` and `WindowRelation.INCOMPARABLE`.
+
+    This module now distinguishes three different ways a comparison can fail, and collapsing
+    any two of them is how this task has produced false claims four times:
+
+    * **`Absence` / `degraded`** — "one run could not *look*." The coordinate system is
+      shared; a reading is missing from it. Handled per absence, per proposal, by
+      `_absence_disclosure`.
+    * **`WindowRelation.INCOMPARABLE`** — "both runs looked, and their measurements are
+      commensurable, but the *windows* they measured make the comparison weak." Handled as a
+      confidence ceiling: a verdict is still claimed, just at `LOW`.
+    * **`ArtifactMismatch` (this enum)** — "the two runs do not share a coordinate system at
+      all." No reading is missing and no window is at fault: the identifiers the two
+      artifacts use for the same query group are simply different strings, so *every*
+      group-level comparison between them is meaningless rather than weak. There is no
+      confidence at which such a comparison could be reported, so `verdicts` claims no
+      group-level outcome and no mean at all — see `artifact_incomparabilities`.
+
+    `REDACTION` is the one member today (fix round 5, review finding B). `--keep-literals`
+    changes the canonical query text `fingerprint_id` hashes, so two runs differing only in
+    that flag produce disjoint `query_groups` key sets from an identical workload. Before
+    this fix `verify` read that as `DISAPPEARED` — "Cited query group(s) no longer appear in
+    the after run" — for a query still running, with no degradation anywhere and the
+    recommendation genuinely applied. That is the governing rule's exact violation (an
+    absence produced by one run's own settings reported as a measurement about the user's
+    database) through a door the `degraded`-based gate structurally cannot see.
+    """
+
+    REDACTION = "redaction"
+
+
+#: What each `ArtifactMismatch` makes incommensurable, as a noun phrase for the disclosure
+#: sentence. A plain lookup, like `_CONFIDENCE_BY_RELATION` and `_ABSENCE_DEPENDENCIES`, so a
+#: second member added without an entry raises `KeyError` rather than silently disclosing
+#: nothing; `test_every_artifact_mismatch_is_classified` pins it directly.
+_MISMATCH_EFFECT: Final[dict[ArtifactMismatch, str]] = {
+    ArtifactMismatch.REDACTION: (
+        "every query-group digest, and the key of every statement-scoped proposal "
+        "(ADV005's leading-wildcard branch, ADV006), which is a fingerprint"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class Incomparability:
+    """One reason two artifacts cannot be compared at query-group level at all.
+
+    `mismatch` is the machine-readable kind; `detail` is a complete sentence naming the two
+    values that disagree and what they make incommensurable. **Task 7 (the CLI) should call
+    `artifact_incomparabilities` directly and refuse the comparison up front**, rendering
+    every `detail`, rather than relying on each individual verdict's `note` — a user handed
+    two artifacts with different redaction settings wants one clear refusal, not the same
+    sentence repeated once per proposal.
+    """
+
+    mismatch: ArtifactMismatch
+    detail: str
+
+
+def artifact_incomparabilities(
+    before: dict[str, object], after: dict[str, object]
+) -> tuple[Incomparability, ...]:
+    """Every reason `before` and `after` do not share a query-group coordinate system.
+
+    Empty when they do. **Callable independently of `verdicts`, and meant to be** — Task 7
+    should consult it before rendering anything (see `Incomparability`).
+
+    `REDACTION`: `payload["redacted"]` is `not keep_literals` (cli.py), and redaction
+    rewrites the canonical text that `fingerprint_id` hashes into a `digest`. So two runs
+    over an identical workload that differ in `--keep-literals` agree on nothing in
+    `query_groups`: same queries, disjoint keys. Reported for **either** of two conditions,
+    and the second is not merely defensive tidiness:
+
+    * the two flags are readable and differ — the reachable case, reproduced from two real
+      `advise` runs;
+    * either flag is not a readable `bool` — then whether the two runs canonicalized their
+      query text the same way *cannot be established*, and this module does not assume an
+      unverifiable premise. This follows `classify_windows`'s existing precedent exactly:
+      a missing or non-string `engine` yields `INCOMPARABLE` rather than being read as "the
+      engines presumably match". Every artifact `advise` has ever written carries `redacted`
+      as a genuine `bool` (it is a required argument of `advise_payload`, present since
+      before this feature), so this arm is unreachable from a well-formed artifact — it
+      exists for the truncated or hand-edited one, and Task 7's shape validation is the
+      other place it should be caught.
+
+    Never raises: every field is read through `.get` and type-checked, like every other
+    entry point in this module.
+    """
+    found: list[Incomparability] = []
+    before_redacted = before.get("redacted")
+    after_redacted = after.get("redacted")
+    effect = _MISMATCH_EFFECT[ArtifactMismatch.REDACTION]
+    if not isinstance(before_redacted, bool) or not isinstance(after_redacted, bool):
+        found.append(
+            Incomparability(
+                mismatch=ArtifactMismatch.REDACTION,
+                detail=(
+                    "At least one run does not record a readable `redacted` flag "
+                    f"(before={before_redacted!r}, after={after_redacted!r}), so whether "
+                    "the two runs canonicalized their query text the same way cannot be "
+                    f"established — and redaction determines {effect}. No query-group "
+                    "comparison is claimed."
+                ),
+            )
+        )
+    elif before_redacted != after_redacted:
+        found.append(
+            Incomparability(
+                mismatch=ArtifactMismatch.REDACTION,
+                detail=(
+                    "The two runs disagree about literal redaction "
+                    f"(before redacted={before_redacted}, after redacted={after_redacted}): "
+                    "`--keep-literals` changes the canonical query text every digest is "
+                    f"computed from, so {effect} differs between these two artifacts. The "
+                    "query groups are not missing from the after run — they are recorded "
+                    "under different identifiers, so no query-group comparison is claimed."
+                ),
+            )
+        )
+    return tuple(found)
+
+
 class VerifyOutcome(str, Enum):
     """How a `before`-proposal's cited workload evidence compares in `after`.
 
@@ -1333,6 +1457,14 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
        change did not cause anything, so crediting it with a mean improvement (however
        real that improvement is) would attribute someone else's fix, or ordinary workload
        shift, to this proposal.
+    1b. `artifact_incomparabilities(before, after)` non-empty -> `UNOBSERVABLE` at `LOW`,
+       with `mean_before` and `mean_after` both `None` and the reason in `note`, for every
+       proposal whose `applied` is not `False`. Finding B, fix round 5: two runs differing
+       in `--keep-literals` record the same query group under different digests, so no
+       group-level outcome exists to claim — `DISAPPEARED` least of all. Ordered *after*
+       `applied is False` deliberately: that verdict rests only on `physical_state`, which
+       carries no digest, so it keeps both its outcome and the full ceiling. See
+       `ArtifactMismatch` for why this is a third concept rather than a wider `Absence`.
     2. `applied is None` -> `UNOBSERVABLE`. Ruling 1 makes this reachable via two
        independent routes — a code with nothing to observe by design (ADV005, ADV006,
        ADV303), or a code that could observe something but `physical_state` reports
@@ -1366,11 +1498,11 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
 
     **Confidence (Ruling 3)** starts at `confidence_for(classify_windows(before, after))`
     — the ceiling every verdict in this run shares — and is lowered no further except in
-    the two cases the design spec calls "possibly addressed... at LOW": an
-    unobservable-application proposal whose cited group vanished, and the
-    Ruling-2-forced downgrade above. Every other verdict, including a genuine
-    `DISAPPEARED` (Ruling 2 already filtered the untrustworthy ones into the case above),
-    keeps the full ceiling.
+    the cases the design spec calls "possibly addressed... at LOW": an
+    unobservable-application proposal whose cited group vanished, the Ruling-2-forced
+    downgrade above, finding N1's degraded-read downgrades, and step 1b's
+    `ArtifactMismatch`. Every other verdict, including a genuine `DISAPPEARED` (Ruling 2
+    already filtered the untrustworthy ones into the case above), keeps the full ceiling.
     """
     before_index = index_proposals(before)
     after_index = index_proposals(after)
@@ -1378,6 +1510,13 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
     ceiling = confidence_for(classify_windows(before, after))
     group_before = group_index(before)
     group_after = group_index(after)
+    # Finding B (fix round 5). Pair-level and computed once: an `ArtifactMismatch` is a
+    # property of the two artifacts, not of any one proposal. Checked ahead of every
+    # group-level branch below, because when it fires there is no coordinate system in which
+    # a group-level comparison could be expressed at all — see `ArtifactMismatch` for why
+    # this is a third concept rather than a wider `Absence` or a lower confidence.
+    incomparabilities = artifact_incomparabilities(before, after)
+    incomparable_note = " ".join(item.detail for item in incomparabilities) or None
 
     results: list[ProposalVerdict] = []
     for key, proposal in before_index.matched.items():
@@ -1389,6 +1528,14 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
         digests = _cited_digests(evidence)
         mean_before, present_before = _aggregate_mean(digests, group_before)
         mean_after, present_after = _aggregate_mean(digests, group_after)
+        if incomparable_note is not None:
+            # Both means, not only `mean_after`. `mean_before` is a real measurement of the
+            # before run, but reporting it beside a `None` `mean_after` is *exactly* the
+            # shape a reader interprets as "the query stopped running" — the false claim
+            # this finding is about. A caller wanting the raw per-side figures can call
+            # `group_index` on either payload; what this pair cannot express is a comparison.
+            mean_before = None
+            mean_after = None
         cost_share_before = cost_share_of(evidence)
         after_proposal = after_index.matched.get(key)
         after_evidence = after_proposal.get("evidence") if after_proposal is not None else None
@@ -1399,6 +1546,8 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
         notes: list[str] = []
         if applied_note:
             notes.append(applied_note)
+        if incomparable_note is not None:
+            notes.append(incomparable_note)
         confidence = ceiling
 
         # Finding N1 (fix round 4): the one gate every conclusion drawn from a cited
@@ -1412,8 +1561,19 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
         after_groups_withheld = _absence_disclosure(after, Absence.CITED_QUERY_GROUP, "after")
 
         if applied is False:
+            # Survives an `ArtifactMismatch` untouched, and keeps the full ceiling: this
+            # verdict rests entirely on `physical_state`, which carries no digest and is
+            # unaffected by redaction. Withholding it would be its own false claim — "we
+            # cannot tell" about something the artifacts do establish.
             outcome = VerifyOutcome.NOT_APPLIED
             notes.append("physical_state shows the proposed change was not made.")
+        elif incomparable_note is not None:
+            # No group-level outcome exists to claim — not `DISAPPEARED`, not a graded
+            # speed change, not even the `applied is None` branch's "possibly addressed",
+            # every one of which reads a digest-keyed lookup as a fact about the workload.
+            # `applied` itself is reported unchanged: it comes from `physical_state`.
+            outcome = VerifyOutcome.UNOBSERVABLE
+            confidence = Confidence.LOW
         elif applied is None:
             vanished = bool(digests) and present_before > 0 and present_after == 0
             outcome = VerifyOutcome.UNOBSERVABLE

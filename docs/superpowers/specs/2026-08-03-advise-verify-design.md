@@ -101,7 +101,13 @@ That last one is the single **breaking** payload change. Acceptable because `adv
 
 ### Matching
 
-Query groups match on digest — a hash of the canonical redacted SQL, stable across runs.
+Query groups match on digest — a hash of the canonical SQL, stable across runs **that used the same redaction setting**.
+
+**Corrected during Task 6's fix round 5, after review found the original claim ("stable across runs", unqualified) false as written.** The digest is computed over the canonicalized query text, and `--keep-literals` changes that text, so two runs differing in that flag record the same query group under different digests. Reproduced from two real `advise` runs on PostgreSQL 16 — no degraded read, matching `--limit`, the recommendation genuinely applied in between, the query still running — as `applied=True outcome=DISAPPEARED note="Cited query group(s) no longer appear in the after run."` The group had not gone anywhere; only its name had. Same statement-scoped consequence for proposal matching, since `(code, fingerprint)` keys on the same text.
+
+`verify` therefore compares `payload["redacted"]` as a **pair-level precondition** (`sqlquality.verify.artifact_incomparabilities`) and claims no query-group-level verdict at all when the two runs disagree, or when either flag is unreadable. This is deliberately *not* modelled as a missing reading (`degraded`) nor as a weak window (`INCOMPARABLE`, which still yields a verdict at `LOW`): the two artifacts do not share a coordinate system, so there is no confidence at which the comparison could be stated. `sqlquality verify` (Task 7) must refuse such a pair up front and say why.
+
+On PostgreSQL the reachable surface is narrower than the flag suggests: `pg_stat_statements` already normalizes every *parameterizable* constant to `$N` before sqlquality reads a row, so redaction only moves the digest for a statement retaining a non-parameterizable constant — an `ORDER BY`/`GROUP BY` ordinal, verified on 16. On Redshift, `sys_query_history` stores statement text verbatim, so every literal-bearing statement moves.
 
 Proposals need two keys, because the rules have two evidence shapes:
 
