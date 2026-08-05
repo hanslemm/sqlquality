@@ -1,7 +1,28 @@
 from sqlquality.delta import ModelDelta
 from sqlquality.gate import GateReport
-from sqlquality.models import Aggregation, Confidence, Proposal, QueryStat, Relation, Workload
+from sqlquality.models import (
+    Aggregation,
+    ColumnRole,
+    ColumnUsage,
+    Confidence,
+    Proposal,
+    QueryStat,
+    Relation,
+    TableFacts,
+    Workload,
+)
 from sqlquality.report import advise_payload, render_advise_markdown, render_markdown
+from sqlquality.workload.fingerprint import (
+    FLAG_LEADING_WILDCARD_LIKE,
+    FLAG_SELECT_STAR,
+    fingerprint_id,
+)
+from sqlquality.workload.postgres import (
+    propose_indexes,
+    propose_join_keys,
+    propose_sargability,
+    propose_select_star,
+)
 
 PASS = GateReport(
     deltas=[ModelDelta("model.demo.orders", 10.7, 11.1, 0.4, False)],
@@ -241,6 +262,223 @@ def test_physical_state_carries_what_the_adapter_reported():
         physical_state=given,
     )
     assert payload["physical_state"] == given
+
+
+def test_query_groups_is_always_present_and_empty_when_nothing_references_it():
+    """Like `physical_state`, this key must never be omitted: an *absent* `query_groups` is
+    how `verify` (a later task) tells a pre-this-feature artifact apart from one that
+    genuinely has no proposal citing any query group."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert "query_groups" in payload
+    assert payload["query_groups"] == []
+
+
+def test_query_groups_excludes_a_group_no_proposal_references():
+    """Only digests some proposal actually cites belong here — a workload can contain query
+    groups this run merely observed without any rule finding them worth proposing on, and
+    those must not bloat the payload."""
+    referenced = QueryStat(fingerprint="select 1", sql="select 1", calls=10, total_time_ms=100.0)
+    unreferenced = QueryStat(fingerprint="select 2", sql="select 2", calls=10, total_time_ms=100.0)
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (fingerprint_id("select 1"),)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(stats=(referenced, unreferenced), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    digests = {g["digest"] for g in payload["query_groups"]}
+    assert digests == {fingerprint_id("select 1")}
+    assert fingerprint_id("select 2") not in digests
+
+
+def test_query_groups_reports_digest_calls_total_time_ms_and_mean_ms_per_field():
+    digest = fingerprint_id("select 1")
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (digest,)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(
+            stats=(
+                QueryStat(fingerprint="select 1", sql="select 1", calls=50, total_time_ms=500.0),
+            ),
+            window_description="w",
+        ),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    [group] = payload["query_groups"]
+    # Asserted per field, not as one dict comparison a single wrong field could still pass
+    # against by accident.
+    assert group["digest"] == digest
+    assert group["calls"] == 50
+    assert group["total_time_ms"] == 500.0
+    assert group["mean_ms"] == 10.0
+
+
+def test_mean_ms_is_null_rather_than_zero_when_a_group_has_no_calls():
+    """0.0 reads as "instantaneous", which is the opposite of "unknown"."""
+    digest = fingerprint_id("select 1")
+    proposal = Proposal(
+        code="ADV005",
+        title="x",
+        rationale="x",
+        evidence={"fingerprint_digests": (digest,)},
+        confidence=Confidence.HIGH,
+    )
+    payload = advise_payload(
+        [proposal],
+        Workload(
+            stats=(QueryStat(fingerprint="select 1", sql="select 1", calls=0, total_time_ms=0.0),),
+            window_description="w",
+        ),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    [group] = payload["query_groups"]
+    assert group["calls"] == 0
+    assert group["total_time_ms"] == 0.0
+    assert group["mean_ms"] is None
+
+
+def test_query_groups_has_no_dangling_references_across_several_rules_firing_at_once():
+    """`query_groups` must contain exactly the digests some proposal cites, and every digest
+    a proposal cites must resolve to an entry in `query_groups` — a dangling digest would
+    make a proposal unverifiable by a later `verify` run. Exercised against several rules
+    firing together (ADV001, ADV007, ADV005, ADV006), not one rule in isolation: a
+    single-rule test cannot catch a rule that forgets to route its usage's fingerprints
+    through the same workload `report.py` reads back."""
+    orders = Relation("public", "orders")
+    order_items = Relation("public", "order_items")
+    wide_table = Relation("public", "wide_table")
+
+    fp_index = 'SELECT "id" FROM "orders" WHERE "status" = %s'
+    fp_join = 'SELECT "id" FROM "order_items" WHERE "order_id" = %s'
+    fp_wildcard = 'SELECT "id" FROM "orders" WHERE "note" LIKE %s'
+    fp_star = 'SELECT * FROM "wide_table"'
+    fp_unreferenced = "SELECT 1"
+
+    aggregation = Aggregation(
+        usage=(
+            ColumnUsage(
+                relation=orders,
+                column="status",
+                role=ColumnRole.EQUALITY,
+                calls=50,
+                cost_ms=500.0,
+                cost_share=0.5,
+                fingerprint_ids=frozenset({fp_index}),
+            ),
+            ColumnUsage(
+                relation=order_items,
+                column="order_id",
+                role=ColumnRole.JOIN,
+                calls=50,
+                cost_ms=400.0,
+                cost_share=0.4,
+                fingerprint_ids=frozenset({fp_join}),
+            ),
+        ),
+        total_cost_ms=1000.0,
+        skipped_unqualifiable=0,
+        tables=frozenset({orders, order_items}),
+    )
+    facts = {
+        orders: TableFacts(
+            relation=orders, row_estimate=100_000, size_bytes=10**8, columns=("id", "status")
+        ),
+        order_items: TableFacts(
+            relation=order_items,
+            row_estimate=100_000,
+            size_bytes=10**8,
+            columns=("id", "order_id"),
+        ),
+        wide_table: TableFacts(
+            relation=wide_table,
+            row_estimate=100_000,
+            size_bytes=10**8,
+            columns=tuple(f"c{i}" for i in range(20)),
+        ),
+    }
+    workload = Workload(
+        stats=(
+            QueryStat(
+                fingerprint=fp_index,
+                sql="select id from orders where status = $1",
+                calls=50,
+                total_time_ms=500.0,
+            ),
+            QueryStat(
+                fingerprint=fp_join,
+                sql="select id from order_items where order_id = $1",
+                calls=50,
+                total_time_ms=400.0,
+            ),
+            QueryStat(
+                fingerprint=fp_wildcard,
+                sql="select id from orders where note like $1",
+                calls=10,
+                total_time_ms=300.0,
+                flags=frozenset({FLAG_LEADING_WILDCARD_LIKE}),
+            ),
+            QueryStat(
+                fingerprint=fp_star,
+                sql="select * from wide_table",
+                calls=10,
+                total_time_ms=300.0,
+                flags=frozenset({FLAG_SELECT_STAR}),
+            ),
+            QueryStat(fingerprint=fp_unreferenced, sql="select 1", calls=1000, total_time_ms=1.0),
+        ),
+        window_description="w",
+    )
+
+    proposals = (
+        propose_indexes(aggregation.usage, facts, {}, min_cost_share=0.01)
+        + propose_join_keys(aggregation.usage, facts, {}, min_cost_share=0.01)
+        + propose_sargability(aggregation.usage, workload, min_cost_share=0.01)
+        + propose_select_star(workload, facts, min_cost_share=0.01, dialect="postgres")
+    )
+    codes = {p.code for p in proposals}
+    assert codes == {"ADV001", "ADV007", "ADV005", "ADV006"}
+
+    payload = advise_payload(
+        proposals, workload, aggregation, engine="postgres", redacted=True, degraded=[]
+    )
+    group_digests = {g["digest"] for g in payload["query_groups"]}
+
+    referenced: set[str] = set()
+    for p in proposals:
+        for digest in p.evidence.get("fingerprint_digests", ()):
+            referenced.add(digest)
+            assert digest in group_digests, f"{p.code} cites {digest}, absent from query_groups"
+
+    # No extras either: every group present was cited by something.
+    assert group_digests == referenced
+    assert fingerprint_id(fp_unreferenced) not in group_digests
 
 
 def test_payload_is_json_serializable():

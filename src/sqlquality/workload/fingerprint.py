@@ -6,8 +6,10 @@ for literal leakage, rather than one per adapter.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 
 from sqlglot import exp
 
@@ -20,6 +22,44 @@ from sqlquality.sqlast import SqlParseError, parse
 FLAG_LEADING_WILDCARD_LIKE = "leading_wildcard_like"
 #: The query group projects a star. Captured pre-qualify (qualify runs expand_stars=False).
 FLAG_SELECT_STAR = "select_star"
+
+#: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
+#: apart the few hundred query groups one run reads, and short enough to sit in a table cell.
+_FINGERPRINT_ID_LEN = 12
+
+
+def fingerprint_id(fingerprint: str) -> str:
+    """A short, stable identity for a query group.
+
+    `QueryStat.fingerprint` is the *entire* canonical SQL, so emitting it as evidence
+    printed the whole statement a second time next to `sql` — for a long query, most of the
+    proposal's evidence block, duplicated. What the field is for is identity: telling two
+    query groups apart and correlating a proposal with a later run. A digest does that in
+    twelve characters. The readable text stays in `sql`.
+
+    Not a security boundary — the fingerprint is already redacted — so a fast digest is
+    fine; sha256 is used because it is the unsurprising choice.
+
+    Lives here rather than in `workload/postgres.py` (where it was first written, for
+    ADV005/ADV006): this module already owns fingerprinting and is engine-neutral, while
+    `postgres.py` is the Postgres-specific adapter. `report.py`'s `query_groups` payload key
+    and the Redshift adapter's evidence both need this same identity, and neither should
+    reach into another engine's adapter — a private helper — to get it.
+    """
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:_FINGERPRINT_ID_LEN]
+
+
+def fingerprint_digests(fingerprints: Iterable[str]) -> tuple[str, ...]:
+    """Sorted, de-duplicated `fingerprint_id` digests for a set of query-group fingerprints.
+
+    Sorted rather than left in whatever order the caller's (frozen)set iterates: a
+    `frozenset`'s iteration order is not guaranteed stable across runs, and every consumer
+    of this — a proposal's `evidence["fingerprint_digests"]` — exists so `sqlquality verify`
+    can diff two artifacts. An order that changed between two runs of the *same* workload
+    would read as evidence that changed, which would be noise, not a finding.
+    """
+    return tuple(sorted({fingerprint_id(fp) for fp in fingerprints}))
+
 
 #: Statement-leading keywords marking session control, DDL, or maintenance — never user
 #: workload. Anchored at the start deliberately: an unanchored `set\s+` also matches

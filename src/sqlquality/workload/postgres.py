@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -34,7 +33,12 @@ from sqlquality.workload.base import (
     Querier,
     WorkloadAdapter,
 )
-from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
+from sqlquality.workload.fingerprint import (
+    FLAG_LEADING_WILDCARD_LIKE,
+    FLAG_SELECT_STAR,
+    fingerprint_digests,
+    fingerprint_id,
+)
 from sqlquality.workload.secrets import secrets_for
 from sqlquality.workload.session import (
     LIBPQ_FIELD_MAP,
@@ -75,25 +79,6 @@ _HINTS = {
     ),
     CAP_INDEXES: "reads pg_index and pg_stat_user_indexes; world-readable unless revoked",
 }
-
-#: Characters of hex kept from the fingerprint digest. 12 is 48 bits — ample for telling
-#: apart the few hundred query groups one run reads, and short enough to sit in a table cell.
-_FINGERPRINT_ID_LEN = 12
-
-
-def _fingerprint_id(fingerprint: str) -> str:
-    """A short, stable identity for a query group.
-
-    `QueryStat.fingerprint` is the *entire* canonical SQL, so emitting it as evidence
-    printed the whole statement a second time next to `sql` — for a long query, most of the
-    proposal's evidence block, duplicated. What the field is for is identity: telling two
-    query groups apart and correlating a proposal with a later run. A digest does that in
-    twelve characters. The readable text stays in `sql`.
-
-    Not a security boundary — the fingerprint is already redacted — so a fast digest is
-    fine; sha256 is used because it is the unsurprising choice.
-    """
-    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:_FINGERPRINT_ID_LEN]
 
 
 def _as_int(value: object) -> int:
@@ -459,6 +444,13 @@ def propose_indexes(
                     #: `k=v` pair next to the joint one can only read as support that is not
                     #: there.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested (not the whole
+                    #: canonical SQL `shared` actually holds — `ColumnUsage.fingerprint_ids`'
+                    #: name is a known wart, see `fingerprint_digests`'s own docstring) and
+                    #: sorted, so `sqlquality verify` (a later task) can name which groups
+                    #: back this proposal and diff two runs' evidence without reordering
+                    #: noise.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     "row_estimate": rows,
                     "leading_ndv": leading_ndv,
                     "partial_indexes_skipped": partial_skipped,
@@ -592,6 +584,9 @@ def propose_join_keys(
                         "cost_share": item.cost_share,
                         "calls": item.calls,
                         "fingerprints": item.fingerprints,
+                        #: The query groups behind `fingerprints`, digested and sorted —
+                        #: see ADV001's identical field for why.
+                        "fingerprint_digests": fingerprint_digests(item.fingerprint_ids),
                         "row_estimate": rows,
                         "leading_ndv": column_ndv,
                         "partial_indexes_skipped": partial_skipped,
@@ -755,6 +750,9 @@ def propose_grouping_indexes(
                     #: renders evidence as bare `k=v` pairs, with no per-rule text, would
                     #: read as more support than actually exists.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     "row_estimate": rows,
                     "partial_indexes_skipped": partial_skipped,
                     "expression_indexes": expression_indexes,
@@ -780,6 +778,13 @@ def propose_unused_indexes(
 
     Confidence is capped at MEDIUM: idx_scan accumulates only since the last statistics
     reset, so zero scans cannot prove an index is unused across a full business cycle.
+
+    No `fingerprint_digests` in this proposal's evidence, deliberately: its evidence is
+    `idx_scan`, a catalog measurement of the index itself, not a claim about which query
+    groups use (or fail to use) it — there is no workload query group to name. Omitted
+    entirely rather than emitted as `[]`, matching Redshift's ADV104/ADV105: an empty list
+    would read as "zero query groups back this", which is a different and false claim from
+    "this rule is not workload-derived".
     """
     proposals: list[Proposal] = []
     for relation in sorted(hot_tables):
@@ -833,6 +838,11 @@ def propose_redundant_indexes(
     provable from the catalog alone, so the advice was not *wrong* — but arbitrary scope for
     a rule that emits `DROP` is not a scope, and this rule should be able to say which
     workload its recommendation came from.
+
+    No `fingerprint_digests` in this proposal's evidence, for the same reason ADV002 has
+    none: prefix redundancy is proven from two `PgIndex` column lists, a catalog fact, not
+    from any query group. See ADV002's docstring for why the key is omitted rather than
+    emitted empty.
     """
     proposals: list[Proposal] = []
     for relation in sorted(hot_tables):
@@ -1054,6 +1064,9 @@ def propose_partial_indexes(
                     #: How many query groups filter on both columns together. This is what
                     #: makes the proposal supported rather than a guess.
                     "co_occurring_fingerprints": len(shared),
+                    #: The query groups behind the count above, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(shared),
                     #: Named `partial_indexes_not_compared`, not ADV001's
                     #: `partial_indexes_skipped`: there the partial index is known not to
                     #: cover an unfiltered lookup, here it may be this exact proposal already
@@ -1103,6 +1116,9 @@ def propose_sargability(
                     "cost_share": item.cost_share,
                     "calls": item.calls,
                     "fingerprints": item.fingerprints,
+                    #: The query groups behind `fingerprints`, digested and sorted — see
+                    #: ADV001's identical field for why.
+                    "fingerprint_digests": fingerprint_digests(item.fingerprint_ids),
                 },
                 confidence=Confidence.HIGH,
                 ddl=None,
@@ -1126,10 +1142,16 @@ def propose_sargability(
                     "so the specific column is not attributed here."
                 ),
                 evidence={
-                    "fingerprint": _fingerprint_id(stat.fingerprint),
+                    "fingerprint": fingerprint_id(stat.fingerprint),
                     "sql": stat.sql,
                     "cost_share": share,
                     "calls": stat.calls,
+                    #: Additional to the singular `fingerprint` above, not a replacement for
+                    #: it: this proposal is backed by exactly one query group — itself — so
+                    #: the list holds that one digest. Same key, same meaning, as every other
+                    #: rule's `fingerprint_digests`, which is what lets `report.py` derive
+                    #: `query_groups` uniformly across every proposal code.
+                    "fingerprint_digests": (fingerprint_id(stat.fingerprint),),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=None,
@@ -1236,11 +1258,14 @@ def propose_select_star(
                     },
                     "cost_share": share,
                     "calls": stat.calls,
-                    "fingerprint": _fingerprint_id(stat.fingerprint),
+                    "fingerprint": fingerprint_id(stat.fingerprint),
                     # The identity above is a digest, so the readable text has to be
                     # carried explicitly — ADV005 already does this. Redacted by
                     # default, like every other query text in the report.
                     "sql": stat.sql,
+                    # Additional to the singular `fingerprint` above, not a replacement —
+                    # see ADV005's identical comment.
+                    "fingerprint_digests": (fingerprint_id(stat.fingerprint),),
                 },
                 confidence=Confidence.MEDIUM,
                 ddl=None,

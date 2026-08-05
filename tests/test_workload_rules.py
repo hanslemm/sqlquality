@@ -13,7 +13,11 @@ from sqlquality.models import (
     TableFacts,
     Workload,
 )
-from sqlquality.workload.fingerprint import FLAG_LEADING_WILDCARD_LIKE, FLAG_SELECT_STAR
+from sqlquality.workload.fingerprint import (
+    FLAG_LEADING_WILDCARD_LIKE,
+    FLAG_SELECT_STAR,
+    fingerprint_id,
+)
 from sqlquality.workload.postgres import (
     PgIndex,
     PostgresWorkloadAdapter,
@@ -662,6 +666,19 @@ def test_unused_index_rule_ignores_tables_outside_the_workload():
     assert propose_unused_indexes(existing, hot_tables=frozenset({_ORDERS})) == []
 
 
+def test_adv002_evidence_omits_fingerprint_digests_entirely():
+    """ADV002's evidence is `idx_scan`, a catalog measurement of the index itself, not a
+    claim about which query groups use it — there is no workload query group at all. The
+    key must be *absent*, not present as `[]`, matching Redshift's ADV104/ADV105: an empty
+    list would read as "zero query groups back this", a different, false claim."""
+    existing = {
+        _ORDERS: (PgIndex("idx_cold", ("note",), False, False, 0, 4096),),
+    }
+    proposals = propose_unused_indexes(existing, hot_tables=frozenset({_ORDERS}))
+    assert len(proposals) == 1
+    assert "fingerprint_digests" not in proposals[0].evidence
+
+
 def test_adv002_drop_ddl_qualifies_the_index_with_its_relations_schema():
     existing = {
         Relation("staging", "orders"): (
@@ -734,6 +751,21 @@ def test_a_plain_redundant_pair_is_high_confidence():
     # drop the "both are plain" claim while leaving HIGH, with nothing failing.
     assert "plain" in proposals[0].rationale
     assert "partial" not in proposals[0].rationale
+
+
+def test_adv003_evidence_omits_fingerprint_digests_entirely():
+    """Prefix redundancy is proven from two `PgIndex` column lists, a catalog fact, not
+    from any query group — see ADV002's identical test for why the key must be absent
+    rather than an empty `[]`."""
+    existing = {
+        _ORDERS: (
+            PgIndex("idx_narrow", ("status",), False, False, 5, 1),
+            PgIndex("idx_wide", ("status", "created_at"), False, False, 5, 1),
+        )
+    }
+    proposals = propose_redundant_indexes(existing, hot_tables=frozenset(existing))
+    assert len(proposals) == 1
+    assert "fingerprint_digests" not in proposals[0].evidence
 
 
 def test_adv003_ignores_relations_the_workload_never_touched():
@@ -896,6 +928,29 @@ def test_partial_index_proposed_for_a_hot_not_null_check():
     )
     assert codes(proposals) == ["ADV004"]
     assert "IS NOT NULL" in proposals[0].ddl
+
+
+def test_adv004_evidence_carries_digests_not_query_text():
+    canonical = 'SELECT "id" FROM "orders" WHERE "status" = %s AND "shipped_at" IS NOT NULL'
+    proposals = propose_partial_indexes(
+        [
+            _usage(_ORDERS, "status", ColumnRole.EQUALITY, cost_ms=90.0, fps=(canonical,)),
+            _usage(
+                _ORDERS,
+                "shipped_at",
+                ColumnRole.NOT_NULL_CHECK,
+                cost_share=0.4,
+                cost_ms=40.0,
+                fps=(canonical,),
+            ),
+        ],
+        _facts_map(),
+        {},
+        min_cost_share=0.01,
+    )
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id(canonical),)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
 
 
 def test_partial_index_polarity_follows_the_predicate():
@@ -2239,15 +2294,41 @@ def test_adv005_reports_a_short_fingerprint_id_and_keeps_the_sql_separately():
     assert len(fingerprint) <= 16
     # The text is still there — the identity is what got shorter, not the evidence.
     assert proposals[0].evidence["sql"] == stat.sql
+    # `fingerprint_digests` is additional to the singular `fingerprint` above, not a
+    # replacement for it: this proposal is backed by exactly one query group, itself.
+    assert proposals[0].evidence["fingerprint_digests"] == (fingerprint,)
 
 
 def test_the_fingerprint_id_is_stable_and_distinguishing():
     """It is an identity: the same query group must always get the same id, and two
-    different groups must not collide."""
-    from sqlquality.workload.postgres import _fingerprint_id
+    different groups must not collide.
 
-    assert _fingerprint_id("select 1") == _fingerprint_id("select 1")
-    assert _fingerprint_id("select 1") != _fingerprint_id("select 2")
+    Imported from `sqlquality.workload.fingerprint`, not `sqlquality.workload.postgres`:
+    the function moved there so the engine-neutral `report.py` and the Redshift adapter
+    could use it too, without either reaching into the Postgres-specific adapter for it."""
+    assert fingerprint_id("select 1") == fingerprint_id("select 1")
+    assert fingerprint_id("select 1") != fingerprint_id("select 2")
+
+
+def test_evidence_carries_digests_not_query_text():
+    """`ColumnUsage.fingerprint_ids` holds the whole canonical SQL despite its name. Putting
+    it in the payload verbatim would print every backing query's full text inside every
+    proposal — and the payload already carries redacted SQL where a rule needs it."""
+    relation = Relation("public", "orders")
+    usage = (
+        _usage(
+            relation,
+            "status",
+            ColumnRole.EQUALITY,
+            cost_share=0.5,
+            fps=('SELECT "id" FROM "orders" WHERE "status" = %s',),
+        ),
+    )
+    [proposal] = propose_indexes(usage, _facts_map(relation, rows=100_000), {}, min_cost_share=0.01)
+    digests = proposal.evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id('SELECT "id" FROM "orders" WHERE "status" = %s'),)
+    assert all(len(d) == 12 for d in digests)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
 
 
 def test_adv006_also_reports_the_short_id_without_losing_the_query():
@@ -2270,6 +2351,9 @@ def test_adv006_also_reports_the_short_id_without_losing_the_query():
     proposals = propose_select_star(_workload(stat), wide, min_cost_share=0.01)
     assert proposals[0].evidence["fingerprint"] != canonical
     assert proposals[0].evidence["sql"] == stat.sql
+    # Additional to the singular `fingerprint` above, not a replacement — see ADV005's
+    # identical assertion.
+    assert proposals[0].evidence["fingerprint_digests"] == (proposals[0].evidence["fingerprint"],)
 
 
 def test_adv007_proposes_an_index_on_an_unindexed_hot_join_key():
@@ -2280,6 +2364,26 @@ def test_adv007_proposes_an_index_on_an_unindexed_hot_join_key():
     assert [p.code for p in proposals] == ["ADV007"]
     assert proposals[0].ddl == 'CREATE INDEX ON "public"."order_items" ("order_id");'
     assert proposals[0].confidence is Confidence.HIGH
+
+
+def test_adv007_evidence_carries_digests_not_query_text():
+    relation = Relation("public", "order_items")
+    canonical = 'SELECT "id" FROM "order_items" WHERE "order_id" = %s'
+    usage = (
+        _usage(
+            relation,
+            "order_id",
+            ColumnRole.JOIN,
+            cost_share=0.4,
+            cost_ms=400.0,
+            fps=(canonical,),
+        ),
+    )
+    facts = {relation: _facts(relation, rows=100_000, ndv={"order_id": 5000.0})}
+    proposals = propose_join_keys(usage, facts, {}, min_cost_share=0.01)
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id(canonical),)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
 
 
 def test_adv007_is_silent_when_an_index_already_leads_with_the_join_key():
@@ -2453,6 +2557,27 @@ def test_adv008_proposes_a_composite_index_for_a_hot_group_by():
     assert [p.code for p in proposals] == ["ADV008"]
     assert proposals[0].evidence["columns"] == ("tenant_id", "day")
     assert proposals[0].ddl == 'CREATE INDEX ON "public"."events" ("tenant_id", "day");'
+
+
+def test_adv008_evidence_carries_digests_not_query_text():
+    relation = Relation("public", "events")
+    canonical = 'SELECT COUNT(*) FROM "events" GROUP BY "tenant_id", "day"'
+    usage = (
+        _usage(
+            relation,
+            "tenant_id",
+            ColumnRole.GROUP,
+            cost_share=0.5,
+            cost_ms=500.0,
+            fps=(canonical,),
+        ),
+        _usage(relation, "day", ColumnRole.GROUP, cost_share=0.5, cost_ms=400.0, fps=(canonical,)),
+    )
+    facts = {relation: _facts(relation, rows=5_000_000)}
+    proposals = propose_grouping_indexes(usage, facts, {}, min_cost_share=0.01)
+    digests = proposals[0].evidence["fingerprint_digests"]
+    assert digests == (fingerprint_id(canonical),)
+    assert not any("SELECT" in d for d in digests), "query text must not reach the payload"
 
 
 def test_adv008_never_reaches_high_confidence():

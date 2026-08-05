@@ -30,6 +30,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transition across two runs where nothing physically changed — only what each run
   happened to fetch did.
 
+- `advise --json` now carries `query_groups`, a top-level `list[dict]` of the specific
+  workload query groups some proposal actually cites as evidence, each with `digest`
+  (the same 12-character id as `evidence["fingerprint"]`/`evidence["fingerprint_digests"]`),
+  `calls`, `total_time_ms`, and `mean_ms` (`total_time_ms / calls`, or `null` — never
+  `0.0` — when `calls` is `0`, since a group with no recorded calls has no meaningful mean
+  to report). This is the workload evidence the upcoming `sqlquality verify` command
+  compares against a later run's timings for the same query groups. The key is always
+  present, `[]` when nothing references it, for the same reason `physical_state` is: an
+  absent key marks a pre-this-feature artifact, distinct from a genuinely-empty run.
+
+  **This is a different key from, and coexists with, the existing
+  `payload["analyzed"]["query_groups"]`** — that one is (and remains) an integer count of
+  how many query groups this run understood; the new one is a list of the specific groups
+  backing a proposal. JSON nesting disambiguates the two (one is nested under
+  `"analyzed"`, the other sits at the payload's root) — renaming the older, already-shipped
+  key to avoid the collision would itself be a breaking change to existing consumers, and
+  is out of scope here.
+
+  Every index- and physical-design-rule proposal (ADV001, ADV004, ADV005, ADV006, ADV007,
+  ADV008, ADV101, ADV102, ADV103) now also carries `evidence["fingerprint_digests"]`: a
+  sorted tuple of the same 12-character digests, naming which of `query_groups` back that
+  specific proposal — beside the existing `fingerprints` / `co_occurring_fingerprints`
+  counts, not replacing them. The three rules with no query-group backing at all —
+  Postgres's ADV002/ADV003 (catalog measurements: index scan counts, index-prefix
+  comparisons) and Redshift's ADV104/ADV105 (a direct catalog measurement and a verbatim
+  Amazon Redshift Advisor relay, respectively) — omit the key entirely rather than emit
+  `[]`, since an empty list would misread as "zero query groups support this" rather than
+  the true "this rule is not workload-derived."
+
 ### Changed
 
 - **Breaking:** `advise --json`'s `"window"` key is now an object —

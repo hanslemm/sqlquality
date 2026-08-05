@@ -12,6 +12,7 @@ from sqlquality.models import (
     analyzed_query_groups,
     cost_share_of,
 )
+from sqlquality.workload.fingerprint import fingerprint_id
 
 
 def _md_escape(value: object) -> str:
@@ -178,6 +179,20 @@ def advise_payload(
     distinction by omitting the key on an empty result would make a pre-this-feature
     artifact and a genuinely-empty one indistinguishable to the one caller that needs to
     tell them apart.
+
+    The top-level `"query_groups"` key is a **different key from, and coexists with**,
+    `payload["analyzed"]["query_groups"]` above — that one is an integer count (how many
+    query groups this run understood), this one is a `list[dict]` of the specific query
+    groups a proposal actually cites in its `evidence["fingerprint_digests"]`, each carrying
+    `digest`/`calls`/`total_time_ms`/`mean_ms`. Two keys of the same name holding different
+    types at different nesting levels of the same payload is unusual enough that a consumer
+    should not have to discover it by surprise: JSON nesting disambiguates the two (one
+    lives under `"analyzed"`, the other at the payload's root), and renaming the older,
+    already-shipped `analyzed.query_groups` to make room would be a breaking payload change
+    for existing consumers, which is outside what this feature set is here to do. Like
+    `physical_state`, this key is **always present** (`[]` when no proposal cites any query
+    group) rather than omitted-when-empty: `verify` (a later task) uses an absent key, not
+    an empty list, to recognize an artifact from a version that predates this feature.
     """
     window_facts = dict(window_facts or {})
     payload = {
@@ -228,10 +243,59 @@ def advise_payload(
         # absent key here must mean something different (a pre-this-feature artifact) than
         # an empty one (this run had nothing physical to report).
         "physical_state": dict(physical_state or {}),
+        # Always present too, for the identical reason — see this function's docstring for
+        # why this coexists with (and is a different key from) "analyzed"."query_groups".
+        "query_groups": _query_groups_payload(proposals, workload),
     }
     if dbt is not None:
         payload["dbt"] = dbt
     return payload
+
+
+def _query_groups_payload(proposals: list[Proposal], workload: Workload) -> list[dict]:
+    """The workload query groups actually cited by some proposal's `fingerprint_digests`.
+
+    Every proposal that names a query group does so with a digest (see
+    `workload.fingerprint.fingerprint_id`), never the group's full canonical SQL — so this
+    is the one place a digest is resolved back to its timings, and it does so by recomputing
+    the same digest from each `QueryStat.fingerprint` and matching on that, rather than by
+    trusting any string a proposal's evidence happens to carry.
+
+    Scoped to *referenced* groups, not every group in `workload.stats`: a query group this
+    run only glanced at, without any rule finding it worth proposing on, is not evidence for
+    anything and would only bloat the payload. `verify` (a later task) needs exactly the
+    groups that back a proposal, to compare their timings against a later run's — not the
+    whole workload.
+
+    `mean_ms` is `None`, never `0.0`, for a group with zero recorded calls: a group that was
+    never called has no meaningful mean latency to report, and `0.0` reads as "instant",
+    the opposite of "unknown". This mirrors the present-but-null idiom `window` and
+    `physical_state` already use elsewhere in this payload for "this run could not tell
+    you", as against a real measurement of zero.
+
+    Order follows `workload.stats` (cost descending, then fingerprint — see `ingest()`),
+    not a fresh sort by digest: that order is already deterministic run-to-run for the same
+    workload, and re-sorting by digest would throw away the cost ordering for no gain.
+    """
+    referenced: set[str] = set()
+    for proposal in proposals:
+        digests = proposal.evidence.get("fingerprint_digests")
+        if isinstance(digests, (tuple, list)):
+            referenced.update(str(d) for d in digests)
+    groups = []
+    for stat in workload.stats:
+        digest = fingerprint_id(stat.fingerprint)
+        if digest not in referenced:
+            continue
+        groups.append(
+            {
+                "digest": digest,
+                "calls": stat.calls,
+                "total_time_ms": stat.total_time_ms,
+                "mean_ms": (stat.total_time_ms / stat.calls) if stat.calls else None,
+            }
+        )
+    return groups
 
 
 def _jsonable(value: object) -> object:
