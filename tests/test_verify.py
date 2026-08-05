@@ -1457,6 +1457,55 @@ def test_ruling_9_adv105_applied_comes_from_advisor_row_presence_in_after():
     assert "more than one" in verdict_collision.note
 
 
+def test_concern_3_adv105_confidence_never_exceeds_medium_even_under_a_disjoint_window():
+    """Concern 3 (fix round 1, accepted): ADV105's applied signal is Advisor's own row
+    disappearing, not this project's own catalog read — weaker evidence than every other
+    code's `physical_state` delta, regardless of how comparable the two windows are. A
+    DISJOINT window (a clean reset-based comparison, `HIGH` for every other code) must
+    still cap an ADV105 verdict at `MEDIUM`."""
+    sort_rec = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": None,
+            "current_ddl": None,
+        },
+        "ddl": None,
+    }
+    before = {
+        "proposals": [sort_rec],
+        "physical_state": {},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": "2026-08-04T00:00:00",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    assert classify_windows(before, after) is WindowRelation.DISJOINT
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.confidence is Confidence.MEDIUM
+
+
 # --- Ruling 10: a proposal present only in `after` has no verdict here ------------------
 
 
@@ -1540,7 +1589,7 @@ def test_applied_drop_index_true_when_the_named_index_is_gone():
     assert verdict.applied is True
 
 
-def test_applied_redshift_sortkey_changed_from_its_recorded_baseline():
+def test_applied_redshift_sortkey_true_when_after_matches_the_proposed_column():
     before = {
         "proposals": [
             {
@@ -1573,6 +1622,140 @@ def test_applied_redshift_sortkey_changed_from_its_recorded_baseline():
     }
     [verdict] = verdicts(before, after)
     assert verdict.applied is True
+
+
+# --- Concern 2 (fix round 1): applied means the PROPOSED target, not "something changed" ---
+
+
+def test_applied_redshift_sortkey_is_false_when_a_different_sortkey_was_set():
+    """A false statement about the user's database is exactly what crediting *any* change
+    would produce: the user set `tenant_id`, not the recommended `created_at`, as the
+    sortkey. Reporting `applied=True` here would tell them their own, unrelated change was
+    the one this tool proposed."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV101",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "column": "created_at",
+                    "current_sortkey1": None,
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": None}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "sortkey1": "tenant_id"}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is False
+
+
+def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_proposed_column():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV102",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "column": "customer_id",
+                    "current_diststyle": "EVEN",
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    # Matches the proposed column exactly -> applied.
+    after_match = {
+        "proposals": [],
+        "physical_state": {
+            "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(customer_id)"}
+        },
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_match] = verdicts(before, after_match)
+    assert verdict_match.applied is True
+
+    # A DIFFERENT distkey column was set -> a genuine mismatch, never credited.
+    after_mismatch = {
+        "proposals": [],
+        "physical_state": {
+            "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(region)"}
+        },
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_mismatch] = verdicts(before, after_mismatch)
+    assert verdict_mismatch.applied is False
+
+
+def test_applied_redshift_diststyle_all_true_only_for_alls_own_shape():
+    before = {
+        "proposals": [
+            {
+                "code": "ADV103",
+                "evidence": {"schema": "public", "table": "orders", "current_diststyle": "EVEN"},
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after_all = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "ALL"}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_all] = verdicts(before, after_all)
+    assert verdict_all.applied is True
+
+    # Some KEY(...) distribution was set instead of ALL -> not applied.
+    after_key = {
+        "proposals": [],
+        "physical_state": {
+            "public.orders": {"is_ordinary_table": True, "diststyle": "KEY(customer_id)"}
+        },
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_key] = verdicts(before, after_key)
+    assert verdict_key.applied is False
 
 
 def test_applied_maintenance_true_when_unsorted_fell_below_its_baseline():
@@ -1664,3 +1847,64 @@ def test_applied_is_none_for_an_unrecognized_future_code():
     [verdict] = verdicts(before, after)
     assert verdict.applied is None
     assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+
+
+# --- Critical fix (fix round 1): physical_state's blind spot on the headline case -------
+
+
+def test_the_headline_case_a_resolved_proposal_still_grades_applied_and_improved():
+    """The critical fix round 1 exists for. Before it, `physical_state` was scoped to
+    proposal relations alone, so `after` — where the recommended index now exists and
+    ADV001 no longer fires for `public.orders` at all — would have carried *no*
+    `physical_state` entry for that relation, and this verdict would have come back
+    `applied=None`, UNOBSERVABLE: the tool structurally unable to confirm its own
+    headline case. `physical_state` is now scoped to `proposal_relations(proposals) |
+    aggregation.tables` (`cli.py`), so `after`'s payload — built from a real `advise` run
+    that produced zero proposals for this relation — still carries its physical facts."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV001",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "columns": ["status"],
+                    "fingerprint_digests": ["aaa"],
+                },
+                "ddl": "CREATE INDEX ON public.orders (status);",
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "indexes": []}},
+        "query_groups": [{"digest": "aaa", "calls": 10, "total_time_ms": 1000.0, "mean_ms": 100.0}],
+        "window": {
+            "description": "d",
+            "engine": "postgres",
+            "stats_reset_at": "2026-08-01T00:00:00",
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+    after = {
+        # No proposals at all for public.orders (or anywhere): the index was created, so
+        # ADV001 stopped firing. Before the fix, `physical_state` would be `{}` here.
+        "proposals": [],
+        "physical_state": {
+            "public.orders": {
+                "is_ordinary_table": True,
+                "indexes": [
+                    {
+                        "name": "idx_status",
+                        "columns": ["status"],
+                        "is_partial": False,
+                        "is_unique": False,
+                    }
+                ],
+            }
+        },
+        "query_groups": [{"digest": "aaa", "calls": 10, "total_time_ms": 400.0, "mean_ms": 40.0}],
+        "window": before["window"],
+    }
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is True
+    assert verdict.outcome is VerifyOutcome.IMPROVED

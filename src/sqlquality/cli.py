@@ -912,6 +912,16 @@ def advise(
             "dropped_collisions": dbt_context.dropped_collisions,
         }
 
+    # Union with `aggregation.tables`, not `proposal_relations(proposals)` alone: a
+    # relation whose proposal got resolved between two `advise` runs (the index was
+    # created, so the rule no longer fires) would otherwise carry no `physical_state`
+    # entry at all in the run where it stopped being a finding — which is precisely the
+    # run `sqlquality verify` needs it in, to confirm the fix actually landed. Every
+    # relation in `aggregation.tables` already has its `CAP_TABLE_FACTS`/`CAP_INDEXES`
+    # facts fetched regardless (see `fetch_table_facts`/`fetch_indexes` above and in
+    # `propose()`), so this reports more from data already gathered — no new SQL, no
+    # behaviour change to `proposals`, `workload` or any non-JSON surface below.
+    physical_state_relations = proposal_relations(proposals) | aggregation.tables
     payload = advise_payload(
         proposals,
         workload,
@@ -921,7 +931,7 @@ def advise(
         degraded=adapter.degraded,
         dbt=dbt_payload,
         window_facts=adapter.window_facts(),
-        physical_state=adapter.physical_state(proposal_relations(proposals)),
+        physical_state=adapter.physical_state(physical_state_relations),
     )
     # Both writes happen after the whole analysis, so an unwritable path would otherwise
     # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate

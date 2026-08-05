@@ -10,15 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
-  relation a proposal targets: Postgres records `is_ordinary_table` and each existing
-  index's `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
+  relation some proposal targets *or* the run's workload analysis touched
+  (`aggregation.tables`): Postgres records `is_ordinary_table` and each existing index's
+  `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
   `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence the
-  upcoming `sqlquality verify` command diffs between two artifacts to tell whether a
-  proposal was actually applied — observed from what the run's own catalog reads already
-  returned, never a second round trip. The key itself is always present, even when empty:
-  an *absent* `physical_state` key (an artifact from before this feature) and an *empty*
-  `{}` one (this run found no relation to report on at all) are different facts, and
-  `verify` needs to tell them apart.
+  `sqlquality verify` command diffs between two artifacts to tell whether a proposal was
+  actually applied — observed from what the run's own catalog reads already returned,
+  never a second round trip. Scoped to the union, not to proposal relations alone: a
+  relation whose proposal got resolved between two runs (the recommended index now
+  exists, so the rule stops firing) would otherwise have no entry at all in the very run
+  `verify` needs it in. The key itself is always present, even when empty: an *absent*
+  `physical_state` key (an artifact from before this feature) and an *empty* `{}` one
+  (this run found no relation to report on at all) are different facts, and `verify`
+  needs to tell them apart.
 
   **Each field within an entry is a genuine three-way signal, not just present-vs-absent:**
   `null` means *this run could not tell you* — either the relation's catalog facts were

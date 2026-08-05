@@ -179,8 +179,15 @@ def advise_payload(
     back as though a filter had been applied.
 
     `physical_state` is the adapter's own `WorkloadAdapter.physical_state(relations)`,
-    called by the caller (`cli.advise`) with `models.proposal_relations(proposals)` so its
-    size scales with findings rather than with schema size. Unlike `dbt`, this key is
+    called by the caller (`cli.advise`) with `models.proposal_relations(proposals)`
+    *unioned with* `aggregation.tables` — every relation some proposal targets, plus
+    every relation the run's workload analysis actually touched — not the first set
+    alone: a relation whose proposal got resolved between two `advise` runs (the
+    recommended index now exists, so the rule stops firing) would otherwise have no
+    `physical_state` entry at all in the very run `sqlquality verify` needs it in, to
+    confirm the fix landed. Sizing against `aggregation.tables` rather than the whole
+    introspected schema keeps the original intent (payload size scales with the workload,
+    not with schema size) while closing that blind spot. Unlike `dbt`, this key is
     **always present** — `{}` (the default) when the caller has none — never omitted:
     `verify` (a later task) treats an *absent* `physical_state` key as an artifact from a
     version that predates this feature and refuses it outright, which is a materially

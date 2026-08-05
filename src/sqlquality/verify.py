@@ -12,6 +12,7 @@ different recommendations into one.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
@@ -589,6 +590,24 @@ class ProposalVerdict:
 #: 8% is reported `UNCHANGED` rather than risk crediting noise as an improvement).
 RELATIVE_CHANGE_THRESHOLD: Final[float] = 0.10
 
+#: `Confidence`'s three grades, ranked low-to-high, so a verdict's confidence can be
+#: *capped* (never raised) against a second ceiling beyond the window relation's — see
+#: `_cap_confidence` and its ADV105 use in `verdicts`.
+_CONFIDENCE_RANK: dict[Confidence, int] = {
+    Confidence.LOW: 0,
+    Confidence.MEDIUM: 1,
+    Confidence.HIGH: 2,
+}
+
+
+def _cap_confidence(value: Confidence, cap: Confidence) -> Confidence:
+    """`value`, or `cap` if `value` outranks it — never the reverse. A second, narrower
+    ceiling than the window relation's own (`confidence_for`), for evidence that is weaker
+    for a reason the window comparison itself does not capture — see ADV105's use in
+    `verdicts`.
+    """
+    return value if _CONFIDENCE_RANK[value] <= _CONFIDENCE_RANK[cap] else cap
+
 
 def _relation_key(evidence: dict[str, object]) -> str | None:
     """`"schema.table"`, matching `physical_state`'s own key (`str(Relation)`), or `None`
@@ -653,14 +672,8 @@ _CREATE_INDEX_CODES = frozenset({"ADV001", "ADV004", "ADV007", "ADV008"})
 #: ADV002/ADV003 — drop-index rules. Applied when the named index is absent from `after`.
 _DROP_INDEX_CODES = frozenset({"ADV002", "ADV003"})
 
-#: ADV101/ADV102/ADV103 — Redshift sortkey/diststyle rules. Maps each code to
-#: (the evidence key holding the value recorded *at proposal time*, the `physical_state`
-#: field to compare it against in `after`).
-_REDSHIFT_KEY_BASELINE_FIELD: dict[str, tuple[str, str]] = {
-    "ADV101": ("current_sortkey1", "sortkey1"),
-    "ADV102": ("current_diststyle", "diststyle"),
-    "ADV103": ("current_diststyle", "diststyle"),
-}
+#: ADV101/ADV102/ADV103 — Redshift sortkey/diststyle rules. See `_applied_redshift_key`.
+_REDSHIFT_KEY_CODES = frozenset({"ADV101", "ADV102", "ADV103"})
 
 #: ADV104 — vacuum/analyze. Applied when `unsorted`/`stats_off` (whichever this specific
 #: proposal's evidence carries) fell below its own recorded baseline.
@@ -727,31 +740,75 @@ def _applied_drop_index(
     return not still_present
 
 
+#: The column name inside `KEY(column)` (or `AUTO(KEY(column))`) in a Redshift
+#: `svv_table_info.diststyle` string. Duplicated from `workload/redshift.py`'s identical,
+#: private `_diststyle_key_column`/`_diststyle_is_all` rather than imported: that module
+#: transitively pulls in this project's live-connection machinery (`workload.base`), which
+#: `verify.py` must never import (see the module docstring) — and the regex itself is a
+#: small, stable piece of AWS's own documented vocabulary ('KEY(col)', 'EVEN', 'ALL', any
+#: of those wrapped in `AUTO(...)`), not project logic that could drift between the two
+#: copies. See the original for the fuller accounting of those shapes.
+_DISTSTYLE_KEY_RE = re.compile(r"KEY\(\s*([^)]+?)\s*\)", re.IGNORECASE)
+
+
+def _diststyle_key_column(diststyle: str) -> str | None:
+    """The column name inside `KEY(column)`/`AUTO(KEY(column))`, or `None` when `diststyle`
+    names no key column at all (`EVEN`, `ALL`, or anything else)."""
+    match = _DISTSTYLE_KEY_RE.search(diststyle)
+    return match.group(1).strip() if match else None
+
+
+def _diststyle_is_all(diststyle: str) -> bool:
+    """`True` for Redshift's own `ALL` or `AUTO(ALL)` diststyle text."""
+    return "ALL" in diststyle.upper() and _diststyle_key_column(diststyle) is None
+
+
 def _applied_redshift_key(
     code: str,
     evidence: dict[str, object],
     before_phys: dict[str, object],
     after_phys: dict[str, object],
 ) -> bool | None:
-    """ADV101/ADV102/ADV103 — see `_REDSHIFT_KEY_BASELINE_FIELD`.
+    """ADV101/ADV102/ADV103 — see `_REDSHIFT_KEY_CODES`.
 
-    Applied when the relevant field (`sortkey1` for ADV101, `diststyle` for ADV102/
-    ADV103) differs, in `after`, from the value the proposal's own evidence recorded as
-    current *at proposal time*. This is the design spec's own wording ("sortkey1/diststyle
-    changed") taken literally: it credits *any* observed change to the named field, not
-    specifically a change matching the exact column this rule recommended — a DBA who set
-    a different SORTKEY entirely would still read as `applied` here. A real, disclosed
-    limitation (see the Task 6 report), not an oversight.
+    **Applied means the observed state now matches the *proposed target*, never merely
+    "the field changed."** Crediting any change to `sortkey1`/`diststyle` — this
+    function's first version, reverted after review — would tell a user who set a
+    *different* sortkey or distkey than the one recommended that their own, unrelated
+    change was the one this tool proposed: a false statement about their database, and a
+    checkable one, since ADV101/ADV102 both carry the proposed `column` in evidence and
+    ADV103 proposes `DISTSTYLE ALL` specifically.
 
-    **Ruling 1.** `None` when either side's `is_ordinary_table` is `null`: `sortkey1`/
-    `diststyle` are themselves ambiguous `None`s until `is_ordinary_table` is known (see
-    `RedshiftWorkloadAdapter.physical_state`'s docstring), so this gates on it rather than
-    reading the field directly.
+    - ADV101: `True` iff `after`'s `sortkey1` equals the proposed `column`, exactly.
+    - ADV102: `True` iff `after`'s `diststyle` parses (`_diststyle_key_column`) to the
+      proposed `column`, exactly — not merely "some KEY(...) column changed."
+    - ADV103: `True` iff `after`'s `diststyle` is Redshift's own `ALL`/`AUTO(ALL)` shape
+      (`_diststyle_is_all`).
+
+    A `diststyle` that parses to some *other* column, or to no key column at all, is a
+    genuine mismatch — `False`, never `None`: `diststyle` is a small, closed AWS
+    vocabulary (the same one `workload/redshift.py`'s own `propose_distkey`/
+    `propose_diststyle_all` already rely on for definitive yes/no reads), so failing to
+    parse as the target is itself a measurement, not missing information.
+
+    **Ruling 1.** `None` when either side's `is_ordinary_table` is `null` (`sortkey1`/
+    `diststyle` are themselves ambiguous `None`s until `is_ordinary_table` is known — see
+    `RedshiftWorkloadAdapter.physical_state`'s docstring), or when ADV101/ADV102's
+    evidence does not carry the `column` this comparison needs (defensive — a real
+    proposal from either rule always does).
     """
-    baseline_key, physical_key = _REDSHIFT_KEY_BASELINE_FIELD[code]
     if before_phys.get("is_ordinary_table") is None or after_phys.get("is_ordinary_table") is None:
         return None
-    return after_phys.get(physical_key) != evidence.get(baseline_key)
+    after_diststyle = after_phys.get("diststyle")
+    if code == "ADV103":
+        return isinstance(after_diststyle, str) and _diststyle_is_all(after_diststyle)
+    column = evidence.get("column")
+    if not isinstance(column, str):
+        return None
+    if code == "ADV101":
+        return after_phys.get("sortkey1") == column
+    # ADV102
+    return isinstance(after_diststyle, str) and _diststyle_key_column(after_diststyle) == column
 
 
 def _applied_maintenance(
@@ -851,7 +908,7 @@ def _detect_applied(
         return _applied_create_index(evidence, before_phys, after_phys), None
     if code in _DROP_INDEX_CODES:
         return _applied_drop_index(evidence, before_phys, after_phys), None
-    if code in _REDSHIFT_KEY_BASELINE_FIELD:
+    if code in _REDSHIFT_KEY_CODES:
         return _applied_redshift_key(code, evidence, before_phys, after_phys), None
     if code == _MAINTENANCE_CODE:
         return _applied_maintenance(evidence, before_phys, after_phys), None
@@ -1101,6 +1158,14 @@ def verdicts(before: dict[str, object], after: dict[str, object]) -> list[Propos
             outcome = _grade(mean_before, mean_after)
             if applied is True and outcome is VerifyOutcome.UNCHANGED:
                 notes.append("Applied but unchanged: the work was done and did not help.")
+
+        if code == _ADVISOR_CODE:
+            # Concern 3 (fix round 1): ADV105's applied signal is Advisor's own row
+            # disappearing, not this project's own catalog read — a disclosed, weaker
+            # kind of evidence than every other code's physical_state delta, regardless
+            # of how comparable the two windows are. No ADV105 verdict may claim more
+            # than MEDIUM, even under a DISJOINT or COMPARABLE window.
+            confidence = _cap_confidence(confidence, Confidence.MEDIUM)
 
         results.append(
             ProposalVerdict(
