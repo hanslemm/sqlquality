@@ -1441,6 +1441,19 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         #: — kept for the identical reason: `physical_state` reads this instead of
         #: re-querying `pg_index` for a payload field.
         self._indexes_cache: dict[Relation, tuple[PgIndex, ...]] = {}
+        #: Every relation ever *asked about* in a `fetch_table_facts` call — the full
+        #: `relations` argument, not merely the ones `CAP_TABLE_FACTS` returned a row for.
+        #: `_ordinary_tables` alone cannot tell "asked, and it is not an ordinary table"
+        #: apart from "never asked at all" — both leave the relation absent from it — and
+        #: conflating the two is exactly how `physical_state` used to report a relation
+        #: outside `aggregation.tables` (e.g. a dbt-enriched ADV303 proposal) as a hard
+        #: `is_ordinary_table: False` when the truth is "this run never looked."
+        self._table_facts_requested: set[Relation] = set()
+        #: The same tracking for `fetch_indexes`, for the identical reason applied to
+        #: `_indexes_cache`: that cache only ever receives relations `CAP_INDEXES`
+        #: returned at least one row for, so "genuinely has no indexes" and "never asked"
+        #: are otherwise indistinguishable.
+        self._indexes_requested: set[Relation] = set()
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1585,6 +1598,11 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # only `sales.orders` still returns `staging.orders`, because the bare-name filter
         # cannot distinguish the two. That row's relation key then simply has no consumer,
         # since only the relations in `relations` are ever assembled into the result below.
+        # Recorded before the statement even runs: `physical_state` must be able to tell
+        # "asked about, and CAP_TABLE_FACTS said no" apart from "never asked" — see
+        # `_table_facts_requested`'s docstring — and that distinction is about what this
+        # method was *called with*, not about what came back.
+        self._table_facts_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         sizes = {
             Relation(schema=str(schema_name), table=str(name)): (
@@ -1652,6 +1670,12 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # earlier version of this comment claimed the over-fetched rows had "no consumer",
         # and ADV003 was that consumer, emitting `DROP INDEX` for relations the workload
         # never touched whenever a bare name collided across two requested schemas.
+        #
+        # Recorded before the statement runs, same reasoning as `fetch_table_facts`'s
+        # identical line: `physical_state` needs to know this relation was asked about at
+        # all, distinct from whatever `_indexes_cache` ends up holding for it — see
+        # `_indexes_requested`'s docstring.
+        self._indexes_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         grouped: dict[tuple[Relation, str], _IndexRows] = {}
         for row in self._run(CAP_INDEXES, (list(schemas), wanted)):
@@ -1715,29 +1739,47 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         self._indexes_cache.update(built)
         return built
 
-    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict]:
-        """See `WorkloadAdapter.physical_state`. Reads `_ordinary_tables` and
-        `_indexes_cache`, both populated as a side effect of `fetch_table_facts` and
-        `fetch_indexes` during `propose()` — no statement is issued here.
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict[str, object]]:
+        """See `WorkloadAdapter.physical_state`. Reads `_ordinary_tables`,
+        `_indexes_cache`, `_table_facts_requested` and `_indexes_requested` — all
+        populated as a side effect of `fetch_table_facts` and `fetch_indexes` during
+        `propose()` — no statement is issued here.
 
-        `is_ordinary_table` is `relation in self._ordinary_tables` — see that attribute's
-        docstring: `False` means the relation is a view, a foreign table, or a partitioned
-        parent, exactly the ADV301 "the relation became a table" signal `verify` needs,
-        with no new catalog query. A relation this run never fetched facts for at all
-        (because the analysis never needed them) reads the same way: absent from the
-        cache, hence `False` — an honest "nothing fetched" rather than a guess.
+        `is_ordinary_table` is `relation in self._ordinary_tables` **only when this run
+        actually asked CAP_TABLE_FACTS about `relation` and that capability was not
+        denied** — `relation in self._table_facts_requested and CAP_TABLE_FACTS not in
+        self.degraded`. Under that condition, `False` means the relation is a view, a
+        foreign table, or a partitioned parent — exactly the ADV301 "the relation became
+        a table" signal `verify` needs, with no new catalog query. Otherwise the field is
+        `None`: a relation this run never fetched facts for at all (e.g. a dbt-enriched
+        ADV303 proposal for a relation outside `aggregation.tables`, which
+        `fetch_table_facts` is simply never called with) and a relation whose
+        `CAP_TABLE_FACTS` read was denied both leave `_ordinary_tables` looking identical
+        — empty for that relation — so only tracking "was it asked about, and did the
+        capability survive" tells them apart from a genuine "asked, and it is not an
+        ordinary table." Reporting `False` for either would read to `verify` as a
+        measurement, not as "this run could not tell you," and a later run that *does*
+        observe the relation would then look like the relation was just created.
 
-        Each index's `columns` is its `PgIndex.columns` tuple exactly as read elsewhere in
-        this module (`_covered`, ADV002, ADV003) — for an expression index this
-        understates it, since an expression position contributes no column name (see
+        `indexes` follows the identical discipline against `_indexes_requested` and
+        `CAP_INDEXES`: `None` unless this run asked about `relation` and the read
+        succeeded, in which case it is the real (possibly empty) list — `[]` is a
+        measurement ("fetched, and it genuinely has none"), never a stand-in for "did not
+        look." Each index's `columns` is its `PgIndex.columns` tuple exactly as read
+        elsewhere in this module (`_covered`, ADV002, ADV003) — for an expression index
+        this understates it, since an expression position contributes no column name (see
         `PgIndex.has_expressions`'s docstring), and is recorded as-is here rather than
         inventing a second, unused-elsewhere convention for it.
         """
-        state: dict[str, dict] = {}
+        facts_degraded = any(cap == CAP_TABLE_FACTS for cap, _ in self.degraded)
+        indexes_degraded = any(cap == CAP_INDEXES for cap, _ in self.degraded)
+        state: dict[str, dict[str, object]] = {}
         for relation in sorted(relations):
-            state[str(relation)] = {
-                "is_ordinary_table": relation in self._ordinary_tables,
-                "indexes": [
+            have_facts = relation in self._table_facts_requested and not facts_degraded
+            have_indexes = relation in self._indexes_requested and not indexes_degraded
+            indexes: list[dict[str, object]] | None = None
+            if have_indexes:
+                indexes = [
                     {
                         "name": index.name,
                         "columns": list(index.columns),
@@ -1745,7 +1787,10 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
                         "is_unique": index.is_unique,
                     }
                     for index in self._indexes_cache.get(relation, ())
-                ],
+                ]
+            state[str(relation)] = {
+                "is_ordinary_table": (relation in self._ordinary_tables) if have_facts else None,
+                "indexes": indexes,
             }
         return state
 

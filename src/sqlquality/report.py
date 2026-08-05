@@ -145,7 +145,7 @@ def advise_payload(
     degraded: list[tuple[str, str]],
     dbt: dict | None = None,
     window_facts: dict[str, object] | None = None,
-    physical_state: dict[str, dict] | None = None,
+    physical_state: dict[str, dict[str, object]] | None = None,
 ) -> dict:
     """JSON-serializable summary of an advise run.
 
