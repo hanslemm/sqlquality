@@ -1716,6 +1716,68 @@ def test_applied_redshift_distkey_true_only_when_diststyle_parses_to_the_propose
     assert verdict_mismatch.applied is False
 
 
+# --- Concern 1, fix round 2 (overrules fix round 1's "closed vocabulary" argument) ------
+
+
+def test_concern_1_round_2_an_unrecognized_diststyle_is_none_a_recognized_mismatch_is_still_false():
+    """Redshift's introspection SQL has never been executed against a live cluster
+    (CHANGELOG.md, README.md) — every `diststyle` shape this module recognizes comes from
+    AWS's documentation alone, not observation, so a string that matches *none* of those
+    documented shapes must read as "we could not tell" (`None`), never as a guessed
+    `False`: reporting a parse failure as a measurement is the same error Task 2's
+    Critical fixed one layer down. A string that *does* match a recognized, different
+    shape (`EVEN`, here) is still a genuine `False` — the fix must not collapse into
+    "everything unknown", only into "unparseable is unknown"."""
+    before = {
+        "proposals": [
+            {
+                "code": "ADV102",
+                "evidence": {
+                    "schema": "public",
+                    "table": "orders",
+                    "column": "customer_id",
+                    "current_diststyle": "EVEN",
+                },
+                "ddl": None,
+            }
+        ],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
+        "query_groups": [],
+        "window": {
+            "description": "d",
+            "engine": "redshift",
+            "stats_reset_at": None,
+            "since": None,
+            "since_duration_seconds": None,
+            "limit": 500,
+        },
+    }
+
+    # Unrecognized text — not one of AWS's documented shapes at all -> cannot tell.
+    after_unrecognized = {
+        "proposals": [],
+        "physical_state": {
+            "public.orders": {"is_ordinary_table": True, "diststyle": "SOMETHING_UNDOCUMENTED"}
+        },
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_unrecognized] = verdicts(before, after_unrecognized)
+    assert verdict_unrecognized.applied is None
+    assert "did not match any recognized shape" in verdict_unrecognized.note
+
+    # Recognized, but a genuinely different shape (EVEN, not KEY(customer_id)) -> a real
+    # measurement, still False, not swept into "unknown" alongside the case above.
+    after_recognized_mismatch = {
+        "proposals": [],
+        "physical_state": {"public.orders": {"is_ordinary_table": True, "diststyle": "EVEN"}},
+        "query_groups": [],
+        "window": before["window"],
+    }
+    [verdict_recognized_mismatch] = verdicts(before, after_recognized_mismatch)
+    assert verdict_recognized_mismatch.applied is False
+
+
 def test_applied_redshift_diststyle_all_true_only_for_alls_own_shape():
     before = {
         "proposals": [
