@@ -1307,9 +1307,19 @@ def test_ruling_2_a_limit_mismatch_forbids_a_disappeared_verdict():
 
 def test_ruling_3_confidence_never_exceeds_the_window_ceiling():
     """A strong, genuine improvement must not out-claim the window comparison it rests
-    on: INCOMPARABLE caps at LOW, NESTED caps at MEDIUM, however dramatic the mean drop."""
-    before_incomparable = _payload(groups=[("aaa", 10, 1000.0)], engine="postgres")
-    after_incomparable = _payload(groups=[("aaa", 10, 100.0)], engine="redshift")
+    on: INCOMPARABLE caps at LOW, NESTED caps at MEDIUM, however dramatic the mean drop.
+
+    **The INCOMPARABLE half deliberately no longer uses two different engines** (it did
+    until Task 7 added `ArtifactMismatch.ENGINE`): a cross-engine pair is now refused as
+    incommensurable rather than graded at `LOW`, because "the query got 10x faster" across
+    two different servers is not a weak claim, it is a meaningless one. A one-sided
+    `since_duration_seconds` is the same-engine route to `INCOMPARABLE` — one run restricted
+    its window with `--since` and the other did not — so this test still pins the ceiling
+    itself rather than the refusal that now covers the engine case
+    (`test_cross_engine_artifacts_claim_no_group_level_verdict` covers that)."""
+    before_incomparable = _payload(groups=[("aaa", 10, 1000.0)], since_duration_seconds=604800.0)
+    after_incomparable = _payload(groups=[("aaa", 10, 100.0)], since_duration_seconds=None)
+    assert classify_windows(before_incomparable, after_incomparable) is WindowRelation.INCOMPARABLE
     [verdict_incomparable] = verdicts(before_incomparable, after_incomparable)
     assert verdict_incomparable.outcome is VerifyOutcome.IMPROVED
     assert verdict_incomparable.confidence is Confidence.LOW
@@ -2737,6 +2747,25 @@ def test_redaction_changes_the_digest_so_the_specs_stable_across_runs_claim_is_c
     )
 
 
+#: Every phrasing in `verdicts` that states, as a fact about the user's workload, whether
+#: this proposal's cited query groups are in the after run. A pair that shares no
+#: coordinate system must make **none** of these claims, in any wording — asserting only
+#: `"no longer appear" not in note` (this guard's first version) pinned one branch's exact
+#: words and left its two siblings, "absent from the after run" and "present in the after
+#: run", free to say the same thing in a different sentence. Sinking the incomparability
+#: branch below the `applied is None` branch did exactly that, and survived the whole suite.
+_GROUP_LEVEL_CLAIMS: Sequence[str] = (
+    "no longer appear in the after run",
+    "absent from the after run",
+    "present in the after run",
+)
+
+
+def _assert_no_group_level_claim(note: str) -> None:
+    for claim in _GROUP_LEVEL_CLAIMS:
+        assert claim not in note, f"note claims {claim!r} for an incommensurable pair: {note!r}"
+
+
 def test_finding_b_a_redaction_mismatch_claims_no_group_level_verdict():
     """The reachable false claim. Same relation, same index genuinely created, the cited
     group still running in `after` — but recorded under a digest the `before` run would never
@@ -2762,7 +2791,7 @@ def test_finding_b_a_redaction_mismatch_claims_no_group_level_verdict():
     # the shape a reader interprets as "the query stopped running".
     assert verdict.mean_before is None and verdict.mean_after is None
     assert "redaction" in verdict.note
-    assert "no longer appear" not in verdict.note
+    _assert_no_group_level_claim(verdict.note)
     assert "IMPROVED" not in verdict.note
 
     # The control, and the reason this is not a blanket refusal: the identical pair with the
@@ -2846,6 +2875,118 @@ def test_artifact_incomparabilities_is_callable_on_its_own_for_task_7s_refusal_l
     assert found[0].detail and found[0].detail.endswith(".")
     # The values that disagree are named, so the CLI does not have to re-derive them.
     assert "redacted=True" in found[0].detail and "redacted=False" in found[0].detail
+
+
+def test_an_incomparable_pair_claims_no_absence_even_when_application_is_unobservable():
+    """Ruling 5 of Task 7, and the reason the incomparability branch must sit **above** the
+    `applied is None` branch rather than merely somewhere in the chain.
+
+    An ADV005 rewrite has no catalog state, so `applied` is `None`; the two runs disagree about
+    redaction, so the cited digest cannot resolve in `after` no matter what the workload did.
+    That combination reaches the `applied is None` branch's `vanished` arm the moment the
+    incomparability check is sunk below it, and that arm says the cited groups "are absent from
+    the after run — possibly addressed (for example, by a query rewrite)". They are not absent:
+    they are recorded under a digest this pair cannot compute. The whole suite passed with that
+    mutation in place, because the one guard that existed asserted a *different* branch's exact
+    wording (`"no longer appear"`).
+
+    The `_payload` pair below is a shape `advise` can emit on both sides: one run with
+    `--keep-literals`, one without, over a workload whose hot statement changed."""
+    before = _payload(adv005=True, groups=[("aaa", 10, 1000.0)], limit=500, redacted=True)
+    after = _payload(adv005=True, groups=[("bbb", 10, 400.0)], limit=500, redacted=False)
+
+    # The premises, so this cannot pass for the wrong reason: application is genuinely
+    # unobservable, the cited digest genuinely does not resolve in `after`, and `after` did
+    # observe a healthy workload — i.e. the sunk branch really would reach `vanished`.
+    assert window_limits(before, after).may_be_sampling_artifact is False
+    assert set(group_index(after)) == {"bbb"}
+
+    [verdict] = verdicts(before, after)
+    assert verdict.applied is None
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.confidence is Confidence.LOW
+    assert verdict.mean_before is None and verdict.mean_after is None
+    assert "redaction" in verdict.note
+    _assert_no_group_level_claim(verdict.note)
+    assert "possibly addressed" not in verdict.note
+
+    # The control: the identical pair agreeing on redaction *does* reach the "possibly
+    # addressed… disappearance alone is not proof" reading, so the assertions above pin the
+    # incomparability, not a branch that never fires.
+    after_same = _payload(adv005=True, groups=[("bbb", 10, 400.0)], limit=500, redacted=True)
+    [verdict_same] = verdicts(before, after_same)
+    assert verdict_same.applied is None
+    assert "possibly addressed" in verdict_same.note
+
+
+# --- Task 7, Ruling 4: two engines are an incomparability, not a low-confidence verdict ---
+#
+# Carried over as Task 6's final open finding. `classify_windows` has always graded a
+# cross-engine pair `INCOMPARABLE`, but that is a confidence *ceiling* — the pair still reached
+# a group-level outcome, and `artifact_incomparabilities` returned `()`, so a direct API caller
+# got `DISAPPEARED, mean_before=100.0, mean_after=None, "no longer appear"` for a Postgres query
+# whose absence from a *Redshift* artifact says nothing whatsoever about it.
+
+
+def test_cross_engine_artifacts_claim_no_group_level_verdict():
+    """The exact pair the finding was reported from: a Postgres `before` whose cited group is
+    absent from a Redshift `after`. `LOW` is not a grade at which "this query stopped running"
+    becomes honest, so this is refused as incommensurable rather than graded weakly."""
+    before = _payload(groups=[("aaa", 10, 1000.0)], limit=500, engine="postgres")
+    after = _payload(groups=(), limit=500, engine="redshift")
+
+    # Neither of the other pair-level gates can see this: the limits match, nothing is
+    # degraded, and both runs agree about redaction.
+    assert window_limits(before, after).may_be_sampling_artifact is False
+    assert before["degraded"] == [] and after["degraded"] == []
+    assert before["redacted"] == after["redacted"]
+
+    [item] = artifact_incomparabilities(before, after)
+    assert item.mismatch is ArtifactMismatch.ENGINE
+    # Both engines named, so the CLI does not have to re-derive them for its refusal.
+    assert "postgres" in item.detail and "redshift" in item.detail
+
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.confidence is Confidence.LOW
+    assert verdict.mean_before is None and verdict.mean_after is None
+    _assert_no_group_level_claim(verdict.note)
+
+    # The control: the identical `after`, on the same engine, still grades the genuine
+    # disappearance — this is a refusal about the pair, not a blanket silencing.
+    after_same_engine = _payload(groups=(), limit=500, engine="postgres")
+    [verdict_same] = verdicts(before, after_same_engine)
+    assert verdict_same.outcome is VerifyOutcome.DISAPPEARED
+
+
+def test_an_unreadable_engine_is_disclosed_rather_than_assumed_to_match():
+    """The defensive arm, mirroring `REDACTION`'s exactly — and needed for the same reason:
+    two *missing* engines compare equal to each other, which is the "both null therefore
+    presumably the same" inference `WindowRelation.INCOMPARABLE`'s docstring already forbids
+    for `stats_reset_at`. `classify_windows` grades such a pair `INCOMPARABLE` already; this
+    arm is what stops it also earning a group-level outcome at `LOW`."""
+    before = _payload(groups=[("aaa", 10, 1000.0)])
+    after = _payload(groups=[("aaa", 10, 400.0)])
+    for payload in (before, after):
+        window = payload["window"]
+        assert isinstance(window, dict)
+        del window["engine"]
+    [item] = artifact_incomparabilities(before, after)
+    assert item.mismatch is ArtifactMismatch.ENGINE
+    assert "readable" in item.detail
+    [verdict] = verdicts(before, after)
+    assert verdict.outcome is VerifyOutcome.UNOBSERVABLE
+    assert verdict.mean_before is None and verdict.mean_after is None
+
+    # One side unreadable, and a non-string value, are the same situation.
+    one_sided = _payload(groups=[("aaa", 10, 400.0)])
+    [one_sided_item] = artifact_incomparabilities(before, one_sided)
+    assert "readable" in one_sided_item.detail
+    bad = _payload(groups=[("aaa", 10, 400.0)])
+    bad_window = bad["window"]
+    assert isinstance(bad_window, dict)
+    bad_window["engine"] = 7
+    assert artifact_incomparabilities(_payload(groups=[("aaa", 10, 400.0)]), bad)
 
 
 def test_every_artifact_mismatch_is_classified():

@@ -530,6 +530,23 @@ def window_limits(before: dict[str, object], after: dict[str, object]) -> Window
     )
 
 
+def _payload_engine(payload: dict[str, object]) -> str | None:
+    """The engine this artifact's window reports, or `None` when it is missing/not a string.
+
+    Reads `payload["window"]["engine"]`, the same field `classify_windows` compares, rather
+    than the top-level `payload["engine"]`. `advise_payload` writes both from one argument,
+    so a real artifact cannot disagree with itself here; reading the field this module
+    already reads keeps one source of truth for "which server did this run measure", and
+    keeps `artifact_incomparabilities` consistent with the relation `classify_windows`
+    grades from the same value.
+    """
+    window = payload.get("window")
+    if not isinstance(window, dict):
+        return None
+    engine = window.get("engine")
+    return engine if isinstance(engine, str) else None
+
+
 class ArtifactMismatch(str, Enum):
     """A pair-level fact that makes two artifacts' **query-group identities** incommensurable
     — deliberately a separate concept from both `Absence` and `WindowRelation.INCOMPARABLE`.
@@ -550,17 +567,30 @@ class ArtifactMismatch(str, Enum):
       confidence at which such a comparison could be reported, so `verdicts` claims no
       group-level outcome and no mean at all — see `artifact_incomparabilities`.
 
-    `REDACTION` is the one member today (fix round 5, review finding B). `--keep-literals`
-    changes the canonical query text `fingerprint_id` hashes, so two runs differing only in
-    that flag produce disjoint `query_groups` key sets from an identical workload. Before
-    this fix `verify` read that as `DISAPPEARED` — "Cited query group(s) no longer appear in
-    the after run" — for a query still running, with no degradation anywhere and the
-    recommendation genuinely applied. That is the governing rule's exact violation (an
-    absence produced by one run's own settings reported as a measurement about the user's
-    database) through a door the `degraded`-based gate structurally cannot see.
+    `REDACTION` (fix round 5, review finding B). `--keep-literals` changes the canonical
+    query text `fingerprint_id` hashes, so two runs differing only in that flag produce
+    disjoint `query_groups` key sets from an identical workload. Before this fix `verify`
+    read that as `DISAPPEARED` — "Cited query group(s) no longer appear in the after run" —
+    for a query still running, with no degradation anywhere and the recommendation genuinely
+    applied. That is the governing rule's exact violation (an absence produced by one run's
+    own settings reported as a measurement about the user's database) through a door the
+    `degraded`-based gate structurally cannot see.
+
+    `ENGINE` (Task 7, closing Task 6's final open finding). Two artifacts from two different
+    engines describe two different servers, so no query group in one corresponds to anything
+    in the other — and a Redshift `digest` and a Postgres one are computed from differently
+    normalized text besides. `classify_windows` has always graded such a pair `INCOMPARABLE`,
+    but that is only a confidence ceiling: a cross-engine pair still reached a group-level
+    outcome, and a `before`-only group was reported as `DISAPPEARED, mean_before=100.0,
+    mean_after=None, "no longer appear"` — the same false claim `REDACTION` fixes, arrived at
+    through a wider door. `LOW` is not a grade at which "the query stopped running" becomes
+    honest, so this is an incomparability rather than a confidence cap. `verify`'s CLI refuses
+    such a pair outright; this member is what protects a direct API caller, which was
+    unreachable-by-CLI but never unreachable-by-import.
     """
 
     REDACTION = "redaction"
+    ENGINE = "engine"
 
 
 #: What each `ArtifactMismatch` makes incommensurable, as a noun phrase for the disclosure
@@ -571,6 +601,9 @@ _MISMATCH_EFFECT: Final[dict[ArtifactMismatch, str]] = {
     ArtifactMismatch.REDACTION: (
         "every query-group digest, and the key of every statement-scoped proposal "
         "(ADV005's leading-wildcard branch, ADV006), which is a fingerprint"
+    ),
+    ArtifactMismatch.ENGINE: (
+        "every query group, every relation and every timing the two artifacts record"
     ),
 }
 
@@ -596,8 +629,18 @@ def artifact_incomparabilities(
 ) -> tuple[Incomparability, ...]:
     """Every reason `before` and `after` do not share a query-group coordinate system.
 
-    Empty when they do. **Callable independently of `verdicts`, and meant to be** — Task 7
-    should consult it before rendering anything (see `Incomparability`).
+    Empty when they do. **Callable independently of `verdicts`, and meant to be** — the
+    `verify` command consults it before rendering anything and refuses the pair, rendering
+    every `detail` once instead of once per proposal (see `Incomparability`).
+
+    `ENGINE` is checked first, exactly as `classify_windows` checks it first: a Postgres mean
+    and a Redshift mean measure different servers, and no other fact can override that. Read
+    through `_payload_engine` (`window["engine"]`), reported for **either** a readable
+    disagreement or an unreadable value on one/both sides — the same two conditions, for the
+    same reason, as `REDACTION` below. Both-unreadable matters on its own: two `None`s compare
+    *equal*, so without the readability arm a pair of truncated artifacts would silently earn a
+    full group-level verdict on the inference `WindowRelation.INCOMPARABLE`'s docstring already
+    forbids for `stats_reset_at`.
 
     `REDACTION`: `payload["redacted"]` is `not keep_literals` (cli.py), and redaction
     rewrites the canonical text that `fingerprint_id` hashes into a `digest`. So two runs
@@ -621,6 +664,35 @@ def artifact_incomparabilities(
     entry point in this module.
     """
     found: list[Incomparability] = []
+    engine_effect = _MISMATCH_EFFECT[ArtifactMismatch.ENGINE]
+    before_engine = _payload_engine(before)
+    after_engine = _payload_engine(after)
+    if before_engine is None or after_engine is None:
+        found.append(
+            Incomparability(
+                mismatch=ArtifactMismatch.ENGINE,
+                detail=(
+                    "At least one run does not record a readable engine in its window "
+                    f"(before={before_engine!r}, after={after_engine!r}), so whether the two "
+                    "runs measured the same database server cannot be established — and that "
+                    f"is what decides whether {engine_effect} can be compared at all. No "
+                    "query-group comparison is claimed."
+                ),
+            )
+        )
+    elif before_engine != after_engine:
+        found.append(
+            Incomparability(
+                mismatch=ArtifactMismatch.ENGINE,
+                detail=(
+                    f"The two runs measured different engines (before={before_engine}, "
+                    f"after={after_engine}). Those are two different database servers, so "
+                    f"{engine_effect} belongs to a different system on each side: nothing in "
+                    "one artifact corresponds to anything in the other. No query-group "
+                    "comparison is claimed."
+                ),
+            )
+        )
     before_redacted = before.get("redacted")
     after_redacted = after.get("redacted")
     effect = _MISMATCH_EFFECT[ArtifactMismatch.REDACTION]

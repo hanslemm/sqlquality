@@ -9,12 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`sqlquality verify BEFORE AFTER`** — a new, **fully offline** command that diffs two
+  `advise --json` artifacts and reports, per proposal, whether the advice was **applied**
+  (observed from the two runs' recorded `physical_state`, never declared or asked) and
+  whether the query groups that justified it actually got **faster per call**. It reads two
+  files, connects to nothing and needs no credentials, so anyone reviewing a change can run
+  it. `--json` and `--markdown PATH` mirror `advise`'s options; it exits 0 whenever a
+  comparison was reported and 2 when it was refused, never 1 — `verify` reports and never
+  gates, and there is deliberately no `--gate` flag.
+
+  Each proposal gets an outcome (`improved`, `unchanged`, `regressed`, `disappeared`,
+  `not_applied`, `unobservable`) and a confidence taken from how comparable the two
+  **windows** are. The valuable one is **applied but unchanged**: the work was done and it
+  did not help.
+
+  **Mean time per call is the metric; `cost_share` rides along only as context.** On
+  Postgres `pg_stat_statements` is cumulative, so a group's share of the window falls simply
+  because a week of other traffic accumulated — `cost_share` measures whether a finding
+  still *matters*, never whether it got *better*. The workload-context line prints both
+  runs' total window cost and query-group count so a global workload shift is visible
+  rather than deduced.
+
+  **On the common Postgres path (counters baselined once and never reset) the two windows
+  are *nested*: the later one contains the earlier one, so a real improvement is
+  understated** — sometimes badly enough that a proposal which genuinely helped reads as
+  `unchanged`. `verify` says so in the caveat it prints on every such run, caps those
+  verdicts at medium confidence, and names the remedy (call `pg_stat_statements_reset()`
+  yourself right after applying a change and take the after artifact from there —
+  sqlquality never writes to your database, this reset included).
+
+  **`verify` refuses rather than guesses** (exit 2, with the reason): an unreadable,
+  non-UTF-8, malformed or non-object JSON file; an artifact missing the keys this release
+  added, i.e. one produced by 0.3.0 or an intermediate build — regenerate it rather than let
+  a verdict rest on absent data; the same artifact twice (identical path, or byte-identical
+  content, which two genuinely distinct runs cannot produce since the counters accumulate);
+  two artifacts from **different engines**; two runs that **disagree about literal
+  redaction** (`--keep-literals` changes the canonical query text every query-group digest
+  is computed from, so the same query group is recorded under different identifiers in the
+  two artifacts — an absence there is not a measurement); and a pair whose artifacts are
+  demonstrably **swapped**, which is detectable only when both runs report a
+  `stats_reset_at` and the after run's is earlier, since a server's statistics-reset instant
+  cannot move backwards.
+
+  Everything else that limits what the comparison can claim is **disclosed rather than
+  folded silently into a verdict**: the window relation and what it does to confidence; that
+  run order is otherwise taken from the argument order (an `advise` artifact carries no run
+  timestamp, deliberately, so its bytes stay reproducible); a `--limit` mismatch, which
+  makes a group missing from one artifact possibly a sampling artifact rather than a real
+  disappearance; each run's `degraded` capabilities, since a read that could not run
+  produces the same emptiness a real change would; recommendations whose key matched more
+  than one proposal within their *own* artifact, which are reported as unmatched rather than
+  as disappeared or new; and proposals only the after run makes, which are new findings
+  rather than changed ones.
+
 - `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
   relation some proposal targets *or* the run's workload analysis touched
   (`aggregation.tables`): Postgres records `is_ordinary_table` and each existing index's
   `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
-  `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence the
-  upcoming `sqlquality verify` command diffs between two artifacts to tell whether a
+  `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence
+  `sqlquality verify` diffs between two artifacts to tell whether a
   proposal was actually applied — observed from what the run's own catalog reads already
   returned, never a second round trip. Scoped to the union, not to proposal relations alone: a
   relation whose proposal got resolved between two runs (the recommended index now
@@ -39,7 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the same 12-character id as `evidence["fingerprint"]`/`evidence["fingerprint_digests"]`),
   `calls`, `total_time_ms`, and `mean_ms` (`total_time_ms / calls`, or `null` — never
   `0.0` — when `calls` is `0`, since a group with no recorded calls has no meaningful mean
-  to report). This is the workload evidence the upcoming `sqlquality verify` command
+  to report). This is the workload evidence `sqlquality verify`
   compares against a later run's timings for the same query groups. The key is always
   present, `[]` when the run analysed no query groups at all, for the same reason
   `physical_state` is: an absent key marks a pre-this-feature artifact, distinct from a
@@ -84,8 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `advise --json`'s `"window"` key is now an object —
   `{"description": str, "engine": str, "stats_reset_at": str | None, "since": str | None,
   "since_duration_seconds": float | None, "limit": int | None}` — rather than the bare
-  prose string it was in 0.3.0. A sentence cannot be compared across two runs, and the
-  upcoming `sqlquality verify` command needs to tell whether a baseline and a follow-up
+  prose string it was in 0.3.0. A sentence cannot be compared across two runs, and
+  `sqlquality verify` needs to tell whether a baseline and a follow-up
   windows are disjoint, nested (Postgres's cumulative `pg_stat_statements` counters were
   never reset between the two, so the baseline is really a subset of the follow-up) or
   otherwise comparable before it can grade its own confidence. The old `description`
