@@ -22,6 +22,7 @@ which is to say, against the assumption itself.
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse, urlunparse
 
 import pytest
 from typer.testing import CliRunner
@@ -34,6 +35,11 @@ runner = CliRunner()
 _SCHEMA = "verify_command_it"
 _ROWS = 200_000
 _STATUS_BUCKETS = 2_000
+#: A database that has never had `CREATE EXTENSION pg_stat_statements` run in it, so `advise`'s
+#: workload read genuinely fails there. Named for this test so a leftover from a crashed run is
+#: identifiable, and distinct from `test_verify_degraded_after_live.py`'s so the two cannot
+#: interfere.
+_BARE_DATABASE = "sqlquality_verify_command_it"
 
 
 @pytest.fixture
@@ -173,6 +179,93 @@ def test_the_verify_command_closes_the_loop_over_two_real_artifacts(command_sche
     text = markdown.read_text(encoding="utf-8")
     assert "# sqlquality verify — postgres" in text
     assert f"ADV001 {_SCHEMA}.orders (status)" in text
+
+
+@pytest.fixture
+def bare_database(live_dsn: str):
+    """A throwaway database with no `pg_stat_statements` extension, dropped whether or not the
+    test passes.
+
+    `CREATE EXTENSION` is per-database, so a fresh database simply has no view for `advise` to
+    read — which is also the single most ordinary way a real user meets this degradation.
+    Nothing about the shared database's extension, grants or counters is touched: revoking a
+    grant globally, or dropping the extension, would either reset the cumulative counters the
+    rest of this package depends on or leave a global mutation behind if this test failed
+    mid-way.
+    """
+    import psycopg
+
+    def dsn_for(database: str) -> str:
+        return urlunparse(urlparse(live_dsn)._replace(path=f"/{database}"))
+
+    with psycopg.connect(live_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f"DROP DATABASE IF EXISTS {_BARE_DATABASE} WITH (FORCE)")
+        cur.execute(f"CREATE DATABASE {_BARE_DATABASE}")
+    try:
+        yield dsn_for(_BARE_DATABASE)
+    finally:
+        with psycopg.connect(live_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {_BARE_DATABASE} WITH (FORCE)")
+
+
+def test_a_degraded_before_run_is_not_reported_as_a_finding_the_after_run_newly_found(
+    command_schema, bare_database, tmp_path
+):
+    """**F1 of the whole-branch review, reproduced the way review reproduced it: two real
+    `advise --json` runs, one against a database whose `pg_stat_statements` read genuinely
+    fails.**
+
+    `new_in_after` claimed every after-only proposal was "new rather than changed" — a statement
+    about the user's database inferred from the proposal's absence in `before`. It is false
+    whenever `before` could not look, and this is the reachable case: `advise` against a
+    database with no `pg_stat_statements` extension emits no proposals at all.
+
+    The unit-level twins in `tests/test_verify_cli.py` drive the same two routes through the
+    real `advise` path over a stubbed querier. This one exists because three findings on this
+    branch were first "reproduced" through paths production does not use: here the denial is a
+    real PostgreSQL failure, the artifacts are real files, and the assertions below check the
+    premise — that both runs recorded the same known `--limit`, so `may_be_sampling_artifact` is
+    `False` and nothing except the degraded-read arm can prevent the false claim.
+    """
+    dsn = command_schema
+    _run_query(dsn, times=5)
+
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    result = runner.invoke(
+        app, ["advise", "--dsn", bare_database, "--json", "--min-cost-share", "0.0"]
+    )
+    assert result.exit_code == 0, result.output
+    before_path.write_text(result.stdout, encoding="utf-8")
+    before = json.loads(result.stdout)
+    after = _write_artifact(dsn, after_path)
+
+    # The premise, from the two real artifacts rather than assumed.
+    assert [entry["capability"] for entry in before["degraded"]] == ["workload"], before["degraded"]
+    assert before["proposals"] == [], "the before run must make no proposal at all"
+    assert any(
+        p["code"] == "ADV001" and p["evidence"].get("table") == "orders" for p in after["proposals"]
+    ), (
+        f"the after run made no ADV001 for orders, so no 'new' claim is exercised: {after['proposals']}"
+    )
+    assert before["window"]["limit"] == after["window"]["limit"] is not None
+
+    verified = runner.invoke(app, ["verify", str(before_path), str(after_path), "--json"])
+    assert verified.exit_code == 0, verified.output
+    payload = json.loads(verified.stdout)
+    assert payload["new_in_after"], "no after-only proposal reached the claim"
+    assert payload["limit"]["may_be_sampling_artifact"] is False, (
+        "the --limit gate can fire here, so this test would not prove the degraded-read arm"
+    )
+    assert payload["new_in_after_withheld"] is not None
+    assert "workload" in payload["new_in_after_withheld"]
+    assert not any("new rather than changed" in caveat for caveat in payload["caveats"]), payload[
+        "caveats"
+    ]
+    assert any(
+        "cannot rule out that they were already true and unseen" in caveat
+        for caveat in payload["caveats"]
+    ), payload["caveats"]
 
 
 def test_the_command_refuses_one_real_artifact_passed_twice(command_schema, tmp_path):

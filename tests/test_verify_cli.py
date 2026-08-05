@@ -937,6 +937,135 @@ def test_a_proposal_only_the_after_run_makes_is_reported_as_new_not_as_a_verdict
     result = _verify(str(before), str(after))
     assert "appear only in the after run" in result.stderr
     assert "ADV001 public.orders (created_at)" in result.stderr
+    # The control for the two gated routes below: this pair's `before` run read everything and
+    # both runs sampled the same known number of query groups, so "new" is a claim the
+    # artifacts do support and it must still be made in as many words. Without this assertion,
+    # gating the claim *unconditionally* would leave the suite green.
+    assert "new rather than changed" in result.stderr
+    assert payload["new_in_after_withheld"] is None
+    assert "cannot be established" not in result.stderr
+
+
+def test_a_degraded_before_run_does_not_make_an_after_only_proposal_a_new_finding(
+    tmp_path, monkeypatch
+):
+    """**F1 of the whole-branch review — the fifth door of this feature's dominant defect
+    class, and the one that shipped.**
+
+    `new_in_after` announced every after-only proposal as "new rather than changed", inferred
+    purely from its absence in `before`. Here `before`'s `pg_stat_statements` read is denied, so
+    `before` emits no proposals at all — the recommendation is not new, the earlier run simply
+    could not look. Reproduced during review from two real `advise` runs on live PostgreSQL 16
+    (one database before `CREATE EXTENSION pg_stat_statements`, one after), and again here
+    through the same real `advise` path this whole file uses.
+
+    **The two assertions that make this the damning route rather than a variant of the next
+    test:** both runs record the same known `--limit`, so `may_be_sampling_artifact` is `False`
+    and the sampling gate structurally cannot fire — the *only* thing standing between the user
+    and the false claim is the degraded-read arm. And the caveat printed one bullet above
+    promises "any verdict resting on something being absent from that run says so", so before
+    the fix a single output contradicted itself.
+    """
+    before = _artifact(
+        tmp_path,
+        "before.json",
+        _advise_stdout(
+            monkeypatch,
+            {**_pg_rows(), "pg_stat_statements": RuntimeError("permission denied")},
+        ),
+    )
+    after = _pg_artifact(tmp_path, monkeypatch, "after.json")
+
+    before_payload = json.loads(before.read_text())
+    assert [d["capability"] for d in before_payload["degraded"]] == ["workload"]
+    assert before_payload["proposals"] == [], "the before run must make no proposal at all"
+
+    payload = _payload_of(before, after)
+    assert payload["new_in_after"] == [["ADV001", "public", "orders", "status"]]
+    assert payload["limit"]["may_be_sampling_artifact"] is False, (
+        "the --limit gate can fire here, so this test would not prove the degraded-read arm"
+    )
+    assert payload["new_in_after_withheld"] is not None
+    assert "workload" in payload["new_in_after_withheld"]
+
+    result = _verify(str(before), str(after))
+    assert result.exit_code == 0, result.output
+    # The false claim is gone…
+    assert "new rather than changed" not in result.stderr
+    # …the reason is named…
+    assert "cannot rule out that they were already true and unseen" in result.stderr
+    assert "degraded read(s) workload" in result.stderr
+    # …and the keys are still listed, because withholding them too would hide a genuinely new
+    # finding. The gate is on the claim, never on the disclosure.
+    assert "ADV001 public.orders (status)" in result.stderr
+
+
+def test_a_truncated_before_window_does_not_make_an_after_only_proposal_a_new_finding(
+    tmp_path, monkeypatch
+):
+    """F1's second route: a `before` run taken at a smaller `--limit`.
+
+    A window that sampled fewer query groups may never have held the evidence the later run's
+    proposal rests on. Review reproduced this live with `--limit 1` then `--limit 500`; here the
+    two runs record limits 1 and 500 in their windows, which is what `window_limits` reads.
+    Before the fix a sampling caveat *was* printed for this pair — but as a sibling bullet about
+    *disappearance*, never linked to the "new" claim, which stayed unqualified.
+
+    The degraded arm cannot be what fires: both runs' `degraded` lists are asserted empty.
+    """
+    before = _pg_artifact(tmp_path, monkeypatch, "before.json", "--limit", "1")
+    after = _pg_artifact(
+        tmp_path,
+        monkeypatch,
+        "after.json",
+        statement="select id from orders where created_at > $1",
+        indexed=True,
+        calls=1000,
+        total_ms=2000.0,
+    )
+    for path in (before, after):
+        assert json.loads(path.read_text())["degraded"] == [], path
+
+    payload = _payload_of(before, after)
+    assert payload["new_in_after"] == [["ADV001", "public", "orders", "created_at"]]
+    assert payload["limit"] == {"before": 1, "after": 500, "may_be_sampling_artifact": True}
+    assert payload["new_in_after_withheld"] is not None
+
+    result = _verify(str(before), str(after))
+    assert result.exit_code == 0, result.output
+    assert "new rather than changed" not in result.stderr
+    assert "cannot rule out that they were already true and unseen" in result.stderr
+    assert "--limit before=1, after=500" in result.stderr
+    assert "ADV001 public.orders (created_at)" in result.stderr
+
+
+def test_the_new_claim_and_the_disappeared_claim_are_gated_symmetrically(tmp_path, monkeypatch):
+    """The asymmetry was the tell, so it is what this test pins.
+
+    `DISAPPEARED` (a claim from absence in `after`) has always been forbidden under a `--limit`
+    mismatch; its mirror image (a claim from absence in `before`) had no gate at all until F1.
+    One `--limit`-mismatched pair, both directions asserted in one place, so a future edit
+    cannot restore the asymmetry by touching only one side.
+    """
+    before = _pg_artifact(tmp_path, monkeypatch, "before.json", "--limit", "1")
+    after = _pg_artifact(
+        tmp_path,
+        monkeypatch,
+        "after.json",
+        statement="select id from orders where created_at > $1",
+        indexed=True,
+        calls=1000,
+        total_ms=2000.0,
+    )
+    payload = _payload_of(before, after)
+    assert payload["limit"]["may_be_sampling_artifact"] is True
+    # The `after`-side direction: the before proposal's cited group is gone from `after`, and
+    # `disappeared` is refused for it.
+    outcomes = {v["outcome"] for v in payload["verdicts"]}
+    assert "disappeared" not in outcomes, payload["verdicts"]
+    # The `before`-side direction: the after-only proposal is not called new.
+    assert payload["new_in_after"], "no after-only proposal, so the mirror claim is not exercised"
+    assert payload["new_in_after_withheld"] is not None
 
 
 # --- structural pins ----------------------------------------------------------------------

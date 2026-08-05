@@ -589,9 +589,10 @@ DROP INDEX "public"."idx_orders_customer_ref";
 `--json` emits the same evidence as a structured payload (`analyzed`, `degraded`,
 `engine`, `physical_state`, `proposals`, `query_groups`, `redacted`, `skipped`, `window`,
 plus `dbt` when — and only when — a manifest was loaded). This is the first proposal from
-the run above, and the block is abridged: the real payload lists all five proposals under
-`proposals`, the `query_groups` list is trimmed to one entry, and a proposal's `evidence`
-carries whatever its own rule measured, so the exact key set varies by code.
+the run above, and the block is abridged in exactly two places: the real payload lists all
+five proposals under `proposals`, and the `query_groups` list is trimmed to one entry. The
+ADV001 object is complete — its `evidence` key set is the one a real ADV001 carries — but each
+rule's `evidence` holds whatever that rule measured, so the key set varies by code.
 
 ```console
 $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
@@ -600,7 +601,7 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     "query_groups": 3,
     "query_groups_in_window": 3,
     "tables": [
-      "orders"
+      "public.orders"
     ],
     "total_cost_ms": 925000.0
   },
@@ -625,7 +626,7 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
     {
       "code": "ADV001",
       "confidence": "high",
-      "ddl": "CREATE INDEX ON \"orders\" (\"status\");",
+      "ddl": "CREATE INDEX ON \"public\".\"orders\" (\"status\");",
       "evidence": {
         "calls": 15000,
         "co_occurring_fingerprints": 1,
@@ -633,18 +634,21 @@ $ sqlquality advise --dsn postgresql://readonly@db.internal/analytics --json
           "status"
         ],
         "cost_share": 0.6702702702702703,
+        "expression_indexes": [],
         "fingerprint_digests": [
           "d2e8aa0a67af"
         ],
         "leading_ndv": 500.0,
+        "partial_indexes_skipped": [],
         "roles": [
           "equality"
         ],
         "row_estimate": 5200000,
+        "schema": "public",
         "table": "orders"
       },
       "rationale": "These columns carry the table's hottest predicates and no existing index leads with them. Equality columns come first so the range column can be scanned last.",
-      "title": "Add index on orders(status)"
+      "title": "Add index on public.orders(status)"
     }
     /* … 4 more proposal objects, same shape … */
   ],
@@ -947,7 +951,15 @@ artifact rather than a real disappearance, so `disappeared` is not graded on tha
 each run's `degraded` capabilities (a read that could not run produces the same emptiness a
 real change would), recommendations whose key matched more than one proposal *within their
 own artifact* (reported as unmatched — neither disappeared nor new), and proposals only the
-after run makes (new findings, not changed ones).
+after run makes (no verdict, because there is nothing to compare them against).
+
+**An after-only proposal is only called a *new* finding when the before run's coverage
+supports that.** If the before run's reads were degraded, or its window sampled fewer (or an
+unknown number of) query groups, it may never have had the evidence to make that
+recommendation — so its absence is a fact about that run, not about your database. `verify`
+still lists those proposals, and says why it will not call them new. This is the same
+treatment a query group's absence from the *after* run already gets before `disappeared` may
+be graded; the two directions of the same reasoning are deliberately symmetric.
 
 ### check (the CI gate)
 

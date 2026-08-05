@@ -25,6 +25,7 @@ from sqlquality.verify import (
     classify_windows,
     confidence_for,
     index_proposals,
+    new_proposal_disclosure,
     window_limits,
 )
 from sqlquality.workload.fingerprint import fingerprint_id
@@ -556,6 +557,15 @@ class VerifyContext:
     Ruling 4 of Task 4: a key that identified two proposals in `before` is ambiguous there,
     not missing from there, so calling its `after` counterpart "new" would turn a local
     matching ambiguity into a claim about the user's database.
+
+    `new_in_after_withheld` is why those keys must **not** be called new — or `None` when
+    `before`'s coverage rules that out. Whole-branch review found the collision reasoning above
+    had been applied to one route onto that claim and not to the other two: a degraded `before`
+    run and a truncated `before` window produce the same absence with nothing having changed,
+    and neither was gated. See `verify.new_proposal_disclosure`, which is the gate, and
+    `verify.Absence.BEFORE_COUNTERPART`, which is the registry entry that makes it visible to
+    the completeness tests. Carried on the context rather than recomputed per surface so the
+    terminal, `--json` and markdown cannot disagree about it.
     """
 
     before: ArtifactFacts
@@ -564,6 +574,7 @@ class VerifyContext:
     ceiling: Confidence
     limits: WindowLimits
     new_in_after: tuple[tuple[str, ...], ...]
+    new_in_after_withheld: str | None
 
 
 def _artifact_float(payload: dict[str, object], section: str, field: str) -> float | None:
@@ -626,6 +637,7 @@ def verify_context(before: dict[str, object], after: dict[str, object]) -> Verif
         ceiling=confidence_for(relation),
         limits=window_limits(before, after),
         new_in_after=new_in_after,
+        new_in_after_withheld=new_proposal_disclosure(before, after),
     )
 
 
@@ -729,12 +741,27 @@ def verify_caveats(context: VerifyContext) -> list[str]:
                 "not a disappearance and not a new finding."
             )
     if context.new_in_after:
-        caveats.append(
-            f"{len(context.new_in_after)} proposal(s) appear only in the after run and "
-            "therefore carry no verdict: verify grades each before-run proposal against the "
-            "after run, and a finding with no counterpart to compare against is new rather "
-            f"than changed: {_keys_text(context.new_in_after)}."
-        )
+        # The claim is gated, the list never is. Calling these "new" is a statement about the
+        # user's database drawn from their absence in `before`, and `before` may simply not have
+        # been able to look — but withholding the keys as well would hide a genuinely new
+        # finding, which is the opposite failure. See `verify.new_proposal_disclosure`.
+        if context.new_in_after_withheld is None:
+            caveats.append(
+                f"{len(context.new_in_after)} proposal(s) appear only in the after run and "
+                "therefore carry no verdict: verify grades each before-run proposal against "
+                "the after run, and a finding with no counterpart to compare against is new "
+                f"rather than changed: {_keys_text(context.new_in_after)}."
+            )
+        else:
+            caveats.append(
+                f"{len(context.new_in_after)} proposal(s) appear only in the after run and "
+                "therefore carry no verdict: verify grades each before-run proposal against "
+                "the after run. Whether they are genuinely new cannot be established here — "
+                "the before run's coverage cannot rule out that they were already true and "
+                f"unseen. {context.new_in_after_withheld} "
+                f"Reported as such rather than as new findings: "
+                f"{_keys_text(context.new_in_after)}."
+            )
     return caveats
 
 
@@ -872,6 +899,11 @@ def verify_payload(
         "caveats": verify_caveats(context),
         "summary": verify_summary(verdicts),
         "new_in_after": [list(key) for key in context.new_in_after],
+        # Beside the key list, never only inside `caveats`: a machine consumer that reads
+        # `new_in_after` and reports "N new findings" reproduces the exact over-claim
+        # `new_proposal_disclosure` exists to prevent, one layer up. `null` means the before
+        # run's coverage does rule out "already true and unseen".
+        "new_in_after_withheld": context.new_in_after_withheld,
         "verdicts": [
             {
                 "key": list(verdict.key),

@@ -59,8 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disappearance; each run's `degraded` capabilities, since a read that could not run
   produces the same emptiness a real change would; recommendations whose key matched more
   than one proposal within their *own* artifact, which are reported as unmatched rather than
-  as disappeared or new; and proposals only the after run makes, which are new findings
-  rather than changed ones.
+  as disappeared or new; and proposals only the after run makes, which carry no verdict
+  because there is nothing to compare them against.
+
+  **Whether an after-only proposal is a *new* finding is itself a claim `verify` will not make
+  unless the before run's coverage supports it.** A before run whose reads were degraded, or
+  whose window sampled fewer (or an unknown number of) query groups, may simply never have had
+  the evidence to make that recommendation — so the absence is a fact about that run, not about
+  your database. In those cases the proposals are still listed, and the reason they cannot be
+  called new is stated: exactly the treatment a query group's absence from the *after* run
+  already gets before `disappeared` may be graded.
 
 - `advise --json` now carries `physical_state`, keyed by `"schema.table"` for each
   relation some proposal targets *or* the run's workload analysis touched
