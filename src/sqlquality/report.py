@@ -198,9 +198,14 @@ def advise_payload(
 
     The top-level `"query_groups"` key is a **different key from, and coexists with**,
     `payload["analyzed"]["query_groups"]` above — that one is an integer count (how many
-    query groups this run understood), this one is a `list[dict]` of the specific query
-    groups a proposal actually cites in its `evidence["fingerprint_digests"]`, each carrying
-    `digest`/`calls`/`total_time_ms`/`mean_ms`. Two keys of the same name holding different
+    query groups this run understood), this one is a `list[dict]` of **every** query group
+    `workload.stats` carries for this run, each with `digest`/`calls`/`total_time_ms`/
+    `mean_ms`. **Not scoped to what some proposal currently cites** — see
+    `_query_groups_payload`'s docstring for why a citation-scoped list (this key's original
+    shape) reproduced, one payload key over, the exact blind spot the sanctioned
+    `physical_state` widening above exists to close: a query group whose proposal got
+    resolved between two runs (so the later run no longer cites it) is precisely the case
+    `sqlquality verify` needs this list *for*. Two keys of the same name holding different
     types at different nesting levels of the same payload is unusual enough that a consumer
     should not have to discover it by surprise: JSON nesting disambiguates the two (one
     lives under `"analyzed"`, the other at the payload's root), and renaming the older,
@@ -262,27 +267,44 @@ def advise_payload(
         "physical_state": dict(physical_state or {}),
         # Always present too, for the identical reason — see this function's docstring for
         # why this coexists with (and is a different key from) "analyzed"."query_groups".
-        "query_groups": _query_groups_payload(proposals, workload),
+        # Scoped to the whole workload, not to `proposals`' citations — see
+        # `_query_groups_payload`'s docstring for why.
+        "query_groups": _query_groups_payload(workload),
     }
     if dbt is not None:
         payload["dbt"] = dbt
     return payload
 
 
-def _query_groups_payload(proposals: list[Proposal], workload: Workload) -> list[dict]:
-    """The workload query groups actually cited by some proposal's `fingerprint_digests`.
+def _query_groups_payload(workload: Workload) -> list[dict]:
+    """Every query group this run's workload carries — **not only the ones some proposal
+    currently cites.**
+
+    **This function's first version scoped the result to `proposals`' own
+    `fingerprint_digests` citations, and that was a Critical bug (Task 6's fix round 3),
+    the identical blind spot the sanctioned `physical_state` scoping fix (see
+    `advise_payload`'s docstring) closed one payload key over.** Walk the same happy path
+    that motivated that fix: run A proposes an index because a query group is slow; the
+    user creates the index; run B's rule no longer fires, so run B *cites* none of that
+    group's digest — and a citation-scoped `query_groups` would omit the group entirely
+    from `after`, even though it is still running, unchanged, twelve times over. `verify`
+    would then read the group's absence as `DISAPPEARED` and never reach `IMPROVED` in
+    exactly the success case this whole feature exists to celebrate. Task 3's original
+    rationale for scoping to citations — "a group nobody proposed on is not evidence *for
+    a proposal*" — is still true of evidence, but `query_groups` is not only evidence for
+    *this* run's proposals: it is the record `sqlquality verify` compares against a
+    *second* run, which cannot know in advance what the first run happened to cite, or
+    whether the second run will still cite it at all. So this now returns one entry per
+    group in `workload.stats`, unconditionally — bounded by the same `--limit` that
+    already bounds `workload.stats` itself, and countable in the payload today via
+    `analyzed.query_groups`/`analyzed.query_groups_in_window`, so a consumer is never
+    left guessing at how large this list can get.
 
     Every proposal that names a query group does so with a digest (see
-    `workload.fingerprint.fingerprint_id`), never the group's full canonical SQL — so this
-    is the one place a digest is resolved back to its timings, and it does so by recomputing
-    the same digest from each `QueryStat.fingerprint` and matching on that, rather than by
-    trusting any string a proposal's evidence happens to carry.
-
-    Scoped to *referenced* groups, not every group in `workload.stats`: a query group this
-    run only glanced at, without any rule finding it worth proposing on, is not evidence for
-    anything and would only bloat the payload. `verify` (a later task) needs exactly the
-    groups that back a proposal, to compare their timings against a later run's — not the
-    whole workload.
+    `workload.fingerprint.fingerprint_id`), never the group's full canonical SQL, so this
+    is still the one place a digest is resolved back to its timings — it recomputes the
+    same digest from each `QueryStat.fingerprint` rather than trusting any string a
+    proposal's evidence happens to carry; that part of the original design is unchanged.
 
     `mean_ms` is `None`, never `0.0`, for a group with zero recorded calls: a group that was
     never called has no meaningful mean latency to report, and `0.0` reads as "instant",
@@ -294,28 +316,19 @@ def _query_groups_payload(proposals: list[Proposal], workload: Workload) -> list
     not a fresh sort by digest: that order is already deterministic run-to-run for the same
     workload, and re-sorting by digest would throw away the cost ordering for no gain.
 
-    A surviving proposal's `fingerprint_digests` can cite *fewer* query groups than
-    actually motivated it: `PostgresWorkloadAdapter._collapse_index_prefixes` (and
-    `_dedupe_by_ddl` identically) discards a folded-in proposal's `evidence` entirely,
-    carrying forward only its rationale's distinguishing sentences — see that function's
-    own docstring. This never produces a dangling reference (every digest still cited
-    resolves to a real group here), but it does mean this function's output is only ever
-    as complete as what survived that collapse, not the full set of groups any rule ever
-    found compelling.
+    No longer takes `proposals` at all — it has nothing left to filter by. A dangling
+    citation is consequently no longer reachable from this function's side: every digest
+    any proposal's `fingerprint_digests` can possibly name resolves to an entry here,
+    since every group in `workload.stats` does, regardless of `PostgresWorkloadAdapter.
+    _collapse_index_prefixes`/`_dedupe_by_ddl` discarding an absorbed proposal's own
+    citations (Task 3) — that collapse can still narrow what a *proposal* cites, but it
+    can no longer narrow what `query_groups` *reports*.
     """
-    referenced: set[str] = set()
-    for proposal in proposals:
-        digests = proposal.evidence.get("fingerprint_digests")
-        if isinstance(digests, (tuple, list)):
-            referenced.update(str(d) for d in digests)
     groups = []
     for stat in workload.stats:
-        digest = fingerprint_id(stat.fingerprint)
-        if digest not in referenced:
-            continue
         groups.append(
             {
-                "digest": digest,
+                "digest": fingerprint_id(stat.fingerprint),
                 "calls": stat.calls,
                 "total_time_ms": stat.total_time_ms,
                 "mean_ms": (stat.total_time_ms / stat.calls) if stat.calls else None,

@@ -272,10 +272,10 @@ def test_physical_state_carries_what_the_adapter_reported():
     assert payload["physical_state"] == given
 
 
-def test_query_groups_is_always_present_and_empty_when_nothing_references_it():
+def test_query_groups_is_always_present_and_empty_when_the_workload_is_empty():
     """Like `physical_state`, this key must never be omitted: an *absent* `query_groups` is
     how `verify` (a later task) tells a pre-this-feature artifact apart from one that
-    genuinely has no proposal citing any query group."""
+    genuinely analysed no query groups at all."""
     payload = advise_payload(
         [],
         Workload(stats=(), window_description="w"),
@@ -288,10 +288,15 @@ def test_query_groups_is_always_present_and_empty_when_nothing_references_it():
     assert payload["query_groups"] == []
 
 
-def test_query_groups_excludes_a_group_no_proposal_references():
-    """Only digests some proposal actually cites belong here — a workload can contain query
-    groups this run merely observed without any rule finding them worth proposing on, and
-    those must not bloat the payload."""
+def test_query_groups_includes_every_group_regardless_of_citation():
+    """Task 6's fix round 3 (Critical): `query_groups` used to be scoped to digests some
+    proposal's `fingerprint_digests` cited — the identical blind spot the sanctioned
+    `physical_state` scoping fix closed one payload key over. A group `unreferenced` here
+    stands in for the exact real-world shape that bug missed: a group whose proposal
+    *resolved* between two `advise` runs (the recommended index now exists, so the rule
+    stops firing and stops citing the group) looks identical to a group nothing ever
+    proposed on — both are simply absent from every proposal's citations. `verify` needs
+    both, so `query_groups` now includes every group in `workload.stats`, cited or not."""
     referenced = QueryStat(fingerprint="select 1", sql="select 1", calls=10, total_time_ms=100.0)
     unreferenced = QueryStat(fingerprint="select 2", sql="select 2", calls=10, total_time_ms=100.0)
     proposal = Proposal(
@@ -310,8 +315,7 @@ def test_query_groups_excludes_a_group_no_proposal_references():
         degraded=[],
     )
     digests = {g["digest"] for g in payload["query_groups"]}
-    assert digests == {fingerprint_id("select 1")}
-    assert fingerprint_id("select 2") not in digests
+    assert digests == {fingerprint_id("select 1"), fingerprint_id("select 2")}
 
 
 def test_query_groups_reports_digest_calls_total_time_ms_and_mean_ms_per_field():
@@ -373,10 +377,11 @@ def test_mean_ms_is_null_rather_than_zero_when_a_group_has_no_calls():
 
 
 def test_query_groups_has_no_dangling_references_across_several_rules_firing_at_once():
-    """`query_groups` must contain exactly the digests some proposal cites, and every digest
-    a proposal cites must resolve to an entry in `query_groups` — a dangling digest would
-    make a proposal unverifiable by a later `verify` run. Exercised against several rules
-    firing together (ADV001, ADV007, ADV005, ADV006), not one rule in isolation: a
+    """Every digest a proposal cites must resolve to an entry in `query_groups` — a
+    dangling digest would make a proposal unverifiable by a later `verify` run — and,
+    since Task 6's fix round 3, `query_groups` also carries every *uncited* group in the
+    workload, not only what these proposals happen to cite. Exercised against several
+    rules firing together (ADV001, ADV007, ADV005, ADV006), not one rule in isolation: a
     single-rule test cannot catch a rule that forgets to route its usage's fingerprints
     through the same workload `report.py` reads back."""
     orders = Relation("public", "orders")
@@ -484,9 +489,10 @@ def test_query_groups_has_no_dangling_references_across_several_rules_firing_at_
             referenced.add(digest)
             assert digest in group_digests, f"{p.code} cites {digest}, absent from query_groups"
 
-    # No extras either: every group present was cited by something.
-    assert group_digests == referenced
-    assert fingerprint_id(fp_unreferenced) not in group_digests
+    # query_groups now covers every group workload.stats carries, cited or not (Task 6's
+    # fix round 3) -- the uncited group must still be present, not excluded.
+    assert fingerprint_id(fp_unreferenced) in group_digests
+    assert group_digests == {fingerprint_id(stat.fingerprint) for stat in workload.stats}
 
 
 def test_payload_is_json_serializable():

@@ -14,9 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`aggregation.tables`): Postgres records `is_ordinary_table` and each existing index's
   `name`/`columns`/`is_partial`/`is_unique`; Redshift records `is_ordinary_table`,
   `sortkey1`, `diststyle`, `unsorted` and `stats_off`. This is the physical evidence the
-  `sqlquality verify` command diffs between two artifacts to tell whether a proposal was
-  actually applied — observed from what the run's own catalog reads already returned,
-  never a second round trip. Scoped to the union, not to proposal relations alone: a
+  upcoming `sqlquality verify` command diffs between two artifacts to tell whether a
+  proposal was actually applied — observed from what the run's own catalog reads already
+  returned, never a second round trip. Scoped to the union, not to proposal relations alone: a
   relation whose proposal got resolved between two runs (the recommended index now
   exists, so the rule stops firing) would otherwise have no entry at all in the very run
   `verify` needs it in. The key itself is always present, even when empty: an *absent*
