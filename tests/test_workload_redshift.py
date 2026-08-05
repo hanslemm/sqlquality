@@ -314,6 +314,49 @@ def test_redshift_physical_state_reports_absence_as_not_an_ordinary_table():
     assert entry["stats_off"] is None
 
 
+def test_redshift_never_fetched_relation_is_present_but_null_not_a_false_measurement():
+    """Same Critical finding as Postgres's identical test: `svv_table_info` was never even
+    asked about `public.never_fetched` (it was never passed to `fetch_table_facts`, exactly
+    the shape an ADV303 proposal for a relation outside `aggregation.tables` takes), and
+    that must read as unknown on every field, not as `is_ordinary_table: False` — which is
+    indistinguishable from a genuinely-empty or external table and would make a later run
+    that does observe it look like the table and its levers were just created."""
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    state = adapter.physical_state(
+        frozenset({Relation("public", "events"), Relation("public", "never_fetched")})
+    )
+    assert state["public.events"]["is_ordinary_table"] is True
+    never = state["public.never_fetched"]
+    assert never["is_ordinary_table"] is None
+    assert never["sortkey1"] is None
+    assert never["diststyle"] is None
+    assert never["unsorted"] is None
+    assert never["stats_off"] is None
+
+
+def test_redshift_denied_catalog_read_is_present_but_null_not_a_false_measurement():
+    """Important finding 2 on Redshift: a denied `CAP_TABLE_FACTS` read must be
+    distinguishable from "fetched, and it genuinely has nothing" — recoverable only by
+    consulting `self.degraded`, which is what the fix does."""
+    querier = FakeQuerier({}, fail_markers=(RedshiftWorkloadAdapter.SQL[CAP_TABLE_FACTS],))
+    adapter = RedshiftWorkloadAdapter(querier=querier)
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    assert any(cap == CAP_TABLE_FACTS for cap, _ in adapter.degraded)
+    state = adapter.physical_state(frozenset({Relation("public", "events")}))
+    entry = state["public.events"]
+    assert entry["is_ordinary_table"] is None, "a denied read must read as unknown, not False"
+    assert entry["sortkey1"] is None
+    assert entry["diststyle"] is None
+    assert entry["unsorted"] is None
+    assert entry["stats_off"] is None
+
+
 def test_redshift_physical_state_does_not_issue_sql():
     """See `window_facts()`'s identical test docstring: a raising stub does not work here
     either, since `_run` swallows any exception into `degraded` and returns `[]` — this

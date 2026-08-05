@@ -1162,6 +1162,14 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         #: second introspection round trip, since one CAP_TABLE_FACTS query already carries
         #: both the engine-neutral and the Redshift-specific columns.
         self.physical_facts: dict[Relation, RedshiftTableFacts] = {}
+        #: Every relation ever *asked about* in a `fetch_table_facts` call — the full
+        #: `relations` argument, not merely the ones CAP_TABLE_FACTS returned a row for.
+        #: `physical_facts` alone cannot tell "asked, and it is absent from
+        #: svv_table_info" apart from "never asked at all" — both leave the relation
+        #: absent from it — which is exactly how `physical_state` used to report a
+        #: relation outside `aggregation.tables` (e.g. a dbt-enriched ADV303 proposal) as
+        #: a hard `is_ordinary_table: False` when the truth is "this run never looked."
+        self._table_facts_requested: set[Relation] = set()
         #: Recorded by `fetch_workload` for `window_facts()` to report without re-querying
         #: — see that method's docstring on `PostgresWorkloadAdapter` for why it must not
         #: issue SQL. `None` until `fetch_workload` runs, or when it ran with no `--since`.
@@ -1393,6 +1401,11 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         apart; see `RedshiftTableFacts`'s docstring. Recorded as a carry-forward, not
         solved here.
         """
+        # Recorded before the statement even runs: `physical_state` must be able to tell
+        # "asked about, and svv_table_info said nothing" apart from "never asked" — see
+        # `_table_facts_requested`'s docstring — and that distinction is about what this
+        # method was *called with*, not about what came back.
+        self._table_facts_requested.update(relations)
         wanted = sorted({relation.table for relation in relations})
         columns: dict[Relation, list[str]] = {}
         for schema_name, table, column, _type in self._schema_rows(schemas):
@@ -1435,29 +1448,42 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         self.physical_facts = physical
         return facts
 
-    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict]:
-        """See `WorkloadAdapter.physical_state`. Reads `self.physical_facts`, populated as
-        a side effect of `fetch_table_facts` during `propose()` — no statement is issued
-        here.
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict[str, object]]:
+        """See `WorkloadAdapter.physical_state`. Reads `self.physical_facts` and
+        `_table_facts_requested`, both populated as a side effect of `fetch_table_facts`
+        during `propose()` — no statement is issued here.
 
-        `is_ordinary_table` is `relation in self.physical_facts` — presence in the last
-        CAP_TABLE_FACTS (`svv_table_info`) result. **This is weaker evidence than
-        Postgres's identically-named field.** Postgres's `CAP_TABLE_FACTS` filters
-        `WHERE c.relkind = 'r'`, so absence there unambiguously means "not an ordinary
-        table" — a view, a foreign table, or a partitioned parent. `svv_table_info`
-        instead omits *both* external (Spectrum) tables — which cannot carry a SORTKEY,
-        DISTKEY or DISTSTYLE at all — and genuinely empty local tables, which can; nothing
-        available to this adapter distinguishes the two (see `RedshiftTableFacts`'s
-        docstring), so `False` here conflates "not a table" with "a table nobody has
-        written to yet". A relation this run never fetched facts for at all reads the same
-        way — absent from `physical_facts`, hence `False` — an honest "nothing fetched"
-        rather than a guess either way.
+        All five fields are `None` unless this run actually asked `CAP_TABLE_FACTS` about
+        `relation` **and** that capability was not denied — `relation in
+        self._table_facts_requested and CAP_TABLE_FACTS not in self.degraded`. A relation
+        this run never fetched facts for at all (e.g. a dbt-enriched ADV303 proposal for a
+        relation outside `aggregation.tables`, which `fetch_table_facts` is simply never
+        called with) and a relation whose `CAP_TABLE_FACTS` read was denied both leave
+        `physical_facts` looking identical — absent for that relation — so only tracking
+        "was it asked about, and did the capability survive" tells "never looked" apart
+        from a genuine "looked, and svv_table_info had nothing." Reporting `False`/`None`
+        for either would read to `verify` as a measurement rather than "this run could not
+        tell you," and a later run that *does* observe the relation would then look like
+        the table and its physical levers had just appeared.
+
+        Once that condition holds, `is_ordinary_table` is `relation in
+        self.physical_facts` — presence in the CAP_TABLE_FACTS (`svv_table_info`) result.
+        **This is weaker evidence than Postgres's identically-named field even when both
+        conditions hold.** Postgres's `CAP_TABLE_FACTS` filters `WHERE c.relkind = 'r'`,
+        so `False` there unambiguously means "not an ordinary table" — a view, a foreign
+        table, or a partitioned parent. `svv_table_info` instead omits *both* external
+        (Spectrum) tables — which cannot carry a SORTKEY, DISTKEY or DISTSTYLE at all —
+        and genuinely empty local tables, which can; nothing available to this adapter
+        distinguishes the two (see `RedshiftTableFacts`'s docstring), so a genuine `False`
+        here conflates "not a table" with "a table nobody has written to yet".
         """
-        state: dict[str, dict] = {}
+        facts_degraded = any(cap == CAP_TABLE_FACTS for cap, _ in self.degraded)
+        state: dict[str, dict[str, object]] = {}
         for relation in sorted(relations):
-            phys = self.physical_facts.get(relation)
+            have_facts = relation in self._table_facts_requested and not facts_degraded
+            phys = self.physical_facts.get(relation) if have_facts else None
             state[str(relation)] = {
-                "is_ordinary_table": phys is not None,
+                "is_ordinary_table": (phys is not None) if have_facts else None,
                 "sortkey1": phys.sortkey1 if phys is not None else None,
                 "diststyle": phys.diststyle if phys is not None else None,
                 "unsorted": phys.unsorted if phys is not None else None,

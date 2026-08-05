@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from sqlquality.models import ComplexityMetrics, ComplexityScore, DagFacts
+from sqlquality.models import ComplexityMetrics, ComplexityScore, DagFacts, proposal_relations
 from sqlquality.models import (
     Aggregation,
     ColumnRole,
@@ -132,3 +132,56 @@ def test_fingerprints_is_derived_from_the_id_set():
             cost_share=0.5,
             fingerprints=2,
         )
+
+
+def test_proposal_relations_recovers_the_relation_from_evidence():
+    """`Proposal` carries no `Relation` field — this is the one place that reconstitutes it
+    from `evidence["schema"]`/`evidence["table"]`, which is what `physical_state`'s scoping
+    depends on end-to-end."""
+    proposal = Proposal(
+        code="ADV001",
+        title="Add index on orders(status)",
+        rationale="hot predicate",
+        evidence={"schema": "public", "table": "orders", "cost_share": 0.5},
+        confidence=Confidence.HIGH,
+        ddl="CREATE INDEX ...",
+    )
+    assert proposal_relations([proposal]) == frozenset({Relation("public", "orders")})
+
+
+def test_proposal_relations_excludes_a_proposal_with_no_schema_or_table():
+    """ADV005's leading-wildcard-LIKE finding carries only `fingerprint`/`sql` in its
+    evidence — no `schema`/`table` at all — so it must not be reconstructed from a
+    placeholder relation."""
+    proposal = Proposal(
+        code="ADV005",
+        title="Leading-wildcard LIKE in a hot query group",
+        rationale="cannot use a B-tree index",
+        evidence={"fingerprint": "abc123", "sql": "select 1", "cost_share": 0.3},
+        confidence=Confidence.MEDIUM,
+        ddl=None,
+    )
+    assert proposal_relations([proposal]) == frozenset()
+
+
+def test_proposal_relations_dedupes_across_proposals_on_the_same_relation():
+    same_relation = {"schema": "public", "table": "orders", "cost_share": 0.5}
+    proposals = [
+        Proposal(
+            code="ADV001",
+            title="a",
+            rationale="r",
+            evidence=dict(same_relation),
+            confidence=Confidence.HIGH,
+            ddl=None,
+        ),
+        Proposal(
+            code="ADV002",
+            title="b",
+            rationale="r",
+            evidence=dict(same_relation),
+            confidence=Confidence.MEDIUM,
+            ddl=None,
+        ),
+    ]
+    assert proposal_relations(proposals) == frozenset({Relation("public", "orders")})

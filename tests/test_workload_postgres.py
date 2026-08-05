@@ -423,6 +423,85 @@ def test_only_the_relations_asked_about_are_recorded():
     assert list(state) == ["public.orders"]
 
 
+def test_a_relation_never_fetched_at_all_is_present_but_null_not_a_false_measurement():
+    """Reproduces the review's Critical finding directly: ADV303 fires for a relation
+    *outside* `aggregation.tables`, and `fetch_table_facts`/`fetch_indexes` are only ever
+    called with `aggregation.tables` (+ `star_tables`) — so that relation's catalog facts
+    are never fetched at all. Before the fix, `physical_state` reported such a relation as
+    `is_ordinary_table: False, indexes: []`, identical to a relation genuinely fetched and
+    found to have neither. `verify` cannot tell those apart, so the moment a later run's
+    workload happens to touch the relation it would see `False -> True` and `[] -> [...]`
+    and conclude a table and its indexes were just created, when nothing physically
+    changed — only what this run happened to look at did.
+
+    `public.orders` is fetched (and genuinely is an ordinary table with one index) to
+    prove the *other* branch is untouched by this fix; `public.never_fetched` is asked
+    about by `physical_state` without ever being passed to `fetch_table_facts` or
+    `fetch_indexes` — exactly the ADV303 shape — and must come back `None`/`None`.
+    """
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned(
+            {
+                CAP_TABLE_FACTS: [("public", "orders", 50_000, 1024)],
+                CAP_INDEXES: [
+                    (
+                        "public",
+                        "orders",
+                        "idx_status",
+                        "status",
+                        1,
+                        False,
+                        False,
+                        3,
+                        100,
+                        False,
+                        None,
+                        False,
+                        "...",
+                    )
+                ],
+            }
+        )
+    )
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(
+        frozenset({Relation("public", "orders"), Relation("public", "never_fetched")})
+    )
+    assert state["public.orders"]["is_ordinary_table"] is True
+    assert state["public.orders"]["indexes"] == [
+        {"name": "idx_status", "columns": ["status"], "is_partial": False, "is_unique": False}
+    ]
+    never = state["public.never_fetched"]
+    assert never["is_ordinary_table"] is None, "never fetched must read as unknown, not False"
+    assert never["indexes"] is None, "never fetched must read as unknown, not []"
+
+
+def test_a_denied_catalog_read_is_present_but_null_not_a_false_measurement():
+    """A degraded `CAP_TABLE_FACTS`/`CAP_INDEXES` read leaves the caches empty exactly as a
+    never-fetched relation does — this is the review's Important finding 2. Both capabilities
+    are denied here even though the relation genuinely was asked about (`fetch_table_facts`/
+    `fetch_indexes` were called with it), so the *only* way to tell this apart from "fetched,
+    and it has neither" is by consulting `self.degraded` — which is what the fix does.
+    """
+    querier = FakeQuerier(
+        {},
+        fail_markers=(
+            PostgresWorkloadAdapter.SQL[CAP_TABLE_FACTS],
+            PostgresWorkloadAdapter.SQL[CAP_INDEXES],
+        ),
+    )
+    adapter = PostgresWorkloadAdapter(querier=querier)
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "orders")}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    assert any(cap == CAP_TABLE_FACTS for cap, _ in adapter.degraded)
+    assert any(cap == CAP_INDEXES for cap, _ in adapter.degraded)
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    entry = state["public.orders"]
+    assert entry["is_ordinary_table"] is None, "a denied read must read as unknown, not False"
+    assert entry["indexes"] is None, "a denied read must read as unknown, not []"
+
+
 def test_postgres_physical_state_does_not_issue_sql():
     """See `window_facts()`'s identical test docstring: a raising stub does not work here
     either, since `_run` swallows any exception into `degraded` and returns `[]` — this
