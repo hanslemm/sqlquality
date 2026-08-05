@@ -276,6 +276,15 @@ def _query_groups_payload(proposals: list[Proposal], workload: Workload) -> list
     Order follows `workload.stats` (cost descending, then fingerprint — see `ingest()`),
     not a fresh sort by digest: that order is already deterministic run-to-run for the same
     workload, and re-sorting by digest would throw away the cost ordering for no gain.
+
+    A surviving proposal's `fingerprint_digests` can cite *fewer* query groups than
+    actually motivated it: `PostgresWorkloadAdapter._collapse_index_prefixes` (and
+    `_dedupe_by_ddl` identically) discards a folded-in proposal's `evidence` entirely,
+    carrying forward only its rationale's distinguishing sentences — see that function's
+    own docstring. This never produces a dangling reference (every digest still cited
+    resolves to a real group here), but it does mean this function's output is only ever
+    as complete as what survived that collapse, not the full set of groups any rule ever
+    found compelling.
     """
     referenced: set[str] = set()
     for proposal in proposals:
@@ -305,6 +314,21 @@ def _jsonable(value: object) -> object:
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     return value
+
+
+#: Evidence keys present in `--json` but suppressed from `--markdown`'s generic evidence
+#: line. `fingerprint_digests` is a machine correlation key — a list of 12-character
+#: digests, one per backing query group, added so `sqlquality verify` can match a
+#: proposal's evidence against `query_groups` across two artifacts. It carries no meaning
+#: to a human reading a report: the human-relevant number is already right beside it as
+#: `fingerprints` / `co_occurring_fingerprints`. Rendering it generically here — as every
+#: other evidence key is — would print, for a proposal backed by thirty query groups,
+#: thirty opaque hashes in a line meant for a human to read. This is the same bloat
+#: `fingerprint_id`'s own docstring already describes for the raw fingerprint text itself
+#: ("printed the whole statement a second time... most of the proposal's evidence block,
+#: duplicated"), just for a different payload: markdown is the human surface, `--json` is
+#: the machine surface, and a correlation key belongs only on the machine surface.
+_MARKDOWN_SUPPRESSED_EVIDENCE_KEYS = frozenset({"fingerprint_digests"})
 
 
 def render_advise_markdown(
@@ -395,8 +419,14 @@ def render_advise_markdown(
         # Values go through `_jsonable` first so the markdown reader and the JSON reader
         # see the same shape. Without it `str(("status",))` renders the Python repr
         # `('status',)` where JSON shows `["status"]` — the same run described two ways.
+        #
+        # `_MARKDOWN_SUPPRESSED_EVIDENCE_KEYS` is filtered here, not upstream in `evidence`
+        # itself: `--json` still carries every key unfiltered, since `verify` (a later
+        # task) needs `fingerprint_digests` there. Only this human-facing render omits it.
         evidence = ", ".join(
-            f"{_md_escape(k)}={_md_escape(_jsonable(v))}" for k, v in sorted(p.evidence.items())
+            f"{_md_escape(k)}={_md_escape(_jsonable(v))}"
+            for k, v in sorted(p.evidence.items())
+            if k not in _MARKDOWN_SUPPRESSED_EVIDENCE_KEYS
         )
         lines.append(f"Evidence: {evidence}")
         lines.append("")
