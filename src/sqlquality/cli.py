@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn
 
@@ -40,9 +40,19 @@ from sqlquality.report import (
     render_advise_markdown,
     render_html,
     render_markdown,
+    render_verify_markdown,
     verdict_label,
+    verify_applied_label,
+    verify_caveats,
+    verify_context,
+    verify_mean_cell,
+    verify_payload,
+    verify_proposal_label,
+    verify_summary,
+    verify_workload_line,
 )
 from sqlquality.sqlast import SqlParseError, analyze_sql, parse, strip_jinja
+from sqlquality.verify import artifact_incomparabilities, verdicts
 from sqlquality.workload import get_workload_adapter
 from sqlquality.workload.aggregate import aggregate, star_tables
 from sqlquality.workload.base import MAX_TIMEOUT_S, MIN_TIMEOUT_S
@@ -1007,6 +1017,299 @@ def advise(
         table.add_row(proposal.code, proposal.confidence.value, share_text, proposal.title)
     console.print(table)
     # Proposals are advisory: advise never gates.
+    raise typer.Exit(code=0)
+
+
+# --- verify -------------------------------------------------------------------------------
+#
+# `verify` is fully offline: it reads two `advise --json` artifacts and connects to nothing.
+# Every check below refuses rather than guesses, because the one thing this command must never
+# do is present an absence or an incommensurability produced by one run's own conditions as a
+# measurement about the user's database.
+
+
+#: Every top-level key `advise_payload` has emitted since this feature landed. An artifact
+#: missing any of them predates it (0.3.0, or an intermediate build), and `verify` refuses it
+#: rather than deriving a verdict from absent data.
+#:
+#: **Not just `window`-being-a-string.** That is the 0.3.0 marker specifically, and checking
+#: it alone was this refusal's first design. `physical_state` and `query_groups` are emitted
+#: as `{}`/`[]` rather than omitted-when-empty *precisely* so that an absent key can mean
+#: "this artifact predates the feature" and nothing else (see `advise_payload`'s docstring),
+#: which only works if something actually checks for them. An artifact from an intermediate
+#: version can carry the `window` object and still lack the rest, and half-understanding such
+#: an artifact is the failure this refusal exists to prevent.
+_VERIFY_REQUIRED_KEYS: tuple[str, ...] = (
+    "analyzed",
+    "degraded",
+    "engine",
+    "physical_state",
+    "proposals",
+    "query_groups",
+    "redacted",
+    "skipped",
+    "window",
+)
+
+#: Every field of the `window` object, `since_duration_seconds` included — it is what
+#: `classify_windows` grades `COMPARABLE` on, and an artifact predating it would silently
+#: classify as though neither run had ever passed `--since`.
+_VERIFY_REQUIRED_WINDOW_KEYS: tuple[str, ...] = (
+    "description",
+    "engine",
+    "limit",
+    "since",
+    "since_duration_seconds",
+    "stats_reset_at",
+)
+
+
+def _refuse(*lines: str) -> NoReturn:
+    """Print a refusal to stderr and exit 2 — the house code for "usage or input error".
+
+    Never exit 1: that is what `check` and `lint` use for real findings, so a CI job cannot
+    distinguish it from a failed gate. `verify` reports and never gates, so 1 is not a code
+    it can produce at all.
+    """
+    for line in lines:
+        typer.echo(line, err=True)
+    raise typer.Exit(code=2)
+
+
+def _read_verify_artifact(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
+    """One `advise --json` artifact, as raw bytes and as a parsed object.
+
+    The bytes are returned alongside the parse because byte-identity is one of the two ways
+    "the same artifact twice" is detected (see the command body). Every failure exits 2 with
+    the argument named: a user who mixed up two paths needs to know *which* one is wrong.
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        _refuse(f"{label}: no such file: {path}")
+    except OSError as exc:
+        _refuse(f"{label}: could not read {path}: {exc}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        _refuse(
+            f"{label} ({path}) is not valid UTF-8, so it cannot be the JSON `advise --json` "
+            "writes. Regenerate it with `sqlquality advise --json > artifact.json`."
+        )
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        _refuse(
+            f"{label} ({path}) is not valid JSON: {exc}. verify reads two `advise --json` "
+            "artifacts; regenerate this one with `sqlquality advise --json > artifact.json`."
+        )
+    if not isinstance(parsed, dict):
+        _refuse(
+            f"{label} ({path}) is valid JSON but not a JSON object (found "
+            f"{type(parsed).__name__}), so it is not an `advise --json` artifact."
+        )
+    return raw, parsed
+
+
+def _verify_artifact_complaints(payload: dict[str, object]) -> list[str]:
+    """Every way `payload` falls short of the artifact contract `verify` needs, or `[]`.
+
+    Names what is actually wrong rather than reporting the first problem found: an artifact
+    can be missing several keys at once, and a user regenerating it wants the whole list.
+    """
+    complaints: list[str] = []
+    missing = [key for key in _VERIFY_REQUIRED_KEYS if key not in payload]
+    if missing:
+        complaints.append("missing top-level key(s) " + ", ".join(missing))
+    window = payload.get("window")
+    if "window" in payload and not isinstance(window, dict):
+        complaints.append(
+            f"`window` is a {type(window).__name__}, not an object — 0.3.0 wrote a prose "
+            "sentence here, and a sentence cannot be compared across two runs"
+        )
+    elif isinstance(window, dict):
+        missing_window = [key for key in _VERIFY_REQUIRED_WINDOW_KEYS if key not in window]
+        if missing_window:
+            complaints.append("missing `window` field(s) " + ", ".join(missing_window))
+    return complaints
+
+
+def _verify_reset_instant(payload: dict[str, object]) -> datetime | None:
+    """`window["stats_reset_at"]` as a `datetime`, or `None` when it cannot be established.
+
+    `None` for an absent, null, non-string or unparseable value — never a substituted
+    instant. The one thing this feeds is the swapped-artifact refusal below, and refusing a
+    pair on a value that could not be read would be its own false claim.
+    """
+    window = payload.get("window")
+    if not isinstance(window, dict):
+        return None
+    value = window.get("stats_reset_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@app.command()
+def verify(
+    before: Path = typer.Argument(
+        ..., dir_okay=False, help="The earlier `advise --json` artifact (the baseline)."
+    ),
+    after: Path = typer.Argument(
+        ..., dir_okay=False, help="The later `advise --json` artifact, taken after the change."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    markdown: Path | None = typer.Option(None, "--markdown", help="Write a markdown report."),
+) -> None:
+    """Diff two `advise --json` artifacts: was each proposal applied, and did it help?
+
+    Fully offline — it reads two files and never opens a connection, so anyone reviewing a
+    change can run it, including people who will never have production access.
+
+    Run order is taken from the argument order: BEFORE, then AFTER. An advise artifact
+    carries no run timestamp (deliberately: its bytes are reproducible, which is what makes
+    two runs diffable at all), so verify cannot detect a swapped pair in general. The one
+    exception is refused: a server's statistics-reset instant cannot move backwards, so when
+    both artifacts report a stats_reset_at and AFTER's is earlier, the two were passed the
+    wrong way round.
+
+    Reports and never gates: exit 0 whenever a comparison was reported, exit 2 when it was
+    refused (unreadable or pre-0.4.0 artifacts, the same artifact twice, two engines, or two
+    runs that disagree about literal redaction). There is no --gate flag.
+    """
+    before_raw, before_payload = _read_verify_artifact(before, "BEFORE")
+    after_raw, after_payload = _read_verify_artifact(after, "AFTER")
+
+    # Checked before anything compares the two, so a user who saved a baseline with an older
+    # sqlquality is told exactly that rather than being handed a verdict derived from keys
+    # the artifact never carried.
+    for label, path, payload in (
+        ("BEFORE", before, before_payload),
+        ("AFTER", after, after_payload),
+    ):
+        complaints = _verify_artifact_complaints(payload)
+        if complaints:
+            _refuse(
+                f"{label} ({path}) was not produced by sqlquality 0.4.0 or later: "
+                + "; ".join(complaints)
+                + ". Every verdict verify reports is derived from those keys, so regenerate "
+                "the artifact with `sqlquality advise --json` on 0.4.0 or later rather than "
+                "letting a verdict rest on absent data."
+            )
+
+    # The same artifact twice would report every proposal unchanged — which reads as a
+    # finding rather than as a mistake. Two arms: the same resolved path, and byte-identical
+    # content (two genuinely distinct runs cannot be byte-identical, because
+    # pg_stat_statements' counters accumulate, so identical bytes are sound evidence of the
+    # same run rather than of a real no-change result).
+    if before.resolve() == after.resolve():
+        _refuse(
+            f"BEFORE and AFTER are the same file ({before.resolve()}). Comparing a run with "
+            "itself reports every proposal unchanged, which reads as a finding rather than "
+            "as a mistake. Pass artifacts from two different advise runs."
+        )
+    if before_raw == after_raw:
+        _refuse(
+            f"BEFORE ({before}) and AFTER ({after}) are byte-identical, so they are the same "
+            "run saved twice. Two genuinely distinct runs cannot be: pg_stat_statements' "
+            "counters accumulate, so even an unchanged workload moves the numbers. Comparing "
+            "a run with itself would report every proposal unchanged, which reads as a "
+            "finding rather than as a mistake."
+        )
+
+    # Two engines, and two disagreeing (or unreadable) `redacted` flags, are both
+    # incommensurability rather than weak evidence: the two artifacts do not share a
+    # coordinate system, so there is no confidence at which a query-group comparison could be
+    # stated. Rendered once here rather than repeated on every proposal's note.
+    incomparabilities = artifact_incomparabilities(before_payload, after_payload)
+    if incomparabilities:
+        _refuse(
+            *[item.detail for item in incomparabilities],
+            "verify refuses this pair rather than grading it at low confidence: a weak "
+            "comparison and a meaningless one are different things. Regenerate both "
+            "artifacts from the same engine, with the same --keep-literals setting.",
+        )
+
+    before_reset = _verify_reset_instant(before_payload)
+    after_reset = _verify_reset_instant(after_payload)
+    if before_reset is not None and after_reset is not None:
+        try:
+            reversed_pair = after_reset < before_reset
+        except TypeError:
+            # One instant is timezone-aware and the other naive, so they cannot be ordered at
+            # all. That is "cannot establish", not "in order" — disclosed by the run-order
+            # caveat every report carries, never resolved by guessing here.
+            reversed_pair = False
+        if reversed_pair:
+            _refuse(
+                f"AFTER's window reports an earlier stats_reset_at ({after_reset}) than "
+                f"BEFORE's ({before_reset}). A server's statistics-reset instant cannot move "
+                "backwards, so these two artifacts were passed in the wrong order — pass the "
+                "earlier run first. (This is the only swapped pair verify can detect: an "
+                "advise artifact carries no run timestamp, so run order is otherwise taken "
+                "from the argument order and never guessed at.)"
+            )
+
+    results = verdicts(before_payload, after_payload)
+    context = verify_context(before_payload, after_payload)
+
+    # Rendered first, then written, so a renderer bug cannot be reported as a write failure —
+    # and exit 2 rather than 1 for an unwritable path, exactly as `advise` and `check` do.
+    if markdown is not None:
+        _write_report_or_exit(
+            markdown, render_verify_markdown(results, before_payload, after_payload), "--markdown"
+        )
+
+    if json_out:
+        typer.echo(
+            json.dumps(
+                verify_payload(results, before_payload, after_payload), indent=2, sort_keys=True
+            )
+        )
+        raise typer.Exit(code=0)
+
+    # Every caveat, on stderr, before the table: each one names a condition under which the
+    # table below means less than it appears to. The nested-window case is the important one —
+    # it is the common Postgres path, and on it a real improvement is understated, so a user
+    # who is not told will read `unchanged` as "it did not work".
+    for caveat in verify_caveats(context):
+        typer.echo(caveat, err=True)
+    typer.echo(verify_workload_line(context), err=True)
+
+    summary = verify_summary(results)
+    outcomes = summary["outcomes"]
+    improved = outcomes["improved"] if isinstance(outcomes, dict) else 0
+    table = Table(
+        title=(
+            f"Verify — {context.before.engine} "
+            f"({_plural(len(results), 'proposal')}, "
+            f"{summary['applied']} applied, {improved} improved)"
+        )
+    )
+    table.add_column("proposal")
+    table.add_column("applied")
+    table.add_column("outcome")
+    table.add_column("mean per call", justify="right")
+    table.add_column("conf")
+    for verdict in results:
+        table.add_row(
+            verify_proposal_label(verdict.key),
+            verify_applied_label(verdict.applied),
+            verdict.outcome.value,
+            verify_mean_cell(verdict),
+            verdict.confidence.value,
+        )
+    console.print(table)
+    # The notes carry the substance the five columns cannot: the applied-but-unchanged
+    # headline, a collision, a limit mismatch, a degraded read. Printing the table without
+    # them would be this command withholding exactly what it exists to say.
+    for verdict in results:
+        if verdict.note:
+            console.print(f"[cyan]{verify_proposal_label(verdict.key)}[/]: {verdict.note}")
+    # verify reports; it never gates. There is no --gate flag (deliberately out of scope).
     raise typer.Exit(code=0)
 
 

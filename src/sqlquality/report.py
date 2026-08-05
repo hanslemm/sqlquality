@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import html as _html
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Final
 
 from sqlquality.gate import GateReport
 from sqlquality.models import (
     Aggregation,
+    Confidence,
     Proposal,
     Workload,
     analyzed_query_groups,
     cost_share_of,
+)
+from sqlquality.verify import (
+    ProposalIndex,
+    ProposalVerdict,
+    VerifyOutcome,
+    WindowLimits,
+    WindowRelation,
+    classify_windows,
+    confidence_for,
+    index_proposals,
+    window_limits,
 )
 from sqlquality.workload.fingerprint import fingerprint_id
 
@@ -489,3 +504,451 @@ def _code_fence(text: str) -> str:
         else:
             current = 0
     return "`" * max(3, longest + 1)
+
+
+# --- `sqlquality verify`: the pair-level facts, and the three surfaces that render them ---
+#
+# Everything below is derived from two already-parsed `advise --json` payloads and the
+# `ProposalVerdict` list `sqlquality.verify.verdicts` produced from them. It touches no
+# database and no filesystem, exactly like `verify.py` itself.
+#
+# The derivation lives here, once, rather than in `cli.verify`: the terminal, `--json` and
+# `--markdown` surfaces must not each re-derive the window relation or recount the query
+# groups, because three copies of a disclosure are three places for one of them to fall
+# behind — and a *missing* disclosure is this feature's recurring defect, not a cosmetic
+# problem.
+
+
+@dataclass(frozen=True)
+class ArtifactFacts:
+    """One artifact's own facts, as `verify` reports them beside the verdict table.
+
+    Every field is `| None` where the artifact might not carry it, and `None` means "this
+    artifact does not say", never a substituted `0`. A `total_cost_ms` of `0.0` is a real
+    measurement of an idle window; a `total_cost_ms` of `None` is a malformed or truncated
+    artifact, and rendering the second as the first would put a number on the screen that
+    no run ever measured.
+
+    `collisions` holds the keys `index_proposals` could not resolve to a single proposal
+    **within this one artifact** (see `ProposalIndex`): a local ambiguity, disclosed, never
+    a disappearance and never a new finding.
+    """
+
+    engine: str | None
+    window_description: str | None
+    total_cost_ms: float | None
+    query_groups: int | None
+    degraded: tuple[tuple[str, str], ...]
+    matched_proposals: int
+    collisions: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
+class VerifyContext:
+    """The pair-level facts every `verify` surface needs, derived once.
+
+    `ceiling` is `confidence_for(relation)` — the confidence no verdict in this run may
+    exceed — carried here so the report can state the ceiling even when the verdict list is
+    empty, which is precisely when a user most needs to know why.
+
+    `new_in_after` holds keys matched unambiguously in `after` and absent from `before`'s
+    *matched* keys **and** from `before`'s collision keys. Excluding the collisions is
+    Ruling 4 of Task 4: a key that identified two proposals in `before` is ambiguous there,
+    not missing from there, so calling its `after` counterpart "new" would turn a local
+    matching ambiguity into a claim about the user's database.
+    """
+
+    before: ArtifactFacts
+    after: ArtifactFacts
+    relation: WindowRelation
+    ceiling: Confidence
+    limits: WindowLimits
+    new_in_after: tuple[tuple[str, ...], ...]
+
+
+def _artifact_float(payload: dict[str, object], section: str, field: str) -> float | None:
+    """`payload[section][field]` as a `float`, or `None` when it is absent or not a number.
+
+    Excludes `bool` (`isinstance(True, int)` is `True` in Python), following
+    `verify.py`'s own `_window_duration_seconds`: a stray boolean must not be rendered as a
+    millisecond total.
+    """
+    parent = payload.get(section)
+    if not isinstance(parent, dict):
+        return None
+    value = parent.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _artifact_facts(payload: dict[str, object], index: ProposalIndex) -> ArtifactFacts:
+    """One payload's `ArtifactFacts`. Never raises: every field is type-checked, and an
+    unexpected shape degrades to `None`/`()` rather than to a fabricated value.
+    """
+    window = payload.get("window")
+    description = window.get("description") if isinstance(window, dict) else None
+    engine = payload.get("engine")
+    groups = payload.get("query_groups")
+    degraded: list[tuple[str, str]] = []
+    entries = payload.get("degraded")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            capability = entry.get("capability")
+            reason = entry.get("reason")
+            if isinstance(capability, str):
+                degraded.append((capability, reason if isinstance(reason, str) else "(no reason)"))
+    return ArtifactFacts(
+        engine=engine if isinstance(engine, str) else None,
+        window_description=description if isinstance(description, str) else None,
+        total_cost_ms=_artifact_float(payload, "analyzed", "total_cost_ms"),
+        query_groups=len(groups) if isinstance(groups, list) else None,
+        degraded=tuple(degraded),
+        matched_proposals=len(index.matched),
+        collisions=tuple(sorted(index.collisions)),
+    )
+
+
+def verify_context(before: dict[str, object], after: dict[str, object]) -> VerifyContext:
+    """Everything `verify`'s three surfaces share, computed from the two payloads once."""
+    before_index = index_proposals(before)
+    after_index = index_proposals(after)
+    relation = classify_windows(before, after)
+    new_in_after = tuple(
+        sorted(set(after_index.matched) - set(before_index.matched) - set(before_index.collisions))
+    )
+    return VerifyContext(
+        before=_artifact_facts(before, before_index),
+        after=_artifact_facts(after, after_index),
+        relation=relation,
+        ceiling=confidence_for(relation),
+        limits=window_limits(before, after),
+        new_in_after=new_in_after,
+    )
+
+
+#: What each window relation means for the verdicts below it, in the words a user needs
+#: rather than the enum's name. A plain lookup, like `verify.py`'s `_CONFIDENCE_BY_RELATION`
+#: and `_MISMATCH_EFFECT`, so a fifth relation added to the enum raises `KeyError` here
+#: instead of silently printing nothing —
+#: `test_every_window_relation_has_a_user_facing_caveat` pins it directly.
+#:
+#: `NESTED`'s entry is the load-bearing one, and the reason this text exists at all: it is
+#: the common Postgres path (counters baselined once, never reset), and on it a real
+#: improvement is *understated*, so a user who is not told will read `unchanged` as "it did
+#: not work". `pg_stat_statements_reset()` is named because it is the remedy, and it is
+#: named as something the *user* runs: sqlquality never writes to the user's database.
+_WINDOW_RELATION_CAVEAT: Final[dict[WindowRelation, str]] = {
+    WindowRelation.DISJOINT: (
+        "Window relation: disjoint — the two runs report different stats_reset_at instants "
+        "and neither restricted its window, so the counters were cleared between them and "
+        "the two measurements are independent samples. This is the cleanest comparison "
+        "available; verdicts may claim high confidence."
+    ),
+    WindowRelation.COMPARABLE: (
+        "Window relation: comparable — both runs requested the same --since duration, so "
+        "the two windows are the same length by construction (the absolute cutoffs differ "
+        "and are deliberately not compared). Verdicts may claim high confidence."
+    ),
+    WindowRelation.NESTED: (
+        "Window relation: nested — both runs report the same stats_reset_at and neither "
+        "restricted its window, so the after run's cumulative pg_stat_statements counters "
+        "contain the before run's. Every pre-change execution is still averaged into the "
+        "after mean, so a real improvement is understated here, sometimes badly: a proposal "
+        "that genuinely helped can read as 'unchanged'. Verdicts are capped at medium "
+        "confidence for that reason. For an undiluted comparison, call "
+        "pg_stat_statements_reset() yourself right after applying a change and take the "
+        "after artifact from there — sqlquality never writes to your database, this reset "
+        "included."
+    ),
+    WindowRelation.INCOMPARABLE: (
+        "Window relation: incomparable — the two windows cannot be placed relative to one "
+        "another (one run restricted its window with --since and the other did not, or the "
+        "two requested different durations, or stats_reset_at is unknown on at least one "
+        "side). Every verdict below is capped at low confidence, and none of them "
+        "establishes that a change did or did not help."
+    ),
+}
+
+#: Ruling 1 of Task 7, disclosed on every run rather than assumed away. An `advise` payload
+#: carries no run timestamp — deliberately: Task 3 established byte-determinism, and a
+#: `generated_at` field would break it — so `verify` cannot detect a swapped pair in general.
+#: The one detectable case is refused up front (`cli.verify`): `stats_reset_at` is monotonic
+#: per server, so a non-null `after` value strictly earlier than a non-null `before` one
+#: demonstrates the two artifacts were passed in the wrong order. Everything else is taken on
+#: trust from the argument order, and saying so is the whole point — the alternative is a user
+#: reading a reversed comparison as a regression.
+_RUN_ORDER_CAVEAT: Final[str] = (
+    "Run order is taken from the argument order: BEFORE, then AFTER. An advise artifact "
+    "carries no run timestamp (its bytes are reproducible by design), so a swapped pair is "
+    "only detectable when both runs report a stats_reset_at and the after run's is earlier — "
+    "which is refused outright. Otherwise sqlquality cannot tell the two apart, and does not "
+    "guess."
+)
+
+
+def _keys_text(keys: Sequence[tuple[str, ...]]) -> str:
+    """Proposal keys as a readable list — `ADV104 public.orders`, comma separated."""
+    return ", ".join(verify_proposal_label(key) for key in keys)
+
+
+def verify_caveats(context: VerifyContext) -> list[str]:
+    """Every disclosure this artifact pair earns, in the order a reader needs them.
+
+    Each entry is a complete sentence, rendered identically on all three surfaces (stderr,
+    `--markdown`, and `--json`'s `caveats` list). None of them is optional decoration: each
+    names a condition under which something the verdict table shows means less than it
+    appears to, and the whole point of this feature is that such a condition is disclosed
+    rather than silently folded into a verdict.
+    """
+    caveats = [_WINDOW_RELATION_CAVEAT[context.relation], _RUN_ORDER_CAVEAT]
+    if context.limits.may_be_sampling_artifact:
+        caveats.append(
+            "The two runs sampled different (or unknown) numbers of query groups "
+            f"(--limit before={context.limits.before}, after={context.limits.after}). A "
+            "query group present in one artifact and absent from the other may therefore be "
+            "a sampling artifact rather than a real disappearance, so no verdict below is "
+            "graded 'disappeared' on the strength of such an absence alone."
+        )
+    for side, facts in (("before", context.before), ("after", context.after)):
+        for capability, reason in facts.degraded:
+            caveats.append(
+                f"The {side} run ran with reduced coverage — {capability}: {reason}. A read "
+                "that could not run produces the same emptiness a real change would, so any "
+                "verdict resting on something being absent from that run says so."
+            )
+    for side, facts in (("before", context.before), ("after", context.after)):
+        if facts.collisions:
+            caveats.append(
+                f"{len(facts.collisions)} recommendation(s) in the {side} run could not be "
+                "matched unambiguously — their key identified more than one proposal within "
+                f"that run's own artifact — so they carry no verdict below: "
+                f"{_keys_text(facts.collisions)}. This is a fact about the {side} artifact, "
+                "not a disappearance and not a new finding."
+            )
+    if context.new_in_after:
+        caveats.append(
+            f"{len(context.new_in_after)} proposal(s) appear only in the after run and "
+            "therefore carry no verdict: verify grades each before-run proposal against the "
+            "after run, and a finding with no counterpart to compare against is new rather "
+            f"than changed: {_keys_text(context.new_in_after)}."
+        )
+    return caveats
+
+
+def verify_workload_line(context: VerifyContext) -> str:
+    """The workload-context line: total window cost and query-group count, both runs.
+
+    Printed on every run, because a global workload shift is the confound this whole feature
+    was designed around (see the design spec's decision 4): `cost_share` falling while the
+    mean per call held steady is *not* an improvement, and a reader can only see that if
+    both runs' totals are on screen rather than deduced.
+    """
+
+    def side(facts: ArtifactFacts) -> str:
+        cost = "unknown" if facts.total_cost_ms is None else f"{facts.total_cost_ms:.1f} ms"
+        groups = "unknown" if facts.query_groups is None else str(facts.query_groups)
+        return f"{cost} across {groups} query group(s)"
+
+    return f"workload: before {side(context.before)}; after {side(context.after)}"
+
+
+def verify_proposal_label(key: Sequence[str]) -> str:
+    """One proposal key as a single cell: the code, then whatever identifies it.
+
+    `("ADV001", "public", "orders", "status")` renders as `ADV001 public.orders (status)`,
+    and the statement-scoped `("ADV005", "a1b2c3d4e5f6")` as `ADV005 a1b2c3d4e5f6` — the
+    key's own parts, never re-derived from the proposal, so two proposals `verify` considers
+    distinct can never print identically.
+    """
+    if not key:
+        return "(unkeyed)"
+    code, *rest = key
+    if len(rest) >= 2:
+        relation = f"{rest[0]}.{rest[1]}"
+        remainder = ", ".join(rest[2:])
+        return f"{code} {relation}" + (f" ({remainder})" if remainder else "")
+    return f"{code} {' '.join(rest)}".rstrip()
+
+
+def verify_applied_label(applied: bool | None) -> str:
+    """`applied` as a word. `None` is "unknown", never "no": the distinction between "you
+    did not do it" and "we could not tell whether you did" is the whole reason the field is
+    `bool | None` (see `ProposalVerdict`).
+    """
+    if applied is None:
+        return "unknown"
+    return "yes" if applied else "no"
+
+
+def verify_mean_cell(verdict: ProposalVerdict) -> str:
+    """`100.0 → 40.0 ms`, with an em dash for a side that has no comparable mean.
+
+    A `None` mean prints as `—`, never as `0.0`: `0.0` reads as "instantaneous", the
+    opposite of "no usable measurement" (the same distinction `_query_groups_payload` keeps
+    for `mean_ms`).
+    """
+    if verdict.mean_before is None and verdict.mean_after is None:
+        return "—"
+    before = "—" if verdict.mean_before is None else f"{verdict.mean_before:.1f}"
+    after = "—" if verdict.mean_after is None else f"{verdict.mean_after:.1f}"
+    return f"{before} → {after} ms"
+
+
+def verify_summary(verdicts: Sequence[ProposalVerdict]) -> dict[str, object]:
+    """Headline counts: how many proposals were graded, how many were applied, and how many
+    landed in each outcome. Every `VerifyOutcome` member appears, `0` included, so a
+    consumer never has to distinguish "none of these" from "this version has no such
+    outcome".
+    """
+    return {
+        "proposals": len(verdicts),
+        "applied": sum(1 for v in verdicts if v.applied is True),
+        "not_applied": sum(1 for v in verdicts if v.applied is False),
+        "applied_unknown": sum(1 for v in verdicts if v.applied is None),
+        "outcomes": {
+            outcome.value: sum(1 for v in verdicts if v.outcome is outcome)
+            for outcome in VerifyOutcome
+        },
+    }
+
+
+def _facts_payload(facts: ArtifactFacts) -> dict[str, object]:
+    return {
+        "engine": facts.engine,
+        "window_description": facts.window_description,
+        "total_cost_ms": facts.total_cost_ms,
+        "query_groups": facts.query_groups,
+        "degraded": [{"capability": cap, "reason": reason} for cap, reason in facts.degraded],
+        "matched_proposals": facts.matched_proposals,
+        "unmatched_keys": [list(key) for key in facts.collisions],
+    }
+
+
+def verify_payload(
+    verdicts: Sequence[ProposalVerdict],
+    before: dict[str, object],
+    after: dict[str, object],
+) -> dict:
+    """JSON-serializable summary of a `verify` run.
+
+    Carries the caveats as data (`caveats`), not only as terminal text: a machine consumer
+    that reports "4 improved" without the window relation and its consequences would
+    reproduce, one layer up, exactly the over-claim this feature exists to prevent.
+    """
+    context = verify_context(before, after)
+    return {
+        "before": _facts_payload(context.before),
+        "after": _facts_payload(context.after),
+        "window_relation": context.relation.value,
+        "confidence_ceiling": context.ceiling.value,
+        "limit": {
+            "before": context.limits.before,
+            "after": context.limits.after,
+            "may_be_sampling_artifact": context.limits.may_be_sampling_artifact,
+        },
+        "caveats": verify_caveats(context),
+        "summary": verify_summary(verdicts),
+        "new_in_after": [list(key) for key in context.new_in_after],
+        "verdicts": [
+            {
+                "key": list(verdict.key),
+                "code": verdict.code,
+                "applied": verdict.applied,
+                "outcome": verdict.outcome.value,
+                "confidence": verdict.confidence.value,
+                "mean_ms_before": verdict.mean_before,
+                "mean_ms_after": verdict.mean_after,
+                "cost_share_before": verdict.cost_share_before,
+                "cost_share_after": verdict.cost_share_after,
+                "note": verdict.note,
+            }
+            for verdict in verdicts
+        ],
+    }
+
+
+def render_verify_markdown(
+    verdicts: Sequence[ProposalVerdict],
+    before: dict[str, object],
+    after: dict[str, object],
+) -> str:
+    """Render a `verify` run as markdown (suitable for a ticket or PR comment).
+
+    Every value goes through `_md_escape` for the same reason `render_advise_markdown`'s do:
+    a proposal key is built from live catalog identifiers, and one containing a `|` or a
+    newline would otherwise fabricate table columns or rows.
+    """
+    context = verify_context(before, after)
+    summary = verify_summary(verdicts)
+    outcomes = summary["outcomes"]
+    improved = outcomes["improved"] if isinstance(outcomes, dict) else 0
+    lines = [
+        f"# sqlquality verify — {_md_escape(context.before.engine)}",
+        "",
+        f"**Proposals graded:** {summary['proposals']}  ",
+        f"**Applied:** {summary['applied']} (not applied {summary['not_applied']}, "
+        f"could not tell {summary['applied_unknown']})  ",
+        f"**Improved:** {improved}  ",
+        f"**Window relation:** {context.relation.value} "
+        f"(confidence ceiling: {context.ceiling.value})",
+        "",
+        f"**Before window:** {_md_escape(context.before.window_description)}  ",
+        f"**After window:** {_md_escape(context.after.window_description)}",
+        "",
+        _md_escape(verify_workload_line(context)),
+        "",
+        "## What this comparison can and cannot say",
+        "",
+    ]
+    lines += [f"- {_md_escape(caveat)}" for caveat in verify_caveats(context)]
+    lines.append("")
+    if not verdicts:
+        lines.append(
+            "No proposal in the before run could be graded — see the caveats above for why."
+        )
+        return "\n".join(lines) + "\n"
+    lines += [
+        "| proposal | applied | outcome | mean per call | confidence |",
+        "|---|---|---|---|---|",
+    ]
+    for verdict in verdicts:
+        lines.append(
+            f"| {_md_escape(verify_proposal_label(verdict.key))} "
+            f"| {verify_applied_label(verdict.applied)} "
+            f"| {verdict.outcome.value} "
+            f"| {_md_escape(verify_mean_cell(verdict))} "
+            f"| {verdict.confidence.value} |"
+        )
+    lines.append("")
+    lines.append("## Detail")
+    lines.append("")
+    for verdict in verdicts:
+        lines.append(f"### {_md_escape(verify_proposal_label(verdict.key))}")
+        lines.append("")
+        lines.append(
+            f"- applied: {verify_applied_label(verdict.applied)}, "
+            f"outcome: {verdict.outcome.value}, confidence: {verdict.confidence.value}"
+        )
+        lines.append(f"- mean per call: {_md_escape(verify_mean_cell(verdict))}")
+        # `cost_share` rides along as context — whether the finding still *matters* — never
+        # as the measure of whether it got better (the design spec's decision 4).
+        lines.append(
+            "- cost share (context, not a speed measure): "
+            f"{_share_text(verdict.cost_share_before)} → {_share_text(verdict.cost_share_after)}"
+        )
+        if verdict.note:
+            lines.append(f"- {_md_escape(verdict.note)}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _share_text(share: float | None) -> str:
+    """A cost share as a percentage, or an em dash when the artifact does not carry one.
+
+    Matches `cli.advise`'s and `render_advise_markdown`'s existing rendering of the same
+    value, so the same number does not appear in two formats across two commands.
+    """
+    return f"{share:.1%}" if share is not None else "—"

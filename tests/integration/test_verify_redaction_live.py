@@ -209,4 +209,14 @@ def test_two_real_advise_runs_differing_only_in_keep_literals_claim_no_speed_com
     )
     assert verdict.mean_before is None and verdict.mean_after is None
     assert "redaction" in verdict.note, verdict.note
-    assert "no longer appear" not in verdict.note, verdict.note
+    # Every phrasing in `verdicts` that states whether the cited groups are in the after run,
+    # not only the `DISAPPEARED` branch's exact words: pinning one branch's wording left its
+    # two siblings free to make the same claim in a different sentence, which is how sinking
+    # the incomparability check below the `applied is None` branch survived the whole suite.
+    # See `_GROUP_LEVEL_CLAIMS` in tests/test_verify.py, this assertion's unit-level twin.
+    for claim in (
+        "no longer appear in the after run",
+        "absent from the after run",
+        "present in the after run",
+    ):
+        assert claim not in verdict.note, verdict.note
