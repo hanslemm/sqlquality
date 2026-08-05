@@ -953,13 +953,22 @@ real change would), recommendations whose key matched more than one proposal *wi
 own artifact* (reported as unmatched — neither disappeared nor new), and proposals only the
 after run makes (no verdict, because there is nothing to compare them against).
 
-**An after-only proposal is only called a *new* finding when the before run's coverage
-supports that.** If the before run's reads were degraded, or its window sampled fewer (or an
-unknown number of) query groups, it may never have had the evidence to make that
-recommendation — so its absence is a fact about that run, not about your database. `verify`
-still lists those proposals, and says why it will not call them new. This is the same
-treatment a query group's absence from the *after* run already gets before `disappeared` may
-be graded; the two directions of the same reasoning are deliberately symmetric.
+**An after-only proposal is only called a *new* finding when both runs' coverage supports
+that.** Three things withhold the claim:
+
+- the **before** run's reads were degraded, so it may never have had the evidence to make that
+  recommendation — its absence is then a fact about that run, not about your database;
+- the **before** run's window sampled fewer (or an unknown number of) query groups, for the
+  same reason;
+- the **after** run's reads were degraded in a way that can *relax* a rule rather than silence
+  it. A rule that cannot evaluate a threshold proposes anyway at reduced confidence — the right
+  posture for `advise`, which discloses rather than withholds — so a run that could not read
+  table sizes, or could not see an index that already covers the predicate, can make a
+  recommendation a fully-observed run would not have made at all.
+
+In each case `verify` still lists those proposals and says why it will not call them new. This
+is the same treatment a query group's absence from the *after* run already gets before
+`disappeared` may be graded; the directions of the same reasoning are deliberately symmetric.
 
 ### check (the CI gate)
 

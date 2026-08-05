@@ -1404,6 +1404,80 @@ def _absence_disclosure(payload: dict[str, object], absence: Absence, side: str)
     )
 
 
+#: Degradations whose denial **in a run** can make that run emit a proposal a fully-observed run
+#: would have withheld — a *presence* fabricated by missing coverage, and the exact inverse of
+#: every `Absence` above. Deliberately **not** an `Absence` member and deliberately not the same
+#: set as `_ABSENCE_DEPENDENCIES[Absence.BEFORE_COUNTERPART]`: nothing is missing from the
+#: artifact here, so there is no absence to gate, and the two directions have genuinely different
+#: memberships (see `new_proposal_disclosure`).
+#:
+#: The mechanism is that a rule which withholds on a threshold it cannot evaluate proposes anyway
+#: at reduced confidence — the correct posture for `advise`, whose job is to disclose rather than
+#: withhold, and a false claim once `verify` reads the resulting proposal as *new*.
+#:
+#: **Two routes, both measured against the real `advise` path (only `connect` stubbed):**
+#:
+#: * `table_facts` — a 50-row table yields **no** proposal when `pg_total_relation_size` is
+#:   readable, and `ADV001` at `low` when it is denied: the size threshold cannot be applied, so
+#:   the rule stops withholding.
+#: * `indexes` — a table whose hot predicate is already covered by an existing index yields
+#:   **no** proposal when `pg_index` is readable, and `ADV001` at `low` when it is denied: the
+#:   coverage check cannot see the index that makes the recommendation redundant.
+#:
+#: `ndv` is included **without** a demonstrated route, for the same reason and on the same
+#: measurement recorded at `_ABSENCE_DEPENDENCIES`: every `n_distinct` tried (`1.0`, `1.5`, `2.0`,
+#: `0.5`, `-0.9`, `-0.02`) still produced an `ADV001`, so the withhold boundary could not be
+#: crossed from this side — but a denied `pg_stats` read demonstrably *does* change that rule's
+#: grade (`low` with NDV known, `medium` with it denied), which is enough to show the value
+#: participates in the gating logic. An unproven premise is disclosed, not assumed.
+#:
+#: Excluded, each because it can only ever *remove* proposals: `workload` and `schema` empty the
+#: rules' input entirely (measured: `proposals: []`); `advisor`'s rows only ever add ADV105, so a
+#: denial removes it; `physical_facts_gap` is recorded *because* facts are missing and makes
+#: `propose` decline ADV101/ADV102/ADV103; `read_only` and `stats_reset` read nothing any rule
+#: consumes. Pinned by `test_every_proposal_relaxing_degradation_is_a_name_an_adapter_records`.
+_PROPOSAL_RELAXING_DEGRADATIONS: Final[frozenset[str]] = frozenset(
+    {_CAP_TABLE_FACTS, _CAP_INDEXES, _CAP_NDV}
+)
+
+
+def _relaxation_disclosure(payload: dict[str, object], side: str) -> str | None:
+    """Why a proposal `payload` makes may be `payload`'s own missing coverage rather than a real
+    finding — or `None` when nothing it declares could have relaxed a rule into proposing.
+
+    The mirror of `_absence_disclosure`, for the opposite mechanism, and deliberately a separate
+    function rather than a fourth branch inside it: that one answers "could this emptiness be
+    fake?", this one answers "could this *presence* be fake?", and the two take different sets.
+
+    Two independent reasons to withhold, both reported when both apply — the same two shapes
+    `_absence_disclosure` uses, for the same reasons:
+
+    * `payload` declares a degradation in `_PROPOSAL_RELAXING_DEGRADATIONS`.
+    * `payload` declares a degradation this version of `verify` cannot name at all (an artifact
+      from a newer `sqlquality`): whether it relaxes a rule, suppresses one, or neither cannot be
+      bounded, so it is disclosed rather than assumed harmless in this direction either.
+    """
+    declared = _degraded_names(payload)
+    relaxing = sorted(declared & _PROPOSAL_RELAXING_DEGRADATIONS)
+    unrecognized = sorted(declared - KNOWN_DEGRADATIONS)
+    if not relaxing and not unrecognized:
+        return None
+    causes: list[str] = []
+    if relaxing:
+        causes.append("degraded read(s) " + ", ".join(relaxing))
+    if unrecognized:
+        causes.append(
+            "degradation(s) this version of sqlquality cannot interpret ("
+            + ", ".join(unrecognized)
+            + ")"
+        )
+    return (
+        f"The {side} run reported {' and '.join(causes)} in its `degraded` list; a rule that "
+        f"cannot evaluate a threshold proposes anyway rather than withholding, so the {side} run "
+        "may have made a recommendation a fully-observed run would not have made at all."
+    )
+
+
 def new_proposal_disclosure(before: dict[str, object], after: dict[str, object]) -> str | None:
     """Why a proposal present only in `after` might **not** be a new finding — or `None` when
     `before`'s own coverage does rule that out.
@@ -1429,16 +1503,31 @@ def new_proposal_disclosure(before: dict[str, object], after: dict[str, object])
     drawn from an absence on *either* side belongs behind this function or `_absence_disclosure`,
     and behind an `Absence` member first — see `Absence`'s docstring.
 
-    Two independent arms, both reported when both apply:
+    **Three independent arms, all reported when all apply. The third is the sixth door**, found
+    while measuring the second: two of them are about `before` not having *seen* the finding,
+    and the third is about `after` not having seen enough to *withhold* it.
 
     * **`before` declares a degradation that can suppress a proposal** —
       `_absence_disclosure(before, Absence.BEFORE_COUNTERPART, "before")`, whose dependency set
       is deliberately wide (see `_ABSENCE_DEPENDENCIES`).
+    * **`after` declares a degradation that can *relax* a rule into proposing** —
+      `_relaxation_disclosure(after, "after")`. The inverse mechanism, the same false sentence:
+      a rule that withholds on a threshold it cannot evaluate proposes anyway, at reduced
+      confidence, so a degraded `after` emits a recommendation a fully-observed `before`
+      correctly withheld — and calling that "new" states as a fact about the user's database
+      something produced by `after`'s own missing coverage. Measured on the real `advise` path;
+      see `_PROPOSAL_RELAXING_DEGRADATIONS` for the two demonstrated routes.
     * **`WindowLimits.may_be_sampling_artifact`** — a `before` run that sampled fewer (or an
       unknown number of) query groups may simply never have had the evidence to make the
       proposal. Read through the same predicate `verdicts` uses for `DISAPPEARED`, rather than
       `before < after`, so the symmetry is exact and an *unknown* limit counts, which is the
       inversion `WindowLimits`' own docstring exists to make unreachable.
+
+    Note that the two degradation arms are **not** symmetric and must not be collapsed into one
+    set: a denied `workload` or `schema` read can only ever *remove* proposals (it empties the
+    rules' input), so it belongs to the `before` arm alone, while a denied `table_facts` or
+    `indexes` read can add one, so it belongs to both. Using one set for both sides would either
+    over-disclose on every `after` degradation or miss the relaxation entirely.
 
     Returns a complete sentence (or sentences) for the caveat to render; the caller keeps
     listing the keys either way, because suppressing the list would hide a genuinely new
@@ -1448,6 +1537,9 @@ def new_proposal_disclosure(before: dict[str, object], after: dict[str, object])
     withheld = _absence_disclosure(before, Absence.BEFORE_COUNTERPART, "before")
     if withheld is not None:
         reasons.append(withheld)
+    relaxed = _relaxation_disclosure(after, "after")
+    if relaxed is not None:
+        reasons.append(relaxed)
     limits = window_limits(before, after)
     if limits.may_be_sampling_artifact:
         reasons.append(
