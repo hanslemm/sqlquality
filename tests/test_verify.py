@@ -8,9 +8,7 @@ invented, so a test failure here means the real rule's evidence would be mis-key
 
 from __future__ import annotations
 
-import pytest
-
-from sqlquality.verify import ProposalKeyCollisionError, group_index, index_proposals, proposal_key
+from sqlquality.verify import ProposalIndex, group_index, index_proposals, proposal_key
 
 
 # --- relation-scoped, plural `columns` (ADV001, ADV002, ADV003, ADV004, ADV007, ADV008) ---
@@ -141,6 +139,25 @@ def test_a_statement_scoped_finding_keys_on_code_and_fingerprint():
     ) == ("ADV006", "def456def456")
 
 
+def test_a_proposal_with_both_a_relation_and_a_fingerprint_keys_by_the_relation():
+    """No rule emits both today (every relation-scoped rule carries `fingerprint_digests`,
+    never a singular `fingerprint`), but the branch precedence must not be an accident: a
+    proposal naming a table is identified by that table, not by incidentally which single
+    query happened to trigger it this run. If this ever flipped, every relation-scoped key
+    would silently degrade from a 4+-tuple to a 2-tuple the moment a rule's evidence grew a
+    `fingerprint` field."""
+    proposal = {
+        "code": "ADV001",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "columns": ["status"],
+            "fingerprint": "shouldnotwin1",
+        },
+    }
+    assert proposal_key(proposal) == ("ADV001", "public", "orders", "status")
+
+
 # --- unkeyable ---
 
 
@@ -165,7 +182,11 @@ def test_two_adv104_proposals_for_one_relation_get_distinct_keys():
     """redshift.py's `propose_maintenance` — VACUUM and ANALYZE are two independent `if`
     statements (not `if`/`elif`), so a relation whose `unsorted` *and* `stats_off` both
     cross their thresholds emits two ADV104 proposals with identical schema/table and no
-    column. Evidence copied verbatim from ~lines 793 and 823."""
+    column. Evidence copied verbatim from ~lines 793 and 823. Asserted as full tuples, not
+    only `!=` and a shared prefix: a mutant swapping the `ddl` fallback for `proposal["title"]`
+    still makes these two keys unequal (the titles differ too), so only pinning the exact
+    expected tuple — which encodes `ddl` specifically, not just "some string differs" —
+    catches that substitution."""
     vacuum = {
         "code": "ADV104",
         "title": "Run VACUUM on public.orders",
@@ -183,14 +204,8 @@ def test_two_adv104_proposals_for_one_relation_get_distinct_keys():
         },
         "ddl": "ANALYZE public.orders;",
     }
-    key_vacuum = proposal_key(vacuum)
-    key_analyze = proposal_key(analyze)
-    assert key_vacuum is not None
-    assert key_analyze is not None
-    assert key_vacuum != key_analyze
-    # Both still key to the same relation as a prefix — only the trailing discriminator differs.
-    assert key_vacuum[:3] == ("ADV104", "public", "orders")
-    assert key_analyze[:3] == ("ADV104", "public", "orders")
+    assert proposal_key(vacuum) == ("ADV104", "public", "orders", "VACUUM public.orders;")
+    assert proposal_key(analyze) == ("ADV104", "public", "orders", "ANALYZE public.orders;")
 
 
 def test_two_indexes_on_the_same_columns_get_distinct_keys_by_index_name():
@@ -229,10 +244,127 @@ def test_two_indexes_on_the_same_columns_get_distinct_keys_by_index_name():
     assert key_b == ("ADV002", "public", "orders", "customer_id", "orders_customer_id_idx2")
 
 
+# --- Minor 7 (review round 1): ADV004's guard must be folded into the key ---
+
+
+def test_adv004_partial_index_keys_include_the_guard_column_and_predicate():
+    """`WHERE shipped_at IS NULL` and `WHERE cancelled_at IS NOT NULL`, both restricting a
+    partial index on the same leading column, are different proposals. Evidence copied
+    verbatim from postgres.py's `propose_partial_indexes`, ~line 1049."""
+    shipped_at_guard = {
+        "code": "ADV004",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "columns": ["customer_id"],
+            "guard_column": "shipped_at",
+            "guard_predicate": "IS NULL",
+        },
+    }
+    cancelled_at_guard = {
+        "code": "ADV004",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "columns": ["customer_id"],
+            "guard_column": "cancelled_at",
+            "guard_predicate": "IS NOT NULL",
+        },
+    }
+    assert proposal_key(shipped_at_guard) == (
+        "ADV004",
+        "public",
+        "orders",
+        "customer_id",
+        "shipped_at",
+        "IS NULL",
+    )
+    assert proposal_key(cancelled_at_guard) == (
+        "ADV004",
+        "public",
+        "orders",
+        "customer_id",
+        "cancelled_at",
+        "IS NOT NULL",
+    )
+    assert proposal_key(shipped_at_guard) != proposal_key(cancelled_at_guard)
+
+
+# --- Critical 1 / Important 2 (review round 1): ADV105 must not key on its own `ddl` ---
+
+
+def test_adv105_two_recommendations_with_a_null_ddl_get_distinct_keys():
+    """`propose_advisor` evidence (`redshift.py` ~line 906): `recommended_ddl` is `str |
+    None` — Amazon Redshift Advisor's own output, not sqlquality's. Two Advisor rows for
+    one relation with different `rec_type` and a NULL `recommended_ddl` both fell back to
+    `ddl` (`None`) before this fix and produced the identical key `("ADV105", schema,
+    table)`, which made `index_proposals` treat two live recommendations as one ambiguous
+    collision. `evidence["recommendation_type"]` must be used instead and take priority
+    over the `ddl` fallback."""
+    sort_rec = {
+        "code": "ADV105",
+        "title": "Amazon Redshift Advisor recommends a sort change for public.orders",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "source": "amazon_redshift_advisor",
+            "recommendation_type": "sort",
+            "current_ddl": None,
+            "recommended_ddl": None,
+        },
+        "ddl": None,
+    }
+    dist_rec = {
+        "code": "ADV105",
+        "title": "Amazon Redshift Advisor recommends a dist change for public.orders",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "source": "amazon_redshift_advisor",
+            "recommendation_type": "dist",
+            "current_ddl": None,
+            "recommended_ddl": None,
+        },
+        "ddl": None,
+    }
+    assert proposal_key(sort_rec) == ("ADV105", "public", "orders", "sort")
+    assert proposal_key(dist_rec) == ("ADV105", "public", "orders", "dist")
+    assert proposal_key(sort_rec) != proposal_key(dist_rec)
+
+
+def test_adv105_key_is_stable_even_if_advisors_relayed_ddl_text_drifts():
+    """`recommended_ddl` is Advisor's own verbatim text — whitespace or column-ordering
+    drift between two runs of the *same* recommendation must not change the key, or
+    `verify` would report one stable Advisor recommendation as both `disappeared` and
+    `new`. The key must come from `recommendation_type` alone, never from `ddl`, once a
+    discriminator already exists."""
+    run_a = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": "ALTER TABLE public.orders ALTER SORTKEY (a, b);",
+        },
+        "ddl": "ALTER TABLE public.orders ALTER SORTKEY (a, b);",
+    }
+    run_b = {
+        "code": "ADV105",
+        "evidence": {
+            "schema": "public",
+            "table": "orders",
+            "recommendation_type": "sort",
+            "recommended_ddl": "ALTER TABLE public.orders ALTER SORTKEY (a,b);",
+        },
+        "ddl": "ALTER TABLE public.orders ALTER SORTKEY (a,b);",
+    }
+    assert proposal_key(run_a) == proposal_key(run_b) == ("ADV105", "public", "orders", "sort")
+
+
 # --- index_proposals ---
 
 
-def test_index_proposals_builds_one_entry_per_distinct_key():
+def test_index_proposals_builds_one_matched_entry_per_distinct_key():
     payload = {
         "proposals": [
             {
@@ -247,45 +379,47 @@ def test_index_proposals_builds_one_entry_per_distinct_key():
                 "evidence": {"schema": "public", "table": "orders", "stats_off": 20.0},
                 "ddl": "ANALYZE public.orders;",
             },
-            # Unkeyable — must be silently excluded, not raised on.
+            # Unkeyable — must be silently excluded, not treated as a collision.
             {"code": "ADV999", "evidence": {}},
         ]
     }
-    index = index_proposals(payload)
-    assert len(index) == 2
-    titles = {key: proposal["title"] for key, proposal in index.items()}
-    assert "Run VACUUM on public.orders" in titles.values()
-    assert "Run ANALYZE on public.orders" in titles.values()
+    result = index_proposals(payload)
+    assert isinstance(result, ProposalIndex)
+    assert len(result.matched) == 2
+    assert result.collisions == {}
+    titles = {proposal["title"] for proposal in result.matched.values()}
+    assert titles == {"Run VACUUM on public.orders", "Run ANALYZE on public.orders"}
 
 
-def test_index_proposals_raises_rather_than_silently_dropping_on_a_genuine_key_collision():
+def test_index_proposals_discloses_rather_than_silently_dropping_on_a_genuine_key_collision():
     """A dict comprehension that overwrites is the defect this guards against: contrive two
-    distinct proposals that share a relation but carry none of `columns`/`column`/`index`
-    and no `ddl` either (a hypothetical future rule's evidence shape `proposal_key` cannot
-    yet discriminate) and confirm the losing proposal does not simply vanish."""
-    payload = {
-        "proposals": [
-            {
-                "code": "ADV999",
-                "title": "First finding for public.orders",
-                "evidence": {"schema": "public", "table": "orders"},
-                "ddl": None,
-            },
-            {
-                "code": "ADV999",
-                "title": "Second, different finding for public.orders",
-                "evidence": {"schema": "public", "table": "orders"},
-                "ddl": None,
-            },
-        ]
+    distinct proposals that share a relation but carry none of the discriminators
+    `proposal_key` currently applies (a hypothetical future rule's evidence shape it cannot
+    yet tell apart) and confirm neither is lost — both surface in `.collisions`, and the
+    ambiguous key is absent from `.matched` rather than pointing at whichever proposal
+    happened to be seen last."""
+    first = {
+        "code": "ADV999",
+        "title": "First finding for public.orders",
+        "evidence": {"schema": "public", "table": "orders"},
+        "ddl": None,
     }
-    with pytest.raises(ProposalKeyCollisionError):
-        index_proposals(payload)
+    second = {
+        "code": "ADV999",
+        "title": "Second, different finding for public.orders",
+        "evidence": {"schema": "public", "table": "orders"},
+        "ddl": None,
+    }
+    result = index_proposals({"proposals": [first, second]})
+    key = ("ADV999", "public", "orders")
+    assert key not in result.matched
+    assert key in result.collisions
+    assert result.collisions[key] == (first, second)
 
 
 def test_index_proposals_ignores_a_payload_with_no_proposals_list():
-    assert index_proposals({}) == {}
-    assert index_proposals({"proposals": "not-a-list"}) == {}
+    assert index_proposals({}) == ProposalIndex(matched={}, collisions={})
+    assert index_proposals({"proposals": "not-a-list"}) == ProposalIndex(matched={}, collisions={})
 
 
 # --- group_index ---
