@@ -919,6 +919,7 @@ def advise(
         redacted=not keep_literals,
         degraded=adapter.degraded,
         dbt=dbt_payload,
+        window_facts=adapter.window_facts(),
     )
     # Both writes happen after the whole analysis, so an unwritable path would otherwise
     # discard the work *and* exit 1 — the code the epilog reserves for "findings or gate

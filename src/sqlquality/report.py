@@ -144,6 +144,7 @@ def advise_payload(
     redacted: bool,
     degraded: list[tuple[str, str]],
     dbt: dict | None = None,
+    window_facts: dict[str, object] | None = None,
 ) -> dict:
     """JSON-serializable summary of an advise run.
 
@@ -157,11 +158,30 @@ def advise_payload(
     plain, JSON-serializable dict (a `Path` or a `Relation` is not — `cli.advise` already
     stringifies the manifest path before building this dict), since this function does not
     itself normalize it the way `_jsonable` normalizes proposal evidence.
+
+    `window_facts` is the adapter's own `WorkloadAdapter.window_facts()` — `{}` (the
+    default) when the caller has none, exactly like every existing caller before this
+    parameter existed. `"window"` is an object rather than the bare string it used to be:
+    a prose sentence cannot be compared across two runs, which is what `verify` needs to
+    do. Each fact is present-but-null rather than absent when unknown — see the comment
+    below — because an *absent* key is how `verify` tells a pre-this-feature artifact
+    apart from one that genuinely has nothing to report for a field.
     """
+    window_facts = dict(window_facts or {})
     payload = {
         "engine": engine,
         "redacted": redacted,
-        "window": workload.window_description,
+        "window": {
+            "description": workload.window_description,
+            "engine": engine,
+            # Present-but-null rather than absent: `verify` treats an absent key as a
+            # payload from a version that predates this feature and refuses the artifact,
+            # while null means "this engine cannot tell you", which is comparable
+            # information.
+            "stats_reset_at": window_facts.get("stats_reset_at"),
+            "since": window_facts.get("since"),
+            "limit": window_facts.get("limit"),
+        },
         "analyzed": {
             # The count of groups whose usage was actually extracted — not `len(stats)`,
             # which includes the unresolvable and ambiguous groups reported under "skipped"

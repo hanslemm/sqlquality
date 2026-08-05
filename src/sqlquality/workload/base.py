@@ -135,3 +135,17 @@ class WorkloadAdapter(ABC):
     @abstractmethod
     def render_ddl(self, proposals: list[Proposal]) -> str:
         """A reviewable DDL script for the proposals that carry DDL. Never executed."""
+
+    def window_facts(self) -> dict[str, object]:
+        """Structured facts about the window `fetch_workload` just read, for the payload.
+
+        Not abstract, and returns `{}` by default, because an adapter that knows none of
+        these is a legitimate state rather than an unfinished one — the payload fills the
+        gaps with `None`. What each field is for: `stats_reset_at` tells a later
+        comparison whether cumulative counters were cleared between two runs (the
+        difference between two independent samples and one containing the other), `since`
+        whether a duration filter was genuinely applied, and `limit` whether the window
+        was truncated. Reporting a `since` an engine did not apply would make an
+        incomparable pair look comparable, which is worse than reporting nothing.
+        """
+        return {}

@@ -303,6 +303,44 @@ def test_fetch_workload_window_is_honest_that_since_is_not_supported():
     assert "since stats reset" in fetch.window_description.lower()
 
 
+def test_postgres_reports_its_stats_reset_time_and_cannot_report_since():
+    """`pg_stat_statements` is cumulative with no per-statement timestamps, so `--since`
+    is never applied and must be reported as such rather than echoed back."""
+    adapter = PostgresWorkloadAdapter(
+        querier=_canned({CAP_STATS_RESET: [("2026-08-01T00:00:00",)]})
+    )
+    adapter.fetch_workload(timedelta(days=7), 500)
+    facts = adapter.window_facts()
+    assert facts["stats_reset_at"] == "2026-08-01T00:00:00"
+    assert facts["since"] is None, "Postgres cannot honour --since; claiming it did would lie"
+    assert facts["limit"] == 500
+
+
+def test_postgres_window_facts_do_not_issue_sql():
+    """`window_facts()` must read only what `fetch_workload` already recorded on the
+    instance — a method that queries would break `--dry-run` and re-read the catalog for a
+    payload field.
+
+    Recording the call rather than raising from the stub: `_run` swallows any exception
+    into `degraded` and returns `[]`, so a stub that raises would be silently absorbed and
+    this test would pass whether or not `window_facts()` actually queried.
+    """
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_STATS_RESET: [("2026-08-01",)]}))
+    adapter.fetch_workload(timedelta(days=7), 500)
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.window_facts()
+    assert calls == [], "window_facts() must not issue any SQL"
+
+
+def test_postgres_window_facts_are_null_before_any_fetch():
+    """Present-but-null before `fetch_workload` has ever run — not an unset/absent state,
+    which is exactly the distinction the payload relies on."""
+    adapter = PostgresWorkloadAdapter(querier=_canned({}))
+    facts = adapter.window_facts()
+    assert facts == {"stats_reset_at": None, "since": None, "limit": None}
+
+
 def test_a_null_stats_reset_reads_as_an_unknown_time_not_as_None():
     """`stats_reset` is SQL NULL until someone resets statistics — the *default* state.
 

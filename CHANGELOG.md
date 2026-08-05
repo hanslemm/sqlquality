@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** `advise --json`'s `"window"` key is now an object —
+  `{"description": str, "engine": str, "stats_reset_at": str | None, "since": str | None,
+  "limit": int | None}` — rather than the bare prose string it was in 0.3.0. A sentence
+  cannot be compared across two runs, and the upcoming `sqlquality verify` command needs
+  to tell whether a baseline and a follow-up windows are disjoint, nested (Postgres's
+  cumulative `pg_stat_statements` counters were never reset between the two, so the
+  baseline is really a subset of the follow-up) or otherwise comparable before it can
+  grade its own confidence. The old `description` string is unchanged and still present,
+  under that key. **Artifacts produced by 0.3.0 are not accepted by `verify`** — this
+  key's shape is exactly how it tells an old artifact apart from one that genuinely has
+  nothing to report for a field, so regenerate any saved baseline with the current
+  version before verifying it.
+
 ## [0.3.0] - 2026-08-03
 
 `advise` is new in this release. Everything below describes it as it ships; it has no

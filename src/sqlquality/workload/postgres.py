@@ -1422,6 +1422,14 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         #: appended two identical entries to `degraded` when it was denied, telling the user
         #: about one missing grant twice.
         self._schema_cache: dict[tuple[str, ...], list[tuple[object, ...]]] = {}
+        #: Recorded by `fetch_workload` for `window_facts()` to report without re-querying —
+        #: `window_facts()` must not issue SQL, since it is read for the payload after the
+        #: whole analysis (including `--dry-run`) has already run. `None` until
+        #: `fetch_workload` runs, or if `pg_stat_database.stats_reset` came back SQL NULL or
+        #: denied — both indistinguishable from "unknown" here.
+        self._stats_reset_at: str | None = None
+        #: The `limit` passed to the most recent `fetch_workload`, for the same reason.
+        self._window_limit: int | None = None
 
     def introspection_sql(self) -> list[IntrospectionStatement]:
         return [
@@ -1494,15 +1502,22 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
         # `pg_stat_database.stats_reset` for any database whose statistics have never been
         # reset. The row is then `(None,)`: non-empty, hence truthy, so testing the row's
         # emptiness printed "since stats reset at None". The value's nullness is what matters.
-        reset_at: object = "an unknown time"
+        reset_value: object | None = None
         if reset and reset[0] and reset[0][0] is not None:
-            reset_at = reset[0][0]
+            reset_value = reset[0][0]
+        reset_at: object = "an unknown time" if reset_value is None else reset_value
         # pg_stat_statements is cumulative since reset and carries no per-statement
         # timestamps before PG 17, so --since cannot be honored. Say so rather than
         # implying the requested window was applied.
         window = f"since stats reset at {reset_at}"
         if since is not None:
             window += " (--since is not supported by pg_stat_statements)"
+        # Recorded for `window_facts()`, which must not issue SQL of its own — see that
+        # method's docstring. `since` is deliberately not recorded here at all: Postgres
+        # never honors it, and `window_facts()` reports `None` unconditionally rather than
+        # echoing back what the caller asked for.
+        self._stats_reset_at = str(reset_value) if reset_value is not None else None
+        self._window_limit = limit
         return WorkloadFetch(
             rows=tuple(
                 RawQueryRow(sql=str(sql), calls=_as_int(calls), total_time_ms=_as_float(total_ms))
@@ -1510,6 +1525,21 @@ class PostgresWorkloadAdapter(WorkloadAdapter):
             ),
             window_description=window,
         )
+
+    def window_facts(self) -> dict[str, object]:
+        """What `fetch_workload` already read, recorded rather than re-queried.
+
+        `since` is always `None`: `pg_stat_statements` carries no per-statement
+        timestamps, so `--since` is never actually applied here, whatever the caller
+        passed. Echoing it back would make a baseline/verification pair that is really
+        *nested* — the follow-up's cumulative counters contain the baseline's — look
+        *comparable*, which is worse than reporting nothing.
+        """
+        return {
+            "stats_reset_at": self._stats_reset_at,
+            "since": None,
+            "limit": self._window_limit,
+        }
 
     def _schema_rows(self, schemas: tuple[str, ...]) -> list[tuple[object, ...]]:
         """CAP_SCHEMA rows, fetched at most once per schema tuple. See `_schema_cache`."""
