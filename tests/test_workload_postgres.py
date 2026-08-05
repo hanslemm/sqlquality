@@ -502,6 +502,26 @@ def test_a_denied_catalog_read_is_present_but_null_not_a_false_measurement():
     assert entry["indexes"] is None, "a denied read must read as unknown, not []"
 
 
+def test_a_relation_with_indexes_genuinely_fetched_and_found_to_have_none_reports_empty_list():
+    """The other half of the same distinction: `indexes: []` is a genuine measurement
+    ("we looked, and there are none"), not a stand-in for "we did not look" — and that half
+    was unpinned. Mutating `have_indexes` to check `self._indexes_cache` (which only ever
+    gains a relation `CAP_INDEXES` returned at least one row for) instead of
+    `self._indexes_requested` re-creates the original bug for exactly this field: a
+    fetched-and-genuinely-empty relation would read `null`, and `verify` would lose the
+    "the proposed index is still absent" signal for every unindexed table. `is_ordinary_table`
+    already has this pin (`test_a_relation_absent_from_table_facts_is_recorded_as_not_an_ordinary_table`);
+    this is its `indexes` counterpart.
+    """
+    adapter = PostgresWorkloadAdapter(querier=_canned({CAP_INDEXES: []}))
+    adapter.fetch_indexes(("public",), frozenset({Relation("public", "orders")}))
+    state = adapter.physical_state(frozenset({Relation("public", "orders")}))
+    assert state["public.orders"]["indexes"] == [], (
+        "a relation whose indexes were requested and genuinely returned no rows must "
+        "report [], not null — null means 'we did not look'"
+    )
+
+
 def test_postgres_physical_state_does_not_issue_sql():
     """See `window_facts()`'s identical test docstring: a raising stub does not work here
     either, since `_run` swallows any exception into `degraded` and returns `[]` — this
