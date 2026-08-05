@@ -277,6 +277,61 @@ def test_redshift_window_facts_do_not_issue_sql():
     assert calls == [], "window_facts() must not issue any SQL"
 
 
+def test_redshift_records_its_own_levers_and_says_absence_means_less_here():
+    """`svv_table_info` omits empty tables as well as external ones, so
+    `is_ordinary_table: False` on Redshift is weaker evidence than on Postgres."""
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    state = adapter.physical_state(frozenset({Relation("public", "events")}))
+    entry = state["public.events"]
+    # The set assertion alone would pass with only one of these five fields correct — each
+    # is checked on its own so a single wrong or missing field fails by itself.
+    assert entry["is_ordinary_table"] is True
+    assert entry["sortkey1"] == "created_at"
+    assert entry["diststyle"] == "KEY(tenant_id)"
+    assert entry["unsorted"] == 2.0
+    assert entry["stats_off"] == 1.0
+    assert set(entry) >= {"is_ordinary_table", "sortkey1", "diststyle", "unsorted", "stats_off"}
+
+
+def test_redshift_physical_state_reports_absence_as_not_an_ordinary_table():
+    """A relation `svv_table_info` never returned a row for — external, or genuinely empty
+    — reads as `is_ordinary_table: False`, the same boolean Postgres uses for a stronger
+    reason (see this function's docstring in `redshift.py`)."""
+    adapter = RedshiftWorkloadAdapter(querier=_canned({CAP_TABLE_FACTS: []}))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "spectrum_tbl")}))
+    state = adapter.physical_state(frozenset({Relation("public", "spectrum_tbl")}))
+    entry = state["public.spectrum_tbl"]
+    assert entry["is_ordinary_table"] is False
+    assert entry["sortkey1"] is None
+    assert entry["diststyle"] is None
+    assert entry["unsorted"] is None
+    assert entry["stats_off"] is None
+
+
+def test_redshift_physical_state_does_not_issue_sql():
+    """See `window_facts()`'s identical test docstring: a raising stub does not work here
+    either, since `_run` swallows any exception into `degraded` and returns `[]` — this
+    test would pass whether or not `physical_state` queried. Count calls instead.
+    """
+    rows = {
+        CAP_TABLE_FACTS: [
+            ("public", "events", 1_000_000, 512, 2.0, 1.0, "KEY(tenant_id)", "created_at", 0.1)
+        ]
+    }
+    adapter = RedshiftWorkloadAdapter(querier=_canned(rows))
+    adapter.fetch_table_facts(("public",), frozenset({Relation("public", "events")}))
+    calls = []
+    adapter._query = lambda sql, params: calls.append((sql, params)) or []
+    adapter.physical_state(frozenset({Relation("public", "events")}))
+    assert calls == [], "physical_state() must not issue any SQL"
+
+
 def test_fetch_workload_since_is_actually_bound_into_the_statement():
     """Guards the claim the test above makes in prose: `--since` must change what the
     statement is run with, not just what the sentence says. Without this, a

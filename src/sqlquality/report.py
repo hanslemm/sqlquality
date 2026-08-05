@@ -145,6 +145,7 @@ def advise_payload(
     degraded: list[tuple[str, str]],
     dbt: dict | None = None,
     window_facts: dict[str, object] | None = None,
+    physical_state: dict[str, dict] | None = None,
 ) -> dict:
     """JSON-serializable summary of an advise run.
 
@@ -166,6 +167,17 @@ def advise_payload(
     do. Each fact is present-but-null rather than absent when unknown — see the comment
     below — because an *absent* key is how `verify` tells a pre-this-feature artifact
     apart from one that genuinely has nothing to report for a field.
+
+    `physical_state` is the adapter's own `WorkloadAdapter.physical_state(relations)`,
+    called by the caller (`cli.advise`) with `models.proposal_relations(proposals)` so its
+    size scales with findings rather than with schema size. Unlike `dbt`, this key is
+    **always present** — `{}` (the default) when the caller has none — never omitted:
+    `verify` (a later task) treats an *absent* `physical_state` key as an artifact from a
+    version that predates this feature and refuses it outright, which is a materially
+    different response than "this run found nothing physical to report." Blurring that
+    distinction by omitting the key on an empty result would make a pre-this-feature
+    artifact and a genuinely-empty one indistinguishable to the one caller that needs to
+    tell them apart.
     """
     window_facts = dict(window_facts or {})
     payload = {
@@ -212,6 +224,10 @@ def advise_payload(
             }
             for p in proposals
         ],
+        # Always present, unlike "dbt" below — see this function's docstring for why an
+        # absent key here must mean something different (a pre-this-feature artifact) than
+        # an empty one (this run had nothing physical to report).
+        "physical_state": dict(physical_state or {}),
     }
     if dbt is not None:
         payload["dbt"] = dbt

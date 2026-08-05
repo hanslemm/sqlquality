@@ -1435,6 +1435,36 @@ class RedshiftWorkloadAdapter(WorkloadAdapter):
         self.physical_facts = physical
         return facts
 
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict]:
+        """See `WorkloadAdapter.physical_state`. Reads `self.physical_facts`, populated as
+        a side effect of `fetch_table_facts` during `propose()` — no statement is issued
+        here.
+
+        `is_ordinary_table` is `relation in self.physical_facts` — presence in the last
+        CAP_TABLE_FACTS (`svv_table_info`) result. **This is weaker evidence than
+        Postgres's identically-named field.** Postgres's `CAP_TABLE_FACTS` filters
+        `WHERE c.relkind = 'r'`, so absence there unambiguously means "not an ordinary
+        table" — a view, a foreign table, or a partitioned parent. `svv_table_info`
+        instead omits *both* external (Spectrum) tables — which cannot carry a SORTKEY,
+        DISTKEY or DISTSTYLE at all — and genuinely empty local tables, which can; nothing
+        available to this adapter distinguishes the two (see `RedshiftTableFacts`'s
+        docstring), so `False` here conflates "not a table" with "a table nobody has
+        written to yet". A relation this run never fetched facts for at all reads the same
+        way — absent from `physical_facts`, hence `False` — an honest "nothing fetched"
+        rather than a guess either way.
+        """
+        state: dict[str, dict] = {}
+        for relation in sorted(relations):
+            phys = self.physical_facts.get(relation)
+            state[str(relation)] = {
+                "is_ordinary_table": phys is not None,
+                "sortkey1": phys.sortkey1 if phys is not None else None,
+                "diststyle": phys.diststyle if phys is not None else None,
+                "unsorted": phys.unsorted if phys is not None else None,
+                "stats_off": phys.stats_off if phys is not None else None,
+            }
+        return state
+
     def _advisor_rows(
         self, schemas: tuple[str, ...], relations: frozenset[Relation]
     ) -> list[RedshiftAdvisorRow]:

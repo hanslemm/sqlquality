@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -279,6 +279,33 @@ def cost_share_of(evidence: Mapping[str, object]) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def proposal_relations(proposals: Sequence[Proposal]) -> frozenset[Relation]:
+    """The relations these proposals target, recovered from each proposal's own evidence.
+
+    ``Proposal`` carries no ``Relation`` field of its own — its ``evidence`` is a plain
+    ``dict[str, object]`` so the whole proposal stays JSON-serializable — so this is the
+    one place that reconstitutes it, from the ``schema``/``table`` strings every
+    relation-scoped proposal already carries (see ``propose_indexes`` et al. in
+    ``workload/postgres.py``, and ``propose_sortkey`` et al. in ``workload/redshift.py``).
+    Not every proposal is about exactly one relation — ADV005's leading-wildcard-LIKE
+    finding carries only ``fingerprint``/``sql`` in its evidence, no ``schema``/``table``
+    at all — so a proposal missing either key is simply excluded rather than reconstructed
+    from a placeholder.
+
+    Feeds ``WorkloadAdapter.physical_state``, which the caller scopes to exactly the
+    relations a proposal is about so the payload's size scales with findings, not with
+    schema size — never re-derived by parsing ``ddl``, which is free-form SQL text and not
+    every proposal even carries one (``ADV005`` has no ``ddl`` at all).
+    """
+    relations: set[Relation] = set()
+    for proposal in proposals:
+        schema = proposal.evidence.get("schema")
+        table = proposal.evidence.get("table")
+        if isinstance(schema, str) and isinstance(table, str):
+            relations.add(Relation(schema=schema, table=table))
+    return frozenset(relations)
 
 
 @dataclass(frozen=True)

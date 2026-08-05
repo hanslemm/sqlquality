@@ -149,3 +149,27 @@ class WorkloadAdapter(ABC):
         incomparable pair look comparable, which is worse than reporting nothing.
         """
         return {}
+
+    def physical_state(self, relations: frozenset[Relation]) -> dict[str, dict]:
+        """Physical-design facts behind each of `relations`, for the payload.
+
+        Not abstract, and returns `{}` by default, because an adapter with no physical
+        levers to report — or a caller asking about no relations at all — is a legitimate
+        state rather than an unfinished one. `sqlquality verify` (a later task) diffs this
+        field between two `advise --json` artifacts to *observe* whether a proposal was
+        applied, rather than trust the assertion, so what is recorded here must be the
+        physical facts a later run can compare against, not a restatement of the proposal.
+
+        Keyed by `str(relation)` (`"schema.table"`), never by `Relation` itself: a
+        `Relation` is not JSON-serializable, and this dict flows straight into the
+        `--json` payload — a `TypeError` raised here would fire only after the whole
+        analysis has already run, which this project has shipped once before.
+
+        Must not issue any SQL of its own. This is called after `propose()` has already
+        fetched everything the run needed, so an implementation reads back what that
+        fetch cached on the instance rather than querying the catalog a second time for a
+        payload field. A relation whose facts were never fetched — because the analysis
+        never needed them — is recorded as honestly as one that was fetched and came back
+        absent, rather than triggering a fresh fetch just to answer this call.
+        """
+        return {}

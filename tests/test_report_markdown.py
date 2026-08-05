@@ -199,6 +199,50 @@ def test_missing_window_facts_are_null_not_absent():
         assert payload["window"][key] is None
 
 
+def test_physical_state_is_always_present_even_when_the_caller_gave_none():
+    """Unlike `dbt`, this key must never be omitted: an *absent* `physical_state` is how
+    `verify` tells a pre-this-feature artifact apart from one that genuinely found nothing
+    physical to report — omitting it on an empty result would blur that distinction."""
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+    )
+    assert "physical_state" in payload
+    assert payload["physical_state"] == {}
+
+
+def test_physical_state_carries_what_the_adapter_reported():
+    """The caller hands in `adapter.physical_state(relations)` verbatim; this function's
+    only job is to place it under a stable key, not to reshape it."""
+    given = {
+        "public.orders": {
+            "is_ordinary_table": True,
+            "indexes": [
+                {
+                    "name": "idx_status",
+                    "columns": ["status"],
+                    "is_partial": False,
+                    "is_unique": False,
+                }
+            ],
+        }
+    }
+    payload = advise_payload(
+        [],
+        Workload(stats=(), window_description="w"),
+        Aggregation(usage=(), total_cost_ms=0.0, skipped_unqualifiable=0, tables=frozenset()),
+        engine="postgres",
+        redacted=True,
+        degraded=[],
+        physical_state=given,
+    )
+    assert payload["physical_state"] == given
+
+
 def test_payload_is_json_serializable():
     import json
 
