@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-09-20
+
+Functionally identical to 0.4.0. Republished because 0.2.0 through 0.4.0 were removed from
+PyPI: their source distributions bundled a test fixture whose placeholder values were not
+generic. The values were replaced and the repository's history was rewritten to match, so a
+fresh clone carries no trace of them. Anything pinned to a removed version must move to
+this release.
+
+### Changed
+
+- The redaction test fixture (`tests/test_workload_redaction.py`) uses generic placeholder
+  values. Nothing the package does has changed.
+
 ## [0.4.0] - 2026-08-06
 
 ### Added
